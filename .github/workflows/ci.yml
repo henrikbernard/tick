@@ -43,6 +43,7 @@ jobs:
           tick compare-sources /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \
             --target snowflake \
             --database MFG_PROD \
+            --use-glossary \
             --html /tmp/tick-ci/harmonization_sf.html \
             --sql /tmp/tick-ci/unified_sf.sql
           tick compare-sources /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \

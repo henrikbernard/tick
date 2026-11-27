@@ -525,8 +525,18 @@ def export_databricks_bundle(
     catalog: str | None = None,
     bronze_schema: str | None = None,
     silver_schema: str = "silver",
+    gold_schema: str = "gold",
 ) -> list[Path]:
-    """Write Unity Catalog DDL, Lakeflow DLT pipeline Python, and sizing guide to output_dir."""
+    """Write Unity Catalog DDL, Lakeflow DLT, DABs manifest, Lakeview dashboard, Gold BOM SQL & sizing guide."""
+    from tick.exporters.deploy_export import (
+        render_databricks_bundle_yml,
+        render_lakeview_dashboard_json,
+    )
+    from tick.exporters.gold_sql import (
+        get_hierarchy_tables,
+        render_databricks_gold_hierarchies_sql,
+    )
+
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -556,5 +566,44 @@ def export_databricks_bundle(
         encoding="utf-8",
     )
     written.append(sizing_path)
+
+    dab_path = root / "databricks.yml"
+    dab_path.write_text(
+        render_databricks_bundle_yml(
+            result,
+            catalog=catalog,
+            bronze_schema=bronze_schema,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(dab_path)
+
+    dash_path = root / "lakeview_dashboard.lvdash.json"
+    dash_path.write_text(
+        render_lakeview_dashboard_json(
+            result,
+            catalog=catalog,
+            bronze_schema=bronze_schema,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(dash_path)
+
+    if get_hierarchy_tables(result):
+        gold_path = root / "gold_hierarchies.sql"
+        gold_path.write_text(
+            render_databricks_gold_hierarchies_sql(
+                result,
+                catalog=catalog,
+                silver_schema=silver_schema,
+                gold_schema=gold_schema,
+            ),
+            encoding="utf-8",
+        )
+        written.append(gold_path)
 
     return written

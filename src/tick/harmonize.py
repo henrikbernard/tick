@@ -11,6 +11,11 @@ from tick.databricks import (
     map_to_spark_type,
     sanitize_delta_column_name,
 )
+from tick.glossary import (
+    BUILTIN_COLUMN_GLOSSARY,
+    BUILTIN_TABLE_GLOSSARY,
+    load_custom_glossary,
+)
 from tick.models import (
     DiscoveryResult,
     HarmonizationReport,
@@ -122,8 +127,46 @@ def harmonize_snapshots(
     catalog: str = "manufacturing",
     bronze_schema: str = "bronze",
     target_platform: Literal["databricks", "snowflake"] = "databricks",
+    match_by_glossary: bool = False,
+    glossary_path: str | Path | None = None,
 ) -> HarmonizationReport:
-    """Compare N plant/site discovery snapshots and generate unified multi-plant Databricks or Snowflake SQL."""
+    """Compare N plant/site discovery snapshots and generate unified multi-plant Databricks or Snowflake SQL.
+
+    When `match_by_glossary=True` (or `glossary_path` is provided), tables and columns from heterogeneous
+    ERP/MES systems (e.g. SAP `AUFK.WERKS` vs MES `production_order_master.plant_code`) are aligned using
+    their canonical glossary semantic names while still projecting each plant's native Bronze names in SQL.
+    """
+    use_glossary = bool(match_by_glossary or glossary_path)
+    tbl_glossary: dict[str, tuple[str, str]] = {}
+    col_glossary: dict[str, tuple[str, str]] = {}
+    if use_glossary:
+        tbl_glossary = dict(BUILTIN_TABLE_GLOSSARY)
+        col_glossary = dict(BUILTIN_COLUMN_GLOSSARY)
+        if glossary_path:
+            user_t, user_c = load_custom_glossary(glossary_path)
+            tbl_glossary.update(user_t)
+            col_glossary.update(user_c)
+
+    def _canon_table_name(tbl: TableInfo) -> str:
+        if not use_glossary:
+            return tbl.name.lower()
+        hit = tbl_glossary.get(tbl.name.upper())
+        if hit and hit[0]:
+            return hit[0].lower()
+        if tbl.semantic_name:
+            return tbl.semantic_name.lower()
+        return tbl.name.lower()
+
+    def _canon_col_name(raw_col_name: str, existing_semantic: str | None) -> str:
+        if not use_glossary:
+            return raw_col_name
+        hit = col_glossary.get(raw_col_name.upper())
+        if hit and hit[0]:
+            return hit[0]
+        if existing_semantic:
+            return existing_semantic
+        return raw_col_name
+
     source_names = list(sources.keys())
     safe_site_map = deduplicate_column_names(source_names)
     sf_site_map = deduplicate_snowflake_columns(source_names)
@@ -132,14 +175,14 @@ def harmonize_snapshots(
     sf_db = catalog.upper() if catalog == "manufacturing" else catalog
     sf_bsch = bronze_schema.upper() if bronze_schema == "bronze" else bronze_schema
 
-    # Index base tables across sites; qualify with schema if a single site has duplicate table names across schemas
+    # Index base tables across sites; qualify with schema if a single site has duplicate table keys across schemas
     dup_names_within_source: set[str] = set()
     for res in sources.values():
         seen_in_src: set[str] = set()
         for tbl in res.tables:
             if tbl.table_type != "table":
                 continue
-            low = tbl.name.lower()
+            low = _canon_table_name(tbl)
             if low in seen_in_src:
                 dup_names_within_source.add(low)
             seen_in_src.add(low)
@@ -149,10 +192,11 @@ def harmonize_snapshots(
         for tbl in res.tables:
             if tbl.table_type != "table":
                 continue
+            canon = _canon_table_name(tbl)
             key = (
-                f"{tbl.schema_name.lower()}.{tbl.name.lower()}"
-                if tbl.name.lower() in dup_names_within_source
-                else tbl.name.lower()
+                f"{tbl.schema_name.lower()}.{canon}"
+                if canon in dup_names_within_source
+                else canon
             )
             tables_by_name.setdefault(key, {})[src_name] = tbl
 
@@ -166,18 +210,43 @@ def harmonize_snapshots(
         site_map = tables_by_name[tbl_key]
         present = [s for s in source_names if s in site_map]
         missing = [s for s in source_names if s not in site_map]
+        source_table_names = {s: site_map[s].name for s in present}
+        tbl_matched_glossary = use_glossary and len({site_map[s].name.lower() for s in present}) > 1
 
+        # Compare primary keys using canonical column names when glossary matching is enabled
         pks_by_source = {s: site_map[s].primary_key for s in present}
-        unique_pks = {tuple(v) for v in pks_by_source.values()}
+        if use_glossary:
+            unique_pks = {
+                tuple(
+                    sanitize_delta_column_name(
+                        _canon_col_name(
+                            pk,
+                            next((c.semantic_name for c in site_map[s].columns if c.name == pk), None),
+                        )
+                    )
+                    for pk in site_map[s].primary_key
+                )
+                for s in present
+            }
+        else:
+            unique_pks = {tuple(v) for v in pks_by_source.values()}
         pk_divergent = len(unique_pks) > 1
 
-        # Gather union of all columns (matched by deduplicated sanitized name per site)
+        # Gather union of all columns (matched by deduplicated sanitized/canonical name per site)
         col_order: list[str] = []
         col_sites: dict[str, dict[str, tuple[str, str, str, str, str, bool]]] = {}
         for s in present:
-            col_map = deduplicate_column_names([c.name for c in site_map[s].columns])
-            for col in site_map[s].columns:
-                ck = col_map[col.name]
+            canon_inputs = [_canon_col_name(c.name, c.semantic_name) for c in site_map[s].columns]
+            # Map positional index safely even when multiple raw columns share identical raw/canonical strings
+            seen_site_cols: set[str] = set()
+            for col, canon_raw in zip(site_map[s].columns, canon_inputs):
+                base_ck = sanitize_delta_column_name(canon_raw)
+                ck = base_ck
+                sfx = 2
+                while ck in seen_site_cols:
+                    ck = f"{base_ck}_{sfx}"
+                    sfx += 1
+                seen_site_cols.add(ck)
                 if ck not in col_sites:
                     col_order.append(ck)
                     col_sites[ck] = {}
@@ -193,6 +262,11 @@ def harmonize_snapshots(
             smap = col_sites[ck]
             c_present = [s for s in present if s in smap]
             c_missing = [s for s in present if s not in smap]
+            src_col_names = {s: smap[s][0] for s in c_present}
+            col_matched_glossary = use_glossary and (
+                len({sanitize_delta_column_name(smap[s][0]) for s in c_present}) > 1
+                or any(sanitize_delta_column_name(smap[s][0]) != ck for s in c_present)
+            )
             raw_types = {s: smap[s][1] for s in c_present}
             spark_types = {s: smap[s][2] for s in c_present}
             sf_types = {s: smap[s][3] for s in c_present}
@@ -212,13 +286,15 @@ def harmonize_snapshots(
             if c_missing:
                 site_specific += 1
 
-            display_name = smap[c_present[0]][0]
+            display_name = ck if col_matched_glossary else smap[c_present[0]][0]
             h_cols.append(
                 HarmonizedColumn(
                     name=display_name,
                     sanitized_name=ck,
                     present_in_sources=c_present,
                     missing_in_sources=c_missing,
+                    source_column_names=src_col_names,
+                    matched_via_glossary=col_matched_glossary,
                     types_by_source=raw_types,
                     canonical_types_by_source=canonical_by_src,
                     target_spark_type=target_spark,
@@ -232,7 +308,6 @@ def harmonize_snapshots(
         # Generate Unified Multi-Plant UNION ALL SQL (Databricks Spark SQL or Snowflake SQL)
         union_branches: list[str] = []
         if target_platform == "snowflake":
-            sf_tbl = sanitize_snowflake_identifier(tbl_key)
             sf_view_stem = view_sf_map[tbl_key]
             sf_col_aliases = deduplicate_snowflake_columns([hc.sanitized_name for hc in h_cols])
             existing_sf_aliases = set(sf_col_aliases.values())
@@ -245,6 +320,12 @@ def harmonize_snapshots(
                     sfx += 1
             for s in present:
                 sf_site = sf_site_map[s]
+                src_tbl_obj = site_map[s]
+                sf_src_tbl = sanitize_snowflake_identifier(
+                    f"{src_tbl_obj.schema_name}_{src_tbl_obj.name}"
+                    if "." in tbl_key
+                    else src_tbl_obj.name
+                )
                 escaped_site_lit = s.replace("'", "''")
                 selects = [f"    '{escaped_site_lit}' AS {_dq(plant_col)}"]
                 for hc in h_cols:
@@ -261,7 +342,7 @@ def harmonize_snapshots(
                 branch = (
                     "SELECT\n"
                     + ",\n".join(selects)
-                    + f"\nFROM {_dq(sf_db)}.{_dq(f'{sf_bsch}_{sf_site}')}.{_dq(sf_tbl)}"
+                    + f"\nFROM {_dq(sf_db)}.{_dq(f'{sf_bsch}_{sf_site}')}.{_dq(sf_src_tbl)}"
                 )
                 union_branches.append(branch)
 
@@ -271,7 +352,6 @@ def harmonize_snapshots(
                 + ";\n"
             )
         else:
-            safe_tbl = sanitize_delta_column_name(tbl_key)
             dbx_view_stem = view_dbx_map[tbl_key]
             existing_dbx_aliases = {hc.sanitized_name for hc in h_cols}
             plant_col_dbx = "source_plant"
@@ -283,6 +363,12 @@ def harmonize_snapshots(
                     sfx += 1
             for s in present:
                 safe_site = safe_site_map[s]
+                src_tbl_obj = site_map[s]
+                safe_src_tbl = sanitize_delta_column_name(
+                    f"{src_tbl_obj.schema_name}_{src_tbl_obj.name}"
+                    if "." in tbl_key
+                    else src_tbl_obj.name
+                )
                 escaped_site_lit = s.replace("'", "''")
                 selects = [f"    '{escaped_site_lit}' AS `{plant_col_dbx}`"]
                 for hc in h_cols:
@@ -297,7 +383,7 @@ def harmonize_snapshots(
                 branch = (
                     "SELECT\n"
                     + ",\n".join(selects)
-                    + f"\nFROM `{cat_esc}`.`{bsch_esc}_{safe_site}`.`{safe_tbl}`"
+                    + f"\nFROM `{cat_esc}`.`{bsch_esc}_{safe_site}`.`{safe_src_tbl}`"
                 )
                 union_branches.append(branch)
 
@@ -316,6 +402,8 @@ def harmonize_snapshots(
                 table_name=tbl_key,
                 present_in_sources=present,
                 missing_in_sources=missing,
+                source_table_names=source_table_names,
+                matched_via_glossary=tbl_matched_glossary,
                 primary_keys_by_source=pks_by_source,
                 pk_divergent=pk_divergent,
                 columns=h_cols,
@@ -327,6 +415,7 @@ def harmonize_snapshots(
 
     return HarmonizationReport(
         target_platform=target_platform,
+        glossary_matching_enabled=use_glossary,
         sources=source_names,
         total_unique_tables=len(harmonized_tables),
         fully_aligned_tables=fully_aligned,
@@ -340,6 +429,8 @@ def render_harmonization_markdown(report: HarmonizationReport) -> str:
     lines = [
         "# Multi-Plant Schema Harmonization Report",
         "",
+        f"- **Target Platform:** `{'Snowflake' if report.target_platform == 'snowflake' else 'Databricks'}`"
+        + (" · **Glossary-Aware Semantic Matching:** `ENABLED`" if report.glossary_matching_enabled else ""),
         f"- **Plants / Sources Compared ({len(report.sources)}):** " + ", ".join(f"`{s}`" for s in report.sources),
         f"- **Total Unique Tables:** `{report.total_unique_tables}`",
         f"- **Fully Aligned Tables:** `{report.fully_aligned_tables}`",
@@ -353,22 +444,30 @@ def render_harmonization_markdown(report: HarmonizationReport) -> str:
     for tbl in report.tables:
         pres = ", ".join(f"`{s}`" for s in tbl.present_in_sources)
         miss = ", ".join(f"`{s}`" for s in tbl.missing_in_sources) if tbl.missing_in_sources else "—"
+        g_note = " *(glossary)*" if tbl.matched_via_glossary else ""
         lines.append(
-            f"| `{tbl.table_name}` | {pres} | {miss} | {'YES' if tbl.pk_divergent else 'no'} | "
+            f"| `{tbl.table_name}`{g_note} | {pres} | {miss} | {'YES' if tbl.pk_divergent else 'no'} | "
             f"{tbl.conflict_count} | {tbl.site_specific_column_count} |"
         )
     lines.append("")
 
     for tbl in report.tables:
+        has_glossary_cols = any(c.matched_via_glossary for c in tbl.columns)
         if (
             tbl.conflict_count == 0
             and tbl.site_specific_column_count == 0
             and not tbl.missing_in_sources
             and not tbl.pk_divergent
+            and not tbl.matched_via_glossary
+            and not has_glossary_cols
         ):
             continue
         lines.append(f"### `{tbl.table_name}` — Harmonization Plan")
         lines.append("")
+        if tbl.matched_via_glossary and tbl.source_table_names:
+            tmap_desc = ", ".join(f"`{s}`: `{t}`" for s, t in tbl.source_table_names.items())
+            lines.append(f"- **Glossary-Matched Source Tables:** {tmap_desc}")
+            lines.append("")
         if tbl.pk_divergent:
             pk_desc = ", ".join(
                 f"`{s}`: `({', '.join(pks) or 'none'})`"
@@ -377,14 +476,21 @@ def render_harmonization_markdown(report: HarmonizationReport) -> str:
             lines.append(f"- **Primary Key Divergence:** {pk_desc}")
             lines.append("")
         drifted_cols = [
-            col for col in tbl.columns if col.has_type_conflict or col.missing_in_sources
+            col
+            for col in tbl.columns
+            if col.has_type_conflict or col.missing_in_sources or col.matched_via_glossary
         ]
         if drifted_cols:
             type_col_hdr = "Target Snowflake Type" if report.target_platform == "snowflake" else "Target Spark Type"
-            lines.append(f"| Target Column | {type_col_hdr} | Type Conflict | Types by Source | Missing In |")
+            lines.append(f"| Target Column | {type_col_hdr} | Type Conflict | Source Columns & Types | Missing In |")
             lines.append("|---|---|---|---|---|")
             for col in drifted_cols:
-                tsrc = ", ".join(f"`{s}`: `{t}`" for s, t in col.types_by_source.items())
+                tsrc = ", ".join(
+                    f"`{s}`: `{col.source_column_names.get(s, col.name)}` (`{t}`)"
+                    if col.matched_via_glossary
+                    else f"`{s}`: `{t}`"
+                    for s, t in col.types_by_source.items()
+                )
                 miss = ", ".join(f"`{s}`" for s in col.missing_in_sources) if col.missing_in_sources else "—"
                 tgt_type = (
                     (col.target_snowflake_type or col.target_spark_type)

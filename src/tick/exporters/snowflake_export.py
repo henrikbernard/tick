@@ -607,8 +607,19 @@ def export_snowflake_bundle(
     database: str | None = None,
     schema: str | None = None,
     warehouse: str | None = None,
+    silver_schema: str = "SILVER",
+    gold_schema: str = "GOLD",
 ) -> list[Path]:
-    """Write Snowflake DDL, Dynamic Tables SQL, DMFs SQL, and sizing plan to output_dir."""
+    """Write Snowflake DDL, Dynamic Tables, DMFs, sizing plan, snowflake.yml, Streamlit app & Gold BOM SQL."""
+    from tick.exporters.deploy_export import (
+        render_snowflake_project_yml,
+        render_snowflake_streamlit_app,
+    )
+    from tick.exporters.gold_sql import (
+        get_hierarchy_tables,
+        render_snowflake_gold_hierarchies_sql,
+    )
+
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -622,7 +633,11 @@ def export_snowflake_bundle(
     dt_path = root / "snowflake_dynamic_tables.sql"
     dt_path.write_text(
         render_snowflake_dynamic_tables_sql(
-            result, database=database, bronze_schema=schema, warehouse=warehouse
+            result,
+            database=database,
+            bronze_schema=schema,
+            silver_schema=silver_schema,
+            warehouse=warehouse,
         ),
         encoding="utf-8",
     )
@@ -640,5 +655,46 @@ def export_snowflake_bundle(
         encoding="utf-8",
     )
     written.append(sizing_path)
+
+    proj_path = root / "snowflake.yml"
+    proj_path.write_text(
+        render_snowflake_project_yml(
+            result,
+            database=database,
+            bronze_schema=schema,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+            warehouse=warehouse,
+        ),
+        encoding="utf-8",
+    )
+    written.append(proj_path)
+
+    sis_path = root / "streamlit_app.py"
+    sis_path.write_text(
+        render_snowflake_streamlit_app(
+            result,
+            database=database,
+            bronze_schema=schema,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(sis_path)
+
+    if get_hierarchy_tables(result):
+        gold_path = root / "snowflake_gold_hierarchies.sql"
+        gold_path.write_text(
+            render_snowflake_gold_hierarchies_sql(
+                result,
+                database=database,
+                silver_schema=silver_schema,
+                gold_schema=gold_schema,
+                warehouse=warehouse,
+            ),
+            encoding="utf-8",
+        )
+        written.append(gold_path)
 
     return written

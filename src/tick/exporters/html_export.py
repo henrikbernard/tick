@@ -11,6 +11,14 @@ from tick.exporters.databricks_export import (
     render_unity_catalog_ddl,
 )
 from tick.exporters.dbt_export import render_dbt_sources_yaml
+from tick.exporters.deploy_export import (
+    render_databricks_bundle_yml,
+    render_snowflake_streamlit_app,
+)
+from tick.exporters.gold_sql import (
+    render_databricks_gold_hierarchies_sql,
+    render_snowflake_gold_hierarchies_sql,
+)
 from tick.exporters.snowflake_export import (
     render_snowflake_ddl,
     render_snowflake_dmf_sql,
@@ -419,9 +427,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="subtabs">
           <button class="btn btn-primary code-tab" data-code="uc_ddl">Unity Catalog Delta DDL</button>
           <button class="btn code-tab" data-code="lakeflow_py">Lakeflow Pipeline (DLT Python)</button>
+          <button class="btn code-tab" data-code="dbx_dab">Databricks Asset Bundle</button>
+          <button class="btn code-tab" data-code="dbx_gold">Gold BOM SQL (DBX)</button>
           <button class="btn code-tab" data-code="sf_ddl">Snowflake DDL &amp; Policies</button>
           <button class="btn code-tab" data-code="sf_dt">Snowflake Dynamic Tables</button>
           <button class="btn code-tab" data-code="sf_dmf">Snowflake DMFs</button>
+          <button class="btn code-tab" data-code="sf_gold">Gold BOM SQL (SF)</button>
+          <button class="btn code-tab" data-code="sf_sis">Snowflake Streamlit App</button>
           <button class="btn code-tab" data-code="dbt_yaml">dbt sources.yml</button>
         </div>
         <div style="display:flex;gap:8px;">
@@ -442,17 +454,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const codeAssets = {
     uc_ddl: payload.uc_ddl,
     lakeflow_py: payload.lakeflow_py,
+    dbx_dab: payload.dbx_dab,
+    dbx_gold: payload.dbx_gold,
     sf_ddl: payload.sf_ddl,
     sf_dt: payload.sf_dt,
     sf_dmf: payload.sf_dmf,
+    sf_gold: payload.sf_gold,
+    sf_sis: payload.sf_sis,
     dbt_yaml: payload.dbt_yaml
   };
   const codeFilenames = {
     uc_ddl: "unity_catalog_ddl.sql",
     lakeflow_py: "lakeflow_pipeline.py",
+    dbx_dab: "databricks.yml",
+    dbx_gold: "gold_hierarchies.sql",
     sf_ddl: "snowflake_ddl.sql",
     sf_dt: "snowflake_dynamic_tables.sql",
     sf_dmf: "snowflake_dmf.sql",
+    sf_gold: "snowflake_gold_hierarchies.sql",
+    sf_sis: "streamlit_app.py",
     dbt_yaml: "sources.yml"
   };
   const ov = data.overview;
@@ -1483,9 +1503,13 @@ def render_html_report(result: DiscoveryResult) -> str:
         "dbt_yaml": render_dbt_sources_yaml(result),
         "uc_ddl": render_unity_catalog_ddl(result),
         "lakeflow_py": render_lakeflow_pipeline_py(result),
+        "dbx_dab": render_databricks_bundle_yml(result),
+        "dbx_gold": render_databricks_gold_hierarchies_sql(result),
         "sf_ddl": render_snowflake_ddl(result),
         "sf_dt": render_snowflake_dynamic_tables_sql(result),
         "sf_dmf": render_snowflake_dmf_sql(result),
+        "sf_gold": render_snowflake_gold_hierarchies_sql(result),
+        "sf_sis": render_snowflake_streamlit_app(result),
     }
     raw_json = json.dumps(payload).replace("</", "<\\/")
     return (

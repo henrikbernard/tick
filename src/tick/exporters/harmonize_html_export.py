@@ -243,7 +243,7 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     );
   });
   document.getElementById("hdr-sub").textContent =
-    `Target: ${platName} · Comparing ${report.sources.length} plants/sources: ${report.sources.join(" · ")}`;
+    `Target: ${platName}${report.glossary_matching_enabled ? " · Glossary Semantic Matching: ON" : ""} · Comparing ${report.sources.length} plants/sources: ${report.sources.join(" · ")}`;
 
   const totalConflicts = report.tables.reduce((a, t) => a + t.conflict_count, 0);
   const totalSiteCols = report.tables.reduce((a, t) => a + t.site_specific_column_count, 0);
@@ -361,7 +361,7 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody>
         ${filtered.length ? filtered.map(t => `
           <tr class="matrix-row ${t.table_name === selectedTable ? 'selected' : ''}" data-table="${esc(t.table_name)}">
-            <td class="mono"><strong>${esc(t.table_name)}</strong></td>
+            <td class="mono"><strong>${esc(t.table_name)}</strong>${t.matched_via_glossary ? ' <span class="badge b-purple" title="Matched across heterogeneous ERP/MES table names via glossary">GLOSSARY</span>' : ''}</td>
             ${report.sources.map(s => {
               const st = plantCellState(t, s);
               return `<td><span class="heat-cell ${st.cls}" title="${esc(st.title)}">${st.label}</span></td>`;
@@ -399,12 +399,17 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       return `<span class="badge ${tbl.pk_divergent ? 'b-purple' : 'b-green'}">${esc(s)} PK: (${esc(pk)})</span>`;
     }).join("");
 
+    const srcTblStrip = tbl.matched_via_glossary && tbl.source_table_names
+      ? `<div style="margin-top:6px;">${Object.entries(tbl.source_table_names).map(([s, tn]) => `<span class="badge b-purple">${esc(s)} table: ${esc(tn)}</span>`).join("")}</div>`
+      : "";
+
     host.innerHTML = `
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
           <div>
             <h2 style="margin:0;font-family:var(--mono);font-size:17px;">Table Inspector: ${esc(tbl.table_name)}</h2>
             <div style="margin-top:6px;">${pkStrip}</div>
+            ${srcTblStrip}
           </div>
           <label class="check-pill">
             <input type="checkbox" id="toggle-drifted-cols" ${showDriftedColsOnly ? "checked" : ""} /> Show drifted columns only
@@ -433,9 +438,12 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
                       return `<td><span class="badge b-red">MISSING → NULL</span></td>`;
                     }
                     const needsCast = c.cast_required_sources.includes(s);
-                    return `<td class="mono">${esc(c.types_by_source[s] || "")}${needsCast ? ' <span class="badge b-amber">CAST</span>' : ""}</td>`;
+                    const rawColName = c.source_column_names ? c.source_column_names[s] : null;
+                    const srcColHint = c.matched_via_glossary && rawColName ? `<div style="font-size:11px;color:var(--purple)">col: ${esc(rawColName)}</div>` : "";
+                    return `<td class="mono">${esc(c.types_by_source[s] || "")}${needsCast ? ' <span class="badge b-amber">CAST</span>' : ""}${srcColHint}</td>`;
                   }).join("")}
                   <td>
+                    ${c.matched_via_glossary ? '<span class="badge b-purple">GLOSSARY</span>' : ""}
                     ${c.has_type_conflict ? '<span class="badge b-amber">TYPE CONFLICT</span>' : ""}
                     ${c.missing_in_sources.length ? '<span class="badge b-orange">SITE-ONLY</span>' : ""}
                     ${(!c.has_type_conflict && !c.missing_in_sources.length) ? '<span class="badge b-green">ALIGNED</span>' : ""}

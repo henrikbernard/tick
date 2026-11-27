@@ -118,9 +118,11 @@ tick discover ./plant_ohio.duckdb \
 tick discover ./plant_munich.duckdb --out-dir ./munich-discovery --workers 4 --quiet
 
 # 5. Harmonize schemas across plants & generate interactive HTML dashboard + unified SQL
-#    (Pass `--target snowflake --database MANUFACTURING` to generate Snowflake UNION ALL views)
+#    (Add `--use-glossary` or `--glossary custom.yml` to unify heterogeneous ERP/MES names like SAP AUFK <-> MES work_orders;
+#     pass `--target snowflake --database MANUFACTURING` to generate Snowflake UNION ALL views)
 tick compare-sources ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
   --target databricks \
+  --use-glossary \
   --html ./harmonization.html \
   --md ./harmonization.md \
   --sql ./unified_silver_views.sql
@@ -143,10 +145,16 @@ tick diff ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
 | `snapshot.json` | Machine-readable Pydantic snapshot for `tick diff` and `tick compare-sources` |
 | `databricks/unity_catalog_ddl.sql` | Unity Catalog Delta DDL with Liquid Clustering, CDF, tags, and type-matched mask/row-filter stubs |
 | `databricks/lakeflow_pipeline.py` | Databricks Lakeflow Declarative Pipeline (DLT) Bronze → Silver Python code |
+| `databricks/gold_hierarchies.sql` | Recursive CTE Gold Delta SQL for detected BOMs, lot genealogy & asset trees (cycle-safe, plant-scoped) |
+| `databricks/databricks.yml` | Deployment-ready **Databricks Asset Bundle (DABs)** manifest (`dev`/`prod` jobs, serverless DLT & dashboard) |
+| `databricks/lakeview_dashboard.lvdash.json` | **Databricks AI/BI Lakeview** operational & manufacturing dashboard definition |
 | `databricks/ingestion_sizing.md` | Backfill volume, daily row velocity, cadence, CDC audit, and Delta linter report |
 | `snowflake/snowflake_ddl.sql` | Snowflake `CREATE TABLE` with `CHANGE_TRACKING`, Object Tags, Row Access Policies & Masking Policies |
 | `snowflake/snowflake_dynamic_tables.sql` | Bronze → Silver Snowflake Dynamic Tables with `TARGET_LAG`, legacy dates, OT filters & `QUALIFY` dedup |
+| `snowflake/snowflake_gold_hierarchies.sql` | Recursive CTE Gold Dynamic Tables for BOMs, lot genealogy & asset trees (`ARRAY_CONTAINS` cycle guard) |
 | `snowflake/snowflake_dmf.sql` | Snowflake Data Metric Functions (DMFs) for row count, nulls, duplicates, freshness & OPC quality |
+| `snowflake/snowflake.yml` | Deployment-ready **Snowflake CLI (`snow`) v2** project manifest |
+| `snowflake/streamlit_app.py` | **Streamlit in Snowflake (SiS)** observability, Dynamic Table lag, DMF, OT telemetry & BOM monitor app |
 | `snowflake/snowflake_sizing.md` | Snowflake connector, Dynamic Table lag, clustering advisory, and Virtual Warehouse sizing plan |
 | `contracts/dqx_checks.yml` | Databricks Labs DQX data quality rules YAML |
 | `contracts/data_contract.odcs.yml` | Open Data Contract Standard (ODCS v3.0.0) YAML contract |

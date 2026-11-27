@@ -12,7 +12,17 @@ from tick.exporters.databricks_export import (
     render_unity_catalog_ddl,
 )
 from tick.exporters.dbt_export import export_dbt_project, render_dbt_sources_yaml
+from tick.exporters.deploy_export import (
+    render_databricks_bundle_yml,
+    render_lakeview_dashboard_json,
+    render_snowflake_project_yml,
+    render_snowflake_streamlit_app,
+)
 from tick.exporters.diff_html_export import export_diff_html, render_diff_html
+from tick.exporters.gold_sql import (
+    render_databricks_gold_hierarchies_sql,
+    render_snowflake_gold_hierarchies_sql,
+)
 from tick.exporters.harmonize_html_export import (
     export_harmonization_html,
     render_harmonization_html,
@@ -46,11 +56,17 @@ __all__ = [
     "render_unity_catalog_ddl",
     "render_lakeflow_pipeline_py",
     "render_databricks_sizing_md",
+    "render_databricks_bundle_yml",
+    "render_lakeview_dashboard_json",
+    "render_databricks_gold_hierarchies_sql",
     "export_snowflake_bundle",
     "render_snowflake_ddl",
     "render_snowflake_dynamic_tables_sql",
     "render_snowflake_dmf_sql",
     "render_snowflake_sizing_md",
+    "render_snowflake_project_yml",
+    "render_snowflake_streamlit_app",
+    "render_snowflake_gold_hierarchies_sql",
     "export_contracts_bundle",
     "render_dqx_yaml",
     "render_odcs_yaml",

@@ -169,7 +169,7 @@ def test_manufacturing_discovery_end_to_end(tmp_path, ext):
     # 9. Databricks Exporter bundle + Python AST validation of Lakeflow DLT code!
     dbx_dir = tmp_path / "databricks"
     written = export_databricks_bundle(result, dbx_dir)
-    assert len(written) == 3
+    assert len(written) == 6
 
     ddl_text = (dbx_dir / "unity_catalog_ddl.sql").read_text(encoding="utf-8")
     assert "CREATE CATALOG IF NOT EXISTS `mfg_prod`;" in ddl_text

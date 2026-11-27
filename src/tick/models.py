@@ -458,6 +458,8 @@ class HarmonizedColumn(BaseModel):
     sanitized_name: str
     present_in_sources: list[str] = Field(default_factory=list)
     missing_in_sources: list[str] = Field(default_factory=list)
+    source_column_names: dict[str, str] = Field(default_factory=dict)
+    matched_via_glossary: bool = False
     types_by_source: dict[str, str] = Field(default_factory=dict)
     canonical_types_by_source: dict[str, str] = Field(default_factory=dict)
     target_spark_type: str
@@ -471,6 +473,8 @@ class HarmonizedTable(BaseModel):
     table_name: str
     present_in_sources: list[str] = Field(default_factory=list)
     missing_in_sources: list[str] = Field(default_factory=list)
+    source_table_names: dict[str, str] = Field(default_factory=dict)
+    matched_via_glossary: bool = False
     primary_keys_by_source: dict[str, list[str]] = Field(default_factory=dict)
     pk_divergent: bool = False
     columns: list[HarmonizedColumn] = Field(default_factory=list)
@@ -481,6 +485,7 @@ class HarmonizedTable(BaseModel):
 
 class HarmonizationReport(BaseModel):
     target_platform: Literal["databricks", "snowflake"] = "databricks"
+    glossary_matching_enabled: bool = False
     sources: list[str] = Field(default_factory=list)
     total_unique_tables: int = 0
     fully_aligned_tables: int = 0

@@ -237,9 +237,10 @@ def _render_diff_summary(diff: SnapshotDiff) -> None:
 
 def _render_harmonization_summary(report: HarmonizationReport) -> None:
     plat = "Snowflake" if report.target_platform == "snowflake" else "Databricks"
+    glos_note = " · [bold green]Glossary Matching: ON[/bold green]" if report.glossary_matching_enabled else ""
     console.print(
         Panel(
-            f"Target: [bold magenta]{plat}[/bold magenta] · "
+            f"Target: [bold magenta]{plat}[/bold magenta]{glos_note} · "
             f"Plants / Sources: [bold cyan]{escape(', '.join(report.sources))}[/bold cyan]\n"
             f"Unique tables: {report.total_unique_tables} · "
             f"[green]Fully aligned: {report.fully_aligned_tables}[/green] · "
@@ -481,6 +482,17 @@ def compare_sources(
     ),
     catalog: str = typer.Option("manufacturing", "--catalog", "--database", help="Target catalog (Databricks) or database (Snowflake)."),
     bronze_schema: str = typer.Option("bronze", "--bronze-schema", help="Bronze schema prefix per plant."),
+    use_glossary: bool = typer.Option(
+        False,
+        "--use-glossary",
+        help="Match heterogeneous ERP/MES table & column names across plants using built-in/discovered semantic glossary names.",
+    ),
+    glossary: Optional[Path] = typer.Option(
+        None,
+        "--glossary",
+        exists=True,
+        help="Custom YAML/JSON glossary file for cross-plant semantic table/column matching (implies --use-glossary).",
+    ),
 ) -> None:
     """Harmonize schemas across multiple plants/sites and generate unified multi-plant Databricks or Snowflake SQL."""
     if len(snapshots) < 2:
@@ -507,6 +519,8 @@ def compare_sources(
         catalog=catalog,
         bronze_schema=bronze_schema,
         target_platform=target_platform,
+        match_by_glossary=use_glossary,
+        glossary_path=glossary,
     )
     _render_harmonization_summary(report)
 
