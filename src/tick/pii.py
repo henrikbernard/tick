@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from tick.models import CanonicalType, PiiFinding
+from tick.models import CanonicalType, GovernanceFinding, PiiFinding
 
 # Compiled value regexes
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -168,3 +168,71 @@ def redact_value(value: str, findings: Sequence[PiiFinding]) -> str:
     if top_cat == "phone" and len(value) >= 4:
         return f"***-***-{value[-4:]}"
     return f"[REDACTED:{top_cat}]"
+
+
+PLANT_ISOLATION_PATTERNS = [
+    re.compile(r"^(?:werks|bukrs|lgort|plant_?id|plant_?code|site_?id|site_?code|facility_?id|facility_?code|factory_?id|factory_?code|mill_?code)$", re.I),
+    re.compile(r"(?:^|_)(?:plant_id|plant_code|site_id|site_code|facility_id|factory_code)(?:$|_)", re.I),
+]
+
+COMMERCIAL_PATTERNS = [
+    re.compile(
+        r"(?:^|_)(?:unit_cost|std_cost|standard_cost|bom_cost|labor_cost|overhead_cost|margin|gross_margin|supplier_price|contract_price|purchase_price|vendor_cost|wholesale_price|net_cost)(?:$|_)",
+        re.I,
+    ),
+]
+
+IP_EXPORT_PATTERNS = [
+    re.compile(
+        r"(?:^|_)(?:cad_path|cad_file|cad_uri|cad_drawing(?:_path|_file)?|cad_model|drawing_path|drawing_file|drawing_no|drawing_num|drawing_number|blueprint|spec_doc|spec_uri|itar|itar_class|eccn|export_control|cage_code|defense_contract|formula_recipe|process_recipe|proprietary_spec)(?:$|_)",
+        re.I,
+    ),
+]
+
+
+def detect_governance(
+    column_name: str,
+    canonical_type: CanonicalType,
+) -> list[GovernanceFinding]:
+    """Detect manufacturing governance & Unity Catalog policy signals (plant row filters, cost masks, ITAR/IP)."""
+    findings: list[GovernanceFinding] = []
+    norm = re.sub(r"[\s\-]+", "_", column_name.strip())
+
+    if any(p.search(norm) for p in PLANT_ISOLATION_PATTERNS):
+        findings.append(
+            GovernanceFinding(
+                category="plant_isolation_key",
+                confidence="high",
+                uc_policy="row_filter",
+                uc_tag_key="governance_scope",
+                uc_tag_value="plant_isolation",
+                evidence=[f"Column '{column_name}' matches plant/site/facility isolation key pattern (candidate UC row filter)."],
+            )
+        )
+
+    if any(p.search(norm) for p in COMMERCIAL_PATTERNS) and canonical_type in {"decimal", "float", "integer", "string", "other"}:
+        findings.append(
+            GovernanceFinding(
+                category="commercial_sensitive",
+                confidence="high" if canonical_type in {"decimal", "float"} else "medium",
+                uc_policy="column_mask",
+                uc_tag_key="sensitivity",
+                uc_tag_value="commercial_cost",
+                evidence=[f"Column '{column_name}' matches sensitive cost/margin/supplier pricing pattern (candidate UC column mask)."],
+            )
+        )
+
+    if any(p.search(norm) for p in IP_EXPORT_PATTERNS):
+        findings.append(
+            GovernanceFinding(
+                category="ip_or_export_controlled",
+                confidence="high",
+                uc_policy="column_mask",
+                uc_tag_key="compliance",
+                uc_tag_value="itar_ear_ip",
+                evidence=[f"Column '{column_name}' matches CAD/blueprint/ITAR/export-control/recipe IP pattern."],
+            )
+        )
+
+    return findings
+

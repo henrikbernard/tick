@@ -424,6 +424,80 @@ def analyze_tables_and_quality(
                 # PII is a governance alert rather than broken data, apply small governance weight
                 penalty += 3 if sev == "high" else 1
 
+            for gov in prof.governance_findings:
+                sev = "high" if gov.category == "ip_or_export_controlled" else "medium"
+                issues.append(
+                    QualityIssue(
+                        severity=sev,  # type: ignore[arg-type]
+                        category=f"governance_{gov.category}",
+                        table=tbl.full_name,
+                        column=col.name,
+                        message=f"UC {gov.uc_policy} candidate ({gov.uc_tag_key}={gov.uc_tag_value}): {'; '.join(gov.evidence)}",
+                    )
+                )
+
+            if prof.legacy_date:
+                issues.append(
+                    QualityIssue(
+                        severity="low",
+                        category="legacy_date_encoding",
+                        table=tbl.full_name,
+                        column=col.name,
+                        message=prof.legacy_date.note,
+                    )
+                )
+
+        # Surface telemetry flatlines & bad sensor quality
+        if tbl.telemetry_profile:
+            for fl_col in tbl.telemetry_profile.flatline_columns:
+                issues.append(
+                    QualityIssue(
+                        severity="medium",
+                        category="sensor_flatline",
+                        table=tbl.full_name,
+                        column=fl_col,
+                        message=f"OT sensor column '{fl_col}' appears flatlined (zero variance across sampled readings)",
+                    )
+                )
+                penalty += 4
+            if tbl.telemetry_profile.bad_quality_rate and tbl.telemetry_profile.bad_quality_rate >= 0.05:
+                issues.append(
+                    QualityIssue(
+                        severity="medium",
+                        category="sensor_bad_quality",
+                        table=tbl.full_name,
+                        column=tbl.telemetry_profile.quality_column,
+                        message=f"{tbl.telemetry_profile.bad_quality_rate:.1%} of sampled OT readings have non-GOOD quality codes",
+                    )
+                )
+
+        # Surface CDC blockers & Delta Lake compatibility issues
+        if tbl.cdc_readiness:
+            for blocker in tbl.cdc_readiness.blockers:
+                issues.append(
+                    QualityIssue(
+                        severity="high",
+                        category="cdc_blocker",
+                        table=tbl.full_name,
+                        message=blocker,
+                    )
+                )
+                penalty += 6
+
+        if tbl.delta_compatibility:
+            for d_issue in tbl.delta_compatibility.issues:
+                if d_issue.severity in {"high", "medium"}:
+                    issues.append(
+                        QualityIssue(
+                            severity=d_issue.severity,
+                            category=f"delta_{d_issue.category}",
+                            table=tbl.full_name,
+                            column=d_issue.column,
+                            message=f"{d_issue.message} Remediation: {d_issue.remediation}",
+                        )
+                    )
+                    penalty += 5 if d_issue.severity == "high" else 2
+
         tbl.quality_issues = issues
         tbl.quality_score = max(0, min(100, 100 - penalty))
         all_issues.extend(issues)
