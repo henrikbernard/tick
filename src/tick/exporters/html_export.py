@@ -6,6 +6,10 @@ import html
 import json
 from pathlib import Path
 
+from tick.exporters.databricks_export import (
+    render_lakeflow_pipeline_py,
+    render_unity_catalog_ddl,
+)
 from tick.exporters.dbt_export import render_dbt_sources_yaml
 from tick.models import DiscoveryResult
 
@@ -34,6 +38,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --red-soft: rgba(248, 113, 113, 0.15);
     --purple: #a78bfa;
     --purple-soft: rgba(167, 139, 250, 0.15);
+    --orange: #fb923c;
+    --orange-soft: rgba(251, 146, 60, 0.15);
     --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
@@ -55,6 +61,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --red-soft: rgba(220, 38, 38, 0.1);
     --purple: #7c3aed;
     --purple-soft: rgba(124, 58, 237, 0.1);
+    --orange: #ea580c;
+    --orange-soft: rgba(234, 88, 12, 0.12);
   }
   * { box-sizing: border-box; }
   body {
@@ -64,7 +72,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   header {
     position: sticky; top: 0; z-index: 40;
     background: var(--bg-elev); border-bottom: 1px solid var(--border);
-    padding: 12px 22px; display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 12px 22px; display: flex; align-items: center; justify-content: space-between; gap: 14px;
     flex-wrap: wrap;
   }
   .brand { display: flex; align-items: center; gap: 12px; }
@@ -75,10 +83,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .brand h1 { margin: 0; font-size: 16px; font-weight: 700; }
   .brand .sub { font-size: 12px; color: var(--text-muted); font-family: var(--mono); }
-  .nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  .nav { display: flex; gap: 5px; flex-wrap: wrap; }
   .tab-btn {
     background: transparent; color: var(--text-muted); border: 1px solid transparent;
-    padding: 7px 13px; border-radius: 7px; cursor: pointer; font-weight: 600; font-size: 13px;
+    padding: 7px 12px; border-radius: 7px; cursor: pointer; font-weight: 600; font-size: 13px;
     transition: all 0.15s ease;
   }
   .tab-btn:hover { background: var(--bg-hover); color: var(--text); }
@@ -87,18 +95,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     background: var(--bg-card); color: var(--text); border: 1px solid var(--border);
     padding: 6px 10px; border-radius: 7px; cursor: pointer; font-size: 12px; font-weight: 600;
   }
-  main { padding: 20px 24px; max-width: 1560px; margin: 0 auto; }
+  main { padding: 20px 24px; max-width: 1580px; margin: 0 auto; }
   .panel { display: none; }
   .panel.active { display: block; }
   .kpi-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
     gap: 14px; margin-bottom: 20px;
   }
   .kpi {
     background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
   }
   .kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
-  .kpi .val { font-size: 24px; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
+  .kpi .val { font-size: 22px; font-weight: 700; margin-top: 4px; font-family: var(--mono); }
   .kpi .hint { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 980px) { .grid-2 { grid-template-columns: 1fr; } }
@@ -115,17 +123,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .mono { font-family: var(--mono); font-size: 12px; }
   .badge {
     display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px;
-    font-weight: 600; font-family: var(--mono); white-space: nowrap; margin-right: 4px;
+    font-weight: 600; font-family: var(--mono); white-space: nowrap; margin-right: 4px; margin-bottom: 2px;
   }
   .b-accent { background: var(--accent-soft); color: var(--accent); }
   .b-green { background: var(--green-soft); color: var(--green); }
   .b-amber { background: var(--amber-soft); color: var(--amber); }
   .b-red { background: var(--red-soft); color: var(--red); }
   .b-purple { background: var(--purple-soft); color: var(--purple); }
+  .b-orange { background: var(--orange-soft); color: var(--orange); }
   .b-muted { background: var(--bg-hover); color: var(--text-muted); }
 
-  /* Catalog split view */
-  .catalog-layout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+  .catalog-layout { display: grid; grid-template-columns: 310px 1fr; gap: 16px; align-items: start; }
   @media (max-width: 900px) { .catalog-layout { grid-template-columns: 1fr; } }
   .sidebar {
     background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
@@ -142,10 +150,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tbl-item:hover { background: var(--bg-hover); }
   .tbl-item.selected { background: var(--accent-soft); border-color: rgba(56,189,248,0.4); }
   .tbl-item .name { font-weight: 600; font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .tbl-item .sem { font-size: 11px; color: var(--accent); }
   .tbl-item .meta { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 3px; }
 
   .bar-track {
-    width: 78px; height: 7px; background: var(--bg); border: 1px solid var(--border);
+    width: 72px; height: 7px; background: var(--bg); border: 1px solid var(--border);
     border-radius: 99px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 6px;
   }
   .bar-fill { height: 100%; border-radius: 99px; }
@@ -159,10 +168,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   pre.code-block {
     background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
     padding: 12px; overflow-x: auto; font-family: var(--mono); font-size: 12px; line-height: 1.5;
-    max-height: 460px; overflow-y: auto;
+    max-height: 480px; overflow-y: auto;
   }
 
-  /* SVG Canvases */
   .canvas-toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   .btn {
     background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
@@ -180,6 +188,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .filters-row .search-input, .filters-row .select-input { width: auto; min-width: 190px; margin: 0; }
   .expand-row { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
   .clickable { cursor: pointer; color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .subtabs { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -194,10 +203,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <nav class="nav">
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="catalog">Catalog &amp; Profiler</button>
+    <button class="tab-btn" data-tab="databricks">Databricks &amp; Mfg</button>
     <button class="tab-btn" data-tab="erd">Interactive ERD</button>
     <button class="tab-btn" data-tab="lineage">Lineage Graph</button>
-    <button class="tab-btn" data-tab="quality">Quality &amp; PII</button>
-    <button class="tab-btn" data-tab="de">DE Blueprint &amp; dbt</button>
+    <button class="tab-btn" data-tab="quality">Quality &amp; Gov</button>
+    <button class="tab-btn" data-tab="code">Code &amp; DDL</button>
   </nav>
   <button class="theme-btn" id="theme-toggle">Light / Dark</button>
 </header>
@@ -224,17 +234,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <section id="tab-catalog" class="panel">
     <div class="catalog-layout">
       <aside class="sidebar">
-        <input id="cat-search" class="search-input" type="text" placeholder="Filter tables or columns..." />
+        <input id="cat-search" class="search-input" type="text" placeholder="Filter tables, semantic names, cols..." />
         <select id="cat-filter" class="select-input">
           <option value="all">All Objects</option>
           <option value="table">Base Tables Only</option>
           <option value="view">Views Only</option>
-          <option value="pii">Contains PII</option>
-          <option value="issues">Has Quality Issues</option>
+          <option value="pii">Contains PII / Governance Tags</option>
+          <option value="mfg">Manufacturing Signals (OT/BOM/Dates)</option>
+          <option value="issues">Has Quality / Delta Issues</option>
         </select>
         <div id="cat-list"></div>
       </aside>
       <div id="cat-detail"></div>
+    </div>
+  </section>
+
+  <!-- DATABRICKS & MANUFACTURING -->
+  <section id="tab-databricks" class="panel">
+    <div class="card" id="cdc-audit-card"></div>
+    <div class="card">
+      <h2>Databricks Lakeflow Connect, Sizing &amp; Liquid Clustering Blueprint</h2>
+      <div style="overflow-x:auto"><table id="dbx-table"></table></div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Manufacturing Signals (OT Telemetry, BOMs, Legacy Dates)</h2>
+        <div id="mfg-signals"></div>
+      </div>
+      <div class="card">
+        <h2>Spark / Delta Lake Compatibility Linter</h2>
+        <div style="overflow-x:auto"><table id="delta-lint-table"></table></div>
+      </div>
     </div>
   </section>
 
@@ -278,10 +308,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- QUALITY & PII -->
+  <!-- QUALITY & GOV -->
   <section id="tab-quality" class="panel">
     <div class="card">
-      <h2>Data Quality &amp; PII Findings</h2>
+      <h2>Data Quality, PII, Unity Catalog Governance &amp; Compatibility Findings</h2>
       <div class="filters-row">
         <input id="q-search" class="search-input" type="text" placeholder="Search table, column, message..." />
         <select id="q-sev" class="select-input">
@@ -298,18 +328,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- DE BLUEPRINT & DBT -->
-  <section id="tab-de" class="panel">
+  <!-- CODE & DDL -->
+  <section id="tab-code" class="panel">
     <div class="card">
-      <h2>Data Engineering Ingestion Blueprint</h2>
-      <div style="overflow-x:auto"><table id="de-table"></table></div>
-    </div>
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h2 style="margin:0;">Auto-Generated dbt <code>sources.yml</code></h2>
-        <button class="btn btn-primary" id="copy-dbt">Copy YAML</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
+        <div class="subtabs">
+          <button class="btn btn-primary code-tab" data-code="uc_ddl">Unity Catalog Delta DDL</button>
+          <button class="btn code-tab" data-code="lakeflow_py">Lakeflow Pipeline (DLT Python)</button>
+          <button class="btn code-tab" data-code="dbt_yaml">dbt sources.yml</button>
+        </div>
+        <button class="btn btn-primary" id="copy-code">Copy Active Code</button>
       </div>
-      <pre class="code-block" id="dbt-yaml"></pre>
+      <pre class="code-block" id="code-preview"></pre>
     </div>
   </section>
 </main>
@@ -319,7 +349,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 (function() {
   const payload = JSON.parse(document.getElementById("tick-data").textContent);
   const data = payload.result;
-  const dbtYaml = payload.dbt_yaml;
+  const codeAssets = {
+    uc_ddl: payload.uc_ddl,
+    lakeflow_py: payload.lakeflow_py,
+    dbt_yaml: payload.dbt_yaml
+  };
   const ov = data.overview;
 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -339,19 +373,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const cls = sev === "high" ? "b-red" : sev === "medium" ? "b-amber" : "b-muted";
     return `<span class="badge ${cls}">${esc(sev.toUpperCase())}</span>`;
   };
+  const cdcBadge = (st) => {
+    if (!st) return "—";
+    const cls = st === "ready" ? "b-green" : st === "blocked" ? "b-red" : st === "needs_config" ? "b-amber" : "b-muted";
+    return `<span class="badge ${cls}">${esc(st.toUpperCase())}</span>`;
+  };
 
-  // Header
   document.getElementById("hdr-title").textContent = `tick · ${ov.database_name}`;
   document.getElementById("hdr-sub").textContent =
     `${ov.dialect} (${ov.server_version || ov.driver}) · ${ov.sanitized_url} · ${ov.duration_seconds}s`;
 
-  // Theme toggle
   document.getElementById("theme-toggle").addEventListener("click", () => {
     const cur = document.documentElement.getAttribute("data-theme");
     document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
   });
 
-  // Tab switching
   const switchTab = (tabId) => {
     document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tabId));
     document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === `tab-${tabId}`));
@@ -369,12 +405,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   // OVERVIEW
   const kpis = [
-    { label: "Base Tables", val: fmtInt(ov.table_count), hint: `${ov.view_count} views · ${ov.schema_count} schema(s)` },
-    { label: "Total Columns", val: fmtInt(ov.column_count), hint: `Across ${data.tables.length} objects` },
-    { label: "Total Rows", val: fmtInt(ov.total_rows), hint: `Size: ${fmtBytes(ov.total_size_bytes)}` },
+    { label: "Base Tables", val: fmtInt(ov.table_count), hint: `${ov.view_count} views · ${ov.empty_table_count} empty` },
+    { label: "Total Rows", val: fmtInt(ov.total_rows), hint: `${fmtInt(ov.column_count)} cols · ${fmtBytes(ov.total_size_bytes)}` },
     { label: "Relationships", val: fmtInt(ov.explicit_fk_count + ov.inferred_relationship_count), hint: `${ov.explicit_fk_count} explicit · ${ov.inferred_relationship_count} inferred` },
-    { label: "PII Columns", val: fmtInt(ov.pii_column_count), hint: ov.pii_column_count > 0 ? "Review governance tab" : "None detected" },
-    { label: "Avg Health Score", val: `${ov.avg_quality_score}/100`, hint: `${data.quality_issues.length} total findings` },
+    { label: "CDC Readiness", val: `${ov.cdc_ready_table_count} / ${ov.table_count}`, hint: `${ov.cdc_blocked_table_count} blocked · ${ov.delta_warning_count} Delta warns` },
+    { label: "PII & UC Gov", val: `${ov.pii_column_count} / ${ov.governance_column_count}`, hint: "PII cols / UC policy cols" },
+    { label: "Avg Health", val: `${ov.avg_quality_score}/100`, hint: `${data.quality_issues.length} total findings` },
   ];
   document.getElementById("kpi-grid").innerHTML = kpis.map(k =>
     `<div class="kpi"><div class="label">${k.label}</div><div class="val">${k.val}</div><div class="hint">${k.hint}</div></div>`
@@ -383,15 +419,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const sortedTables = [...data.tables].sort((a,b) => (b.row_count || 0) - (a.row_count || 0));
   document.getElementById("overview-health-list").innerHTML = `
     <table>
-      <thead><tr><th>Object</th><th>Role</th><th>Rows</th><th>Health</th><th>Strategy</th></tr></thead>
+      <thead><tr><th>Object</th><th>Role</th><th>Rows</th><th>CDC</th><th>Health</th></tr></thead>
       <tbody>
         ${sortedTables.map(t => `
           <tr>
-            <td><span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></td>
+            <td>
+              <span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>
+              ${t.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(t.semantic_name)}</div>` : ""}
+            </td>
             <td><span class="badge b-purple">${esc(t.recommendations?.entity_role || 'unknown')}</span></td>
             <td class="mono">${fmtInt(t.row_count)}</td>
+            <td>${cdcBadge(t.cdc_readiness?.status)}</td>
             <td>${healthBadge(t.quality_score)}</td>
-            <td><span class="badge b-accent">${esc(t.recommendations?.ingestion_strategy || '—')}</span></td>
           </tr>
         `).join("")}
       </tbody>
@@ -422,6 +461,89 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .sort((a,b) => b[1] - a[1])
     .map(([r, c]) => `<span class="badge b-purple" style="font-size:12px;padding:4px 10px;">${esc(r)}: ${c}</span>`).join("");
 
+  // DATABRICKS & MANUFACTURING TAB
+  const audit = ov.cdc_audit;
+  document.getElementById("cdc-audit-card").innerHTML = `
+    <h2>Source CDC &amp; Lakeflow Connect Readiness (${esc(ov.dialect)})</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+      <span class="badge b-green">CDC Ready: ${ov.cdc_ready_table_count}</span>
+      <span class="badge b-red">CDC Blocked: ${ov.cdc_blocked_table_count}</span>
+      <span class="badge b-amber">Delta Lint Warnings: ${ov.delta_warning_count}</span>
+      ${audit?.wal_level ? `<span class="badge b-accent">wal_level: ${esc(audit.wal_level)}</span>` : ""}
+      ${audit?.db_change_tracking_enabled != null ? `<span class="badge b-accent">MSSQL CT: ${audit.db_change_tracking_enabled}</span>` : ""}
+    </div>
+    ${audit?.notes?.length ? `<ul style="margin:6px 0 0 18px;color:var(--text-muted);">${audit.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
+  `;
+
+  document.getElementById("dbx-table").innerHTML = `
+    <thead><tr><th>Table</th><th>Rows / Est. MB</th><th>Daily Rows</th><th>CDC</th><th>Connector</th><th>Liquid Clustering</th><th>Cadence / Tier</th></tr></thead>
+    <tbody>
+      ${data.tables.filter(t => t.table_type === "table").map(t => {
+        const sz = t.ingestion_sizing || {};
+        const cdc = t.cdc_readiness || {};
+        const dc = t.delta_compatibility || {};
+        return `
+          <tr>
+            <td>
+              <span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>
+              ${t.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(t.semantic_name)}</div>` : ""}
+            </td>
+            <td class="mono">${fmtInt(t.row_count)}<br><span style="color:var(--text-muted)">${sz.estimated_size_mb != null ? sz.estimated_size_mb.toFixed(2) + ' MB' : '—'}</span></td>
+            <td class="mono">${sz.estimated_daily_rows != null ? Math.round(sz.estimated_daily_rows).toLocaleString() : '—'}</td>
+            <td>${cdcBadge(cdc.status)}</td>
+            <td class="mono">${esc(cdc.connector_recommendation || '—')}</td>
+            <td class="mono">${(dc.liquid_clustering_keys || []).join(", ") || "—"}</td>
+            <td><span class="badge b-accent">${esc(sz.recommended_cadence || '—')}</span><div style="font-size:11px;color:var(--text-muted)">${esc(sz.recommended_databricks_tier || '')}</div></td>
+          </tr>`;
+      }).join("")}
+    </tbody>`;
+
+  const mfgItems = [];
+  data.tables.forEach(t => {
+    if (t.telemetry_profile) {
+      const tp = t.telemetry_profile;
+      mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
+        <div class="k">OT Telemetry · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></div>
+        <div class="v"><span class="badge b-orange">${esc(tp.pattern)}</span> ts: <code>${esc(tp.timestamp_column)}</code> · cadence: ${tp.median_interval_seconds ?? '—'}s</div>
+        <div class="d">Watermark delay: <code>${esc(tp.recommended_watermark_delay)}</code> · Cluster: <code>${esc((tp.recommended_liquid_cluster || []).join(', '))}</code>${tp.flatline_columns?.length ? ` · <span class="badge b-red">Flatlines: ${esc(tp.flatline_columns.join(', '))}</span>` : ""}</div>
+      </div>`);
+    }
+    if (t.hierarchy) {
+      mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
+        <div class="k">Recursive Hierarchy · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></div>
+        <div class="v"><span class="badge b-purple">${esc(t.hierarchy.pattern)}</span> <code>${esc(t.hierarchy.parent_column)} → ${esc(t.hierarchy.child_column)}</code></div>
+        <div class="d">${esc(t.hierarchy.reason)}</div>
+      </div>`);
+    }
+    t.columns.forEach(c => {
+      if (c.profile?.legacy_date) {
+        const ld = c.profile.legacy_date;
+        mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
+          <div class="k">Legacy Date/Time · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>.${esc(c.name)}</div>
+          <div class="v"><span class="badge b-amber">${esc(ld.encoding)}</span>${ld.paired_column ? ` paired with <code>${esc(ld.paired_column)}</code>` : ""}</div>
+          <div class="d mono">${esc(ld.spark_expression)}</div>
+        </div>`);
+      }
+    });
+  });
+  document.getElementById("mfg-signals").innerHTML = mfgItems.length ? mfgItems.join("") : `<div style="color:var(--text-muted)">No OT telemetry, recursive BOMs, or legacy integer dates detected.</div>`;
+
+  const lintRows = [];
+  data.tables.forEach(t => {
+    (t.delta_compatibility?.issues || []).forEach(iss => lintRows.push({ table: t.full_name, ...iss }));
+  });
+  document.getElementById("delta-lint-table").innerHTML = `
+    <thead><tr><th>Sev</th><th>Table / Col</th><th>Category</th><th>Remediation</th></tr></thead>
+    <tbody>
+      ${lintRows.length ? lintRows.map(r => `
+        <tr>
+          <td>${sevBadge(r.severity)}</td>
+          <td class="mono"><span class="clickable" onclick="jumpToTable('${esc(r.table)}')">${esc(r.table)}</span>${r.column ? '.' + esc(r.column) : ''}</td>
+          <td class="mono">${esc(r.category)}</td>
+          <td>${esc(r.message)}<div style="font-size:11px;color:var(--accent)">${esc(r.remediation)}</div></td>
+        </tr>`).join("") : `<tr><td colspan="4" style="color:var(--text-muted)">All tables cleanly compatible with Spark/Delta Lake.</td></tr>`}
+    </tbody>`;
+
   // CATALOG & PROFILER
   let selectedTable = data.tables[0]?.full_name || null;
 
@@ -431,11 +553,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const filtered = data.tables.filter(t => {
       if (flt === "table" && t.table_type !== "table") return false;
       if (flt === "view" && t.table_type === "table") return false;
-      if (flt === "pii" && !t.columns.some(c => c.profile?.pii_findings?.length)) return false;
+      if (flt === "pii" && !t.columns.some(c => c.profile?.pii_findings?.length || c.profile?.governance_findings?.length)) return false;
+      if (flt === "mfg" && !(t.telemetry_profile || t.hierarchy || t.columns.some(c => c.profile?.legacy_date))) return false;
       if (flt === "issues" && t.quality_issues.length === 0) return false;
       if (q) {
-        const hitTbl = t.full_name.toLowerCase().includes(q);
-        const hitCol = t.columns.some(c => c.name.toLowerCase().includes(q));
+        const hitTbl = t.full_name.toLowerCase().includes(q) || (t.semantic_name || "").toLowerCase().includes(q);
+        const hitCol = t.columns.some(c => c.name.toLowerCase().includes(q) || (c.semantic_name || "").toLowerCase().includes(q));
         if (!hitTbl && !hitCol) return false;
       }
       return true;
@@ -448,12 +571,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     el.innerHTML = filtered.map(t => {
       const piiN = t.columns.filter(c => c.profile?.pii_findings?.length).length;
+      const govN = t.columns.filter(c => c.profile?.governance_findings?.length).length;
       return `
         <div class="tbl-item ${t.full_name === selectedTable ? 'selected' : ''}" onclick="jumpToTable('${esc(t.full_name)}')">
           <div class="name">${esc(t.name)} ${t.table_type !== 'table' ? '<span class="badge b-purple">VIEW</span>' : ''}</div>
+          ${t.semantic_name ? `<div class="sem">${esc(t.semantic_name)}</div>` : ""}
           <div class="meta">
             <span>${esc(t.schema_name)} · ${fmtInt(t.row_count)} rows</span>
-            <span>${piiN ? `<span class="badge b-red">PII:${piiN}</span>` : ''}${t.quality_score}/100</span>
+            <span>${piiN ? `<span class="badge b-red">PII:${piiN}</span>` : ''}${govN ? `<span class="badge b-orange">UC:${govN}</span>` : ''}${t.quality_score}/100</span>
           </div>
         </div>
       `;
@@ -468,50 +593,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       return;
     }
     const rec = tbl.recommendations;
+    const cdc = tbl.cdc_readiness;
+    const dc = tbl.delta_compatibility;
+    const sz = tbl.ingestion_sizing;
     const rels = data.relationships.filter(r => r.source_table === tbl.full_name || r.target_table === tbl.full_name);
 
     box.innerHTML = `
       <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;">
-          <div>
-            <h2 style="margin:0;font-family:var(--mono);font-size:18px;">${esc(tbl.full_name)}</h2>
-            <div style="margin-top:6px;">
-              <span class="badge b-accent">${esc(tbl.table_type.toUpperCase())}</span>
-              ${rec ? `<span class="badge b-purple">role: ${esc(rec.entity_role)}</span>` : ""}
-              ${healthBadge(tbl.quality_score)}
-              <span class="badge b-muted">${fmtInt(tbl.row_count)} rows${tbl.row_count_exact ? '' : ' (est)'}</span>
-              ${tbl.size_bytes != null ? `<span class="badge b-muted">${fmtBytes(tbl.size_bytes)}</span>` : ""}
-              ${tbl.primary_key.length ? `<span class="badge b-green">PK: ${esc(tbl.primary_key.join(', '))}</span>` : `<span class="badge b-red">NO PK</span>`}
-            </div>
-            ${tbl.comment ? `<p style="color:var(--text-muted);margin:8px 0 0 0;">${esc(tbl.comment)}</p>` : ""}
-          </div>
+        <h2 style="margin:0;font-family:var(--mono);font-size:18px;">
+          ${esc(tbl.full_name)} ${tbl.semantic_name ? `<span style="color:var(--accent);font-weight:500;">→ ${esc(tbl.semantic_name)}</span>` : ""}
+        </h2>
+        <div style="margin-top:6px;">
+          <span class="badge b-accent">${esc(tbl.table_type.toUpperCase())}</span>
+          ${rec ? `<span class="badge b-purple">role: ${esc(rec.entity_role)}</span>` : ""}
+          ${healthBadge(tbl.quality_score)}
+          ${cdcBadge(cdc?.status)}
+          <span class="badge b-muted">${fmtInt(tbl.row_count)} rows${tbl.row_count_exact ? '' : ' (est)'}</span>
+          ${tbl.primary_key.length ? `<span class="badge b-green">PK: ${esc(tbl.primary_key.join(', '))}</span>` : `<span class="badge b-red">NO PK</span>`}
+          ${tbl.telemetry_profile ? `<span class="badge b-orange">OT: ${esc(tbl.telemetry_profile.pattern)}</span>` : ""}
+          ${tbl.hierarchy ? `<span class="badge b-purple">HIERARCHY: ${esc(tbl.hierarchy.pattern)}</span>` : ""}
         </div>
+        ${(tbl.business_description || tbl.comment) ? `<p style="color:var(--text-muted);margin:8px 0 0 0;">${esc(tbl.business_description || tbl.comment)}</p>` : ""}
+        ${tbl.skipped_profiling_reason ? `<p style="color:var(--amber);margin:8px 0 0 0;">⚠ ${esc(tbl.skipped_profiling_reason)}</p>` : ""}
 
-        ${rec ? `
         <div class="rec-grid">
+          ${rec ? `
           <div class="rec-box">
-            <div class="k">Ingestion Strategy</div>
+            <div class="k">Ingestion &amp; CDC</div>
             <div class="v"><span class="badge b-accent">${esc(rec.ingestion_strategy)}</span></div>
-            <div class="d">${esc(rec.ingestion_strategy_reason)}</div>
-          </div>
+            <div class="d">${esc(cdc?.connector_recommendation || '')} · ${esc(rec.ingestion_strategy_reason)}</div>
+          </div>` : ""}
+          ${dc ? `
+          <div class="rec-box">
+            <div class="k">Databricks Liquid Clustering</div>
+            <div class="v mono">${dc.liquid_clustering_keys?.length ? `CLUSTER BY (${esc(dc.liquid_clustering_keys.join(', '))})` : "None suggested"}</div>
+            <div class="d">${dc.requires_column_mapping ? "⚠ Requires delta.columnMapping.mode='name' or column rename" : "Delta column names compliant"}</div>
+          </div>` : ""}
+          ${sz ? `
+          <div class="rec-box">
+            <div class="k">Backfill &amp; Cadence Sizing</div>
+            <div class="v mono">${sz.estimated_size_mb.toFixed(2)} MB · ${esc(sz.recommended_cadence)}</div>
+            <div class="d">${sz.estimated_daily_rows != null ? `~${Math.round(sz.estimated_daily_rows).toLocaleString()} rows/day · ` : ""}${esc(sz.recommended_databricks_tier)}</div>
+          </div>` : ""}
+          ${rec?.watermark_candidates?.length ? `
           <div class="rec-box">
             <div class="k">Watermark Candidates</div>
-            <div class="v mono">${rec.watermark_candidates.length ? rec.watermark_candidates.map(w => `${esc(w.column)} (${esc(w.kind)})`).join("<br>") : "None detected"}</div>
-          </div>
-          <div class="rec-box">
-            <div class="k">Partition &amp; Clustering</div>
-            <div class="v mono">
-              ${rec.partition_candidates.length ? "Part: " + rec.partition_candidates.map(p => `${esc(p.column)} [${p.granularity}]`).join(", ") : "Part: —"}<br>
-              ${rec.clustering_candidates.length ? "Cluster: " + rec.clustering_candidates.map(esc).join(", ") : "Cluster: —"}
-            </div>
-          </div>
-          ${rec.primary_key_candidates.length ? `
-          <div class="rec-box">
-            <div class="k">Candidate Primary Keys</div>
-            <div class="v mono">${rec.primary_key_candidates.map(esc).join(", ")}</div>
-            <div class="d">Unique &amp; non-null columns detected during profiling</div>
+            <div class="v mono">${rec.watermark_candidates.map(w => `${esc(w.column)} (${esc(w.kind)})`).join("<br>")}</div>
           </div>` : ""}
-        </div>` : ""}
+        </div>
 
         ${tbl.upstream_tables.length ? `
           <div style="margin-top:8px;">
@@ -537,8 +666,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <table>
             <thead>
               <tr>
-                <th>Column</th><th>Type</th><th>Null %</th><th>Distinct / Card.</th>
-                <th>Range / Stats</th><th>PII &amp; Freshness</th><th>Top / Sample Values</th>
+                <th>Column</th><th>Source → Spark Type</th><th>Null %</th><th>Distinct</th>
+                <th>Range / Stats</th><th>PII / UC Governance / Signals</th><th>Top Values</th>
               </tr>
             </thead>
             <tbody>
@@ -551,12 +680,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   !c.nullable ? '<span class="badge b-muted">NN</span>' : ''
                 ].join("");
 
-                let nullHtml = "—";
-                let distHtml = "—";
-                let statsHtml = "—";
-                let piiHtml = "—";
-                let valsHtml = "—";
-
+                let nullHtml = "—", distHtml = "—", statsHtml = "—", flagsHtml = "—", valsHtml = "—";
                 if (p && !p.profile_error) {
                   const pct = Math.round(p.null_rate * 100);
                   const barColor = pct >= 50 ? "var(--red)" : pct >= 10 ? "var(--amber)" : "var(--green)";
@@ -567,18 +691,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   if (p.min_value != null) st.push(`min: <code>${esc(p.min_value)}</code>`);
                   if (p.max_value != null) st.push(`max: <code>${esc(p.max_value)}</code>`);
                   if (p.mean != null) st.push(`mean: <code>${p.mean}</code> · p50: <code>${p.p50}</code>`);
-                  if (p.avg_length != null) st.push(`len: ${p.min_length}..${p.max_length} (avg ${p.avg_length})`);
+                  if (p.avg_length != null) st.push(`len: ${p.min_length}..${p.max_length}`);
                   statsHtml = st.length ? `<div class="expand-row" style="margin:0">${st.join("<br>")}</div>` : "—";
 
                   const flags = [];
                   (p.pii_findings || []).forEach(f => {
-                    flags.push(`<span class="badge b-red" title="${esc(f.evidence.join('; '))}">PII: ${esc(f.category)} (${Math.round(f.score*100)}%)</span>`);
+                    flags.push(`<span class="badge b-red">PII: ${esc(f.category)}</span>`);
                   });
+                  (p.governance_findings || []).forEach(g => {
+                    flags.push(`<span class="badge b-orange">UC ${esc(g.uc_policy)}: ${esc(g.uc_tag_value)}</span>`);
+                  });
+                  if (p.legacy_date) {
+                    flags.push(`<span class="badge b-amber">LEGACY: ${esc(p.legacy_date.encoding)}</span>`);
+                  }
                   if (p.freshness_age_hours != null) {
                     const days = (p.freshness_age_hours / 24).toFixed(1);
-                    flags.push(`<span class="badge ${p.is_stale ? 'b-red' : 'b-green'}">${p.is_stale ? 'STALE' : 'FRESH'}: ${days}d ago</span>`);
+                    flags.push(`<span class="badge ${p.is_stale ? 'b-red' : 'b-green'}">${p.is_stale ? 'STALE' : 'FRESH'}: ${days}d</span>`);
                   }
-                  piiHtml = flags.join("<br>") || "—";
+                  flagsHtml = flags.join("<br>") || "—";
 
                   if (p.top_values?.length) {
                     valsHtml = p.top_values.slice(0,3).map(v =>
@@ -591,12 +721,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 return `
                   <tr>
-                    <td><div class="mono"><strong>${esc(c.name)}</strong></div><div style="margin-top:3px;">${keys}</div></td>
-                    <td><div class="mono">${esc(c.raw_type)}</div><span class="badge b-muted">${esc(c.canonical_type)}</span></td>
+                    <td>
+                      <div class="mono"><strong>${esc(c.name)}</strong></div>
+                      ${c.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(c.semantic_name)}</div>` : ""}
+                      <div style="margin-top:3px;">${keys}</div>
+                    </td>
+                    <td><div class="mono">${esc(c.raw_type)}</div>${c.spark_type ? `<span class="badge b-accent">${esc(c.spark_type)}</span>` : ""}</td>
                     <td>${nullHtml}</td>
                     <td>${distHtml}</td>
                     <td>${statsHtml}</td>
-                    <td>${piiHtml}</td>
+                    <td>${flagsHtml}</td>
                     <td>${valsHtml}</td>
                   </tr>`;
               }).join("")}
@@ -605,28 +739,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
       </div>
 
-      ${tbl.view_definition ? `
-      <div class="card">
-        <h2>View SQL Definition</h2>
-        <pre class="code-block">${esc(tbl.view_definition)}</pre>
-      </div>` : ""}
-
-      ${tbl.quality_issues.length ? `
-      <div class="card">
-        <h2>Table Quality Issues (${tbl.quality_issues.length})</h2>
-        <table>
-          <thead><tr><th>Severity</th><th>Category</th><th>Column</th><th>Message</th></tr></thead>
-          <tbody>
-            ${tbl.quality_issues.map(i => `
-              <tr>
-                <td>${sevBadge(i.severity)}</td>
-                <td class="mono">${esc(i.category)}</td>
-                <td class="mono">${esc(i.column || '—')}</td>
-                <td>${esc(i.message)}</td>
-              </tr>`).join("")}
-          </tbody>
-        </table>
-      </div>` : ""}
+      ${tbl.view_definition ? `<div class="card"><h2>View SQL Definition</h2><pre class="code-block">${esc(tbl.view_definition)}</pre></div>` : ""}
     `;
   }
 
@@ -670,37 +783,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   ["q-search","q-sev","q-cat"].forEach(id => document.getElementById(id).addEventListener("input", renderQuality));
   renderQuality();
 
-  // DE BLUEPRINT & DBT
-  document.getElementById("de-table").innerHTML = `
-    <thead><tr><th>Table</th><th>Role</th><th>Rows</th><th>Strategy</th><th>Watermark</th><th>Partition</th><th>Clustering</th><th>Candidate PK</th></tr></thead>
-    <tbody>
-      ${data.tables.map(t => {
-        const r = t.recommendations || {};
-        const wm = r.watermark_candidates?.[0] ? `${r.watermark_candidates[0].column} (${r.watermark_candidates[0].kind})` : "—";
-        const pt = r.partition_candidates?.[0] ? `${r.partition_candidates[0].column} [${r.partition_candidates[0].granularity}]` : "—";
-        const cl = (r.clustering_candidates || []).join(", ") || "—";
-        const pk = (r.primary_key_candidates || []).join(", ") || (t.primary_key.join(", ") || "—");
-        return `
-          <tr>
-            <td><span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></td>
-            <td><span class="badge b-purple">${esc(r.entity_role || '—')}</span></td>
-            <td class="mono">${fmtInt(t.row_count)}</td>
-            <td><span class="badge b-accent">${esc(r.ingestion_strategy || '—')}</span></td>
-            <td class="mono">${esc(wm)}</td>
-            <td class="mono">${esc(pt)}</td>
-            <td class="mono">${esc(cl)}</td>
-            <td class="mono">${esc(pk)}</td>
-          </tr>`;
-      }).join("")}
-    </tbody>`;
-  document.getElementById("dbt-yaml").textContent = dbtYaml;
-  document.getElementById("copy-dbt").addEventListener("click", async (e) => {
+  // CODE & DDL TAB
+  let activeCodeKey = "uc_ddl";
+  function renderCodePreview() {
+    document.getElementById("code-preview").textContent = codeAssets[activeCodeKey] || "";
+    document.querySelectorAll(".code-tab").forEach(b => {
+      b.classList.toggle("btn-primary", b.dataset.code === activeCodeKey);
+    });
+  }
+  document.querySelectorAll(".code-tab").forEach(b => b.addEventListener("click", () => {
+    activeCodeKey = b.dataset.code;
+    renderCodePreview();
+  }));
+  document.getElementById("copy-code").addEventListener("click", async (e) => {
     try {
-      await navigator.clipboard.writeText(dbtYaml);
+      await navigator.clipboard.writeText(codeAssets[activeCodeKey] || "");
       e.target.textContent = "Copied!";
-      setTimeout(() => e.target.textContent = "Copy YAML", 1500);
+      setTimeout(() => e.target.textContent = "Copy Active Code", 1500);
     } catch (_) {}
   });
+  renderCodePreview();
 
   // RELATIONSHIPS TABLE
   document.getElementById("rel-table").innerHTML = `
@@ -718,10 +820,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </tbody>`;
 
   // INTERACTIVE ERD
-  let erdInitialized = false;
-  let erdNodes = {};
-  let erdView = { x: 20, y: 20, scale: 1 };
-
+  let erdInitialized = false, erdNodes = {}, erdView = { x: 20, y: 20, scale: 1 };
   function initERDNodes() {
     const baseTables = data.tables.filter(t => t.table_type === "table");
     const colsPerRow = Math.max(2, Math.ceil(Math.sqrt(baseTables.length)));
@@ -731,13 +830,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const colIdx = i % colsPerRow;
       const shownCols = Math.min(t.columns.length, 10);
       const h = 44 + shownCols * 21 + (t.columns.length > 10 ? 20 : 0);
-      erdNodes[t.full_name] = {
-        table: t,
-        x: 30 + colIdx * (colW + gapX),
-        y: colHeights[colIdx],
-        w: colW,
-        h: h
-      };
+      erdNodes[t.full_name] = { table: t, x: 30 + colIdx * (colW + gapX), y: colHeights[colIdx], w: colW, h };
       colHeights[colIdx] += h + gapY;
     });
     erdInitialized = true;
@@ -753,46 +846,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     rels.forEach(r => {
       const a = erdNodes[r.source_table], b = erdNodes[r.target_table];
       if (!a || !b) return;
-      const ax = a.x + a.w / 2, ay = a.y + a.h / 2;
-      const bx = b.x + b.w / 2, by = b.y + b.h / 2;
-      const startX = ax < bx ? a.x + a.w : a.x;
-      const endX = ax < bx ? b.x : b.x + b.w;
-      const startY = a.y + 34, endY = b.y + 34;
-      const cx = (startX + endX) / 2;
+      const startX = (a.x + a.w/2) < (b.x + b.w/2) ? a.x + a.w : a.x;
+      const endX = (a.x + a.w/2) < (b.x + b.w/2) ? b.x : b.x + b.w;
+      const startY = a.y + 34, endY = b.y + 34, cx = (startX + endX) / 2;
       const isExp = r.kind === "explicit_fk";
       const stroke = isExp ? "#34d399" : "#fbbf24";
       const dash = isExp ? "" : 'stroke-dasharray="6,4"';
       const label = `${r.source_column} → ${r.target_column}${isExp ? '' : ' (' + Math.round(r.confidence*100) + '%)'}`;
-      edgeSvg += `
-        <path d="M ${startX} ${startY} C ${cx} ${startY}, ${cx} ${endY}, ${endX} ${endY}"
-              fill="none" stroke="${stroke}" stroke-width="2" ${dash} opacity="0.85" />
-        <circle cx="${endX}" cy="${endY}" r="4" fill="${stroke}" />
-        <text x="${cx}" y="${(startY + endY)/2 - 5}" text-anchor="middle" fill="${stroke}" font-size="10.5" font-family="monospace">${esc(label)}</text>
-      `;
+      edgeSvg += `<path d="M ${startX} ${startY} C ${cx} ${startY}, ${cx} ${endY}, ${endX} ${endY}" fill="none" stroke="${stroke}" stroke-width="2" ${dash} opacity="0.85" />
+                  <circle cx="${endX}" cy="${endY}" r="4" fill="${stroke}" />
+                  <text x="${cx}" y="${(startY + endY)/2 - 5}" text-anchor="middle" fill="${stroke}" font-size="10.5" font-family="monospace">${esc(label)}</text>`;
     });
 
     let nodeSvg = "";
     Object.values(erdNodes).forEach(n => {
-      const t = n.table;
-      const shown = t.columns.slice(0, 10);
+      const t = n.table, shown = t.columns.slice(0, 10);
       const rows = shown.map((c, idx) => {
         const badge = c.is_primary_key ? "PK" : c.is_foreign_key ? "FK" : "";
         const bColor = c.is_primary_key ? "#34d399" : "#38bdf8";
-        return `
-          <text x="${n.x + 12}" y="${n.y + 52 + idx * 21}" fill="var(--text)" font-size="11.5" font-family="monospace">${esc(c.name.slice(0,22))}</text>
-          <text x="${n.x + n.w - 10}" y="${n.y + 52 + idx * 21}" text-anchor="end" fill="${badge ? bColor : 'var(--text-muted)'}" font-size="10.5" font-family="monospace">${badge || esc(c.canonical_type)}</text>
-        `;
+        return `<text x="${n.x + 12}" y="${n.y + 52 + idx * 21}" fill="var(--text)" font-size="11.5" font-family="monospace">${esc(c.name.slice(0,22))}</text>
+                <text x="${n.x + n.w - 10}" y="${n.y + 52 + idx * 21}" text-anchor="end" fill="${badge ? bColor : 'var(--text-muted)'}" font-size="10.5" font-family="monospace">${badge || esc(c.canonical_type)}</text>`;
       }).join("");
-      const more = t.columns.length > 10 ? `<text x="${n.x + 12}" y="${n.y + n.h - 8}" fill="var(--text-muted)" font-size="10.5">+ ${t.columns.length - 10} more columns...</text>` : "";
-      nodeSvg += `
-        <g class="erd-node" data-id="${esc(t.full_name)}" style="cursor:move;">
-          <rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" />
-          <rect x="${n.x}" y="${n.y}" width="${n.w}" height="32" rx="8" fill="var(--bg-elev)" />
-          <text x="${n.x + 12}" y="${n.y + 21}" fill="var(--accent)" font-size="12.5" font-weight="700" font-family="monospace" class="erd-title" style="cursor:pointer;">${esc(t.name)}</text>
-          <text x="${n.x + n.w - 10}" y="${n.y + 20}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="monospace">${fmtInt(t.row_count)}</text>
-          ${rows}${more}
-        </g>
-      `;
+      const more = t.columns.length > 10 ? `<text x="${n.x + 12}" y="${n.y + n.h - 8}" fill="var(--text-muted)" font-size="10.5">+ ${t.columns.length - 10} more...</text>` : "";
+      nodeSvg += `<g class="erd-node" data-id="${esc(t.full_name)}" style="cursor:move;">
+        <rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="8" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.5" />
+        <rect x="${n.x}" y="${n.y}" width="${n.w}" height="32" rx="8" fill="var(--bg-elev)" />
+        <text x="${n.x + 12}" y="${n.y + 21}" fill="var(--accent)" font-size="12.5" font-weight="700" font-family="monospace" class="erd-title" style="cursor:pointer;">${esc(t.name)}</text>
+        <text x="${n.x + n.w - 10}" y="${n.y + 20}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="monospace">${fmtInt(t.row_count)}</text>
+        ${rows}${more}</g>`;
     });
 
     svg.innerHTML = `<g id="erd-vp" transform="translate(${erdView.x},${erdView.y}) scale(${erdView.scale})">${edgeSvg}${nodeSvg}</g>`;
@@ -801,21 +882,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   let dragState = null;
   function bindERDDrag() {
-    const svg = document.getElementById("erd-svg");
-    svg.querySelectorAll(".erd-node").forEach(el => {
+    document.getElementById("erd-svg").querySelectorAll(".erd-node").forEach(el => {
       el.addEventListener("mousedown", (e) => {
         e.stopPropagation();
-        if (e.target.classList.contains("erd-title")) {
-          jumpToTable(el.dataset.id);
-          return;
-        }
+        if (e.target.classList.contains("erd-title")) { jumpToTable(el.dataset.id); return; }
         const n = erdNodes[el.dataset.id];
         dragState = { type: "node", node: n, sx: e.clientX, sy: e.clientY, ox: n.x, oy: n.y };
       });
     });
   }
-  const erdWrap = document.getElementById("erd-wrap");
-  erdWrap.addEventListener("mousedown", (e) => {
+  document.getElementById("erd-wrap").addEventListener("mousedown", (e) => {
     dragState = { type: "pan", sx: e.clientX, sy: e.clientY, ox: erdView.x, oy: erdView.y };
   });
   window.addEventListener("mousemove", (e) => {
@@ -850,17 +926,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const typeMap = {};
     data.tables.forEach(t => { typeMap[t.full_name] = t.table_type; });
     const nodesSet = new Set();
-    const parents = {}, children = {};
-    edges.forEach(e => {
-      nodesSet.add(e.upstream_table);
-      nodesSet.add(e.downstream_table);
-      (children[e.upstream_table] = children[e.upstream_table] || []).push(e.downstream_table);
-      (parents[e.downstream_table] = parents[e.downstream_table] || []).push(e.upstream_table);
-    });
-
-    // Topological layering
-    const depth = {};
-    const nodes = [...nodesSet];
+    edges.forEach(e => { nodesSet.add(e.upstream_table); nodesSet.add(e.downstream_table); });
+    const depth = {}, nodes = [...nodesSet];
     nodes.forEach(n => { depth[n] = 0; });
     for (let iter = 0; iter < nodes.length; iter++) {
       edges.forEach(e => {
@@ -869,41 +936,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
       });
     }
-
     const layers = {};
     nodes.forEach(n => { (layers[depth[n]] = layers[depth[n]] || []).push(n); });
-    const pos = {};
-    const nodeW = 220, nodeH = 44;
+    const pos = {}, nodeW = 220, nodeH = 44;
     Object.keys(layers).sort((a,b) => Number(a) - Number(b)).forEach(d => {
-      layers[d].sort().forEach((n, idx) => {
-        pos[n] = { x: 35 + Number(d) * 300, y: 35 + idx * 72 };
-      });
+      layers[d].sort().forEach((n, idx) => { pos[n] = { x: 35 + Number(d) * 300, y: 35 + idx * 72 }; });
     });
 
     let edgeSvg = "";
     edges.forEach(e => {
       const a = pos[e.upstream_table], b = pos[e.downstream_table];
       if (!a || !b) return;
-      const sx = a.x + nodeW, sy = a.y + nodeH / 2;
-      const ex = b.x, ey = b.y + nodeH / 2;
-      const cx = (sx + ex) / 2;
+      const sx = a.x + nodeW, sy = a.y + nodeH / 2, ex = b.x, ey = b.y + nodeH / 2, cx = (sx + ex) / 2;
       const color = e.edge_type === "view_dependency" ? "#a78bfa" : "#38bdf8";
-      edgeSvg += `<path d="M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ey}, ${ex} ${ey}" fill="none" stroke="${color}" stroke-width="2" opacity="0.85" />
-                  <circle cx="${ex}" cy="${ey}" r="4" fill="${color}" />`;
+      edgeSvg += `<path d="M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ey}, ${ex} ${ey}" fill="none" stroke="${color}" stroke-width="2" opacity="0.85" /><circle cx="${ex}" cy="${ey}" r="4" fill="${color}" />`;
     });
 
     let nodeSvg = "";
     nodes.forEach(n => {
-      const p = pos[n];
-      const isView = typeMap[n] && typeMap[n] !== "table";
+      const p = pos[n], isView = typeMap[n] && typeMap[n] !== "table";
       const stroke = isView ? "#a78bfa" : "#38bdf8";
       const label = n.includes(".") ? n.split(".").slice(1).join(".") : n;
-      nodeSvg += `
-        <g style="cursor:pointer;" onclick="jumpToTable('${esc(n)}')">
-          <rect x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="8" fill="var(--bg-card)" stroke="${stroke}" stroke-width="1.8" />
-          <text x="${p.x + 12}" y="${p.y + 20}" fill="var(--text)" font-size="12.5" font-weight="700" font-family="monospace">${esc(label)}</text>
-          <text x="${p.x + 12}" y="${p.y + 35}" fill="var(--text-muted)" font-size="10.5" font-family="monospace">${esc(typeMap[n] || 'external')} · ${esc(n)}</text>
-        </g>`;
+      nodeSvg += `<g style="cursor:pointer;" onclick="jumpToTable('${esc(n)}')">
+        <rect x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="8" fill="var(--bg-card)" stroke="${stroke}" stroke-width="1.8" />
+        <text x="${p.x + 12}" y="${p.y + 20}" fill="var(--text)" font-size="12.5" font-weight="700" font-family="monospace">${esc(label)}</text>
+        <text x="${p.x + 12}" y="${p.y + 35}" fill="var(--text-muted)" font-size="10.5" font-family="monospace">${esc(typeMap[n] || 'external')} · ${esc(n)}</text>
+      </g>`;
     });
 
     svg.innerHTML = `<g>${edgeSvg}${nodeSvg}</g>`;
@@ -922,6 +980,8 @@ def render_html_report(result: DiscoveryResult) -> str:
     payload = {
         "result": result.model_dump(mode="json"),
         "dbt_yaml": render_dbt_sources_yaml(result),
+        "uc_ddl": render_unity_catalog_ddl(result),
+        "lakeflow_py": render_lakeflow_pipeline_py(result),
     }
     raw_json = json.dumps(payload).replace("</", "<\\/")
     return (

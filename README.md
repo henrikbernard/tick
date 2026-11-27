@@ -1,69 +1,75 @@
-# tick — Universal Automatic Database Discovery for Data Engineering
+# tick — Universal Automatic Database Discovery for Data Engineering & Databricks
 
-`tick` connects to any SQLAlchemy-supported database (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Snowflake, BigQuery, Oracle**) and automatically discovers everything a data engineer needs before building pipelines or dbt models.
+`tick` connects to any SQLAlchemy-supported database (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Databricks Unity Catalog, Oracle, IBM DB2/AS400, SAP HANA, Snowflake, BigQuery**) and automatically discovers everything a data engineer needs before building pipelines—with first-class **Databricks Lakehouse** and **Manufacturing / ERP / MES / OT** intelligence.
 
-## Features
+## Capabilities
 
-- **Universal Schema Catalog & Stats**: Introspects schemas, base tables, views, materialized views, column types (with canonical cross-dialect normalization), primary keys, foreign keys, unique constraints, indexes, row counts, and storage sizes.
-- **Data Profiling & Freshness**: Computes null rates, distinct counts, cardinality classes, min/max, numeric mean/stddev/quantiles (`p25`/`p50`/`p75`), string lengths, top-K frequencies, and timestamp freshness/staleness detection.
-- **Heuristic PII Detection**: Flags sensitive columns (`email`, `phone`, `ssn`, `credit_card` with Luhn check, `ip_address`, `iban`, `secret_token`, `date_of_birth`, `street_address`, `person_name`, `postal_code`) combining column-name patterns and sampled value regexes, with optional `--redact-pii` masking.
-- **Relationship & Lineage Discovery**:
-  - Collects explicit foreign keys and **infers missing/unenforced joins** using naming conventions + value-overlap verification.
-  - Parses view & materialized view SQL via `sqlglot` to build table-to-view and multi-hop view-to-view lineage graphs.
-- **Data Engineering Readiness**:
-  - Classifies entity roles (`fact`, `dimension`, `event_log`, `bridge`, `reference`, `staging`, `view`).
-  - Recommends ingestion strategies (`incremental_merge`, `incremental_append`, `full_refresh`, `cdc_or_snapshot`), watermark columns, partitioning keys, clustering keys, and candidate primary keys.
-  - Audits quality issues (missing PKs, empty tables, all-null/high-null columns, constant columns, stale data, unindexed FKs, PII alerts) and assigns a 0–100 health score.
-- **Multi-Format Exporters**:
-  - **Standalone Interactive HTML Report** (offline-capable single file with searchable catalog, profiling bars, draggable SVG ERD, lineage DAG, quality/PII filter, and copyable dbt YAML).
-  - **Markdown Data Dictionary** with Mermaid `erDiagram` & `flowchart` lineage diagrams.
-  - **dbt Scaffolding**: Ready-to-use `sources.yml` (with freshness, data tests, relationship tests, and PII metadata) plus `staging/stg_<schema>__<table>.sql` models.
-  - **Versioned JSON Snapshots & CI Diffing** (`tick diff before.json after.json --fail-on-breaking`).
+### Core Discovery & Lineage
+- **Universal Schema Catalog & Stats**: Introspects schemas, tables, views, materialized views, canonical cross-dialect types, PKs, FKs, unique constraints, indexes, row counts, and sizes.
+- **Data Profiling & Freshness**: Null rates, distinct counts, cardinality classes, min/max, numeric mean/stddev/quantiles (`p25`/`p50`/`p75`), string lengths, top-K frequencies, and timestamp freshness/staleness alerts.
+- **Relationship & Lineage Discovery**: Collects explicit FKs, infers missing/unenforced joins with value-overlap verification, and parses view SQL via `sqlglot` for multi-hop lineage graphs.
+- **Data Engineering Blueprint**: Classifies entity roles (`fact`, `dimension`, `event_log`, `bridge`, `reference`, `staging`, `view`), recommends ingestion strategies, watermarks, candidate PKs, and 0–100 table health scores.
+
+### Databricks & Lakeflow Readiness
+- **Unity Catalog Connector**: Connect directly to Databricks SQL Warehouses (`databricks://...`) alongside upstream OLTP/ERP databases.
+- **Lakeflow Connect / CDC Readiness Audit**: Inspects SQL Server Change Tracking/CDC, PostgreSQL `wal_level`/`REPLICA IDENTITY`, Oracle `ARCHIVELOG`/supplemental logging, MySQL `binlog_format`, PK presence, and unsupported column types.
+- **Spark / Delta Lake Compatibility Linter**: Flags Delta-illegal column names (`Order #`, `Qty/Hr`), `DECIMAL` precision > 38, `MONEY`/exotic types, timezone-naive plant timestamps (`TIMESTAMP_NTZ`), and over-partitioning vs. **Liquid Clustering (`CLUSTER BY`)**.
+- **Databricks Asset Exporter (`--databricks-dir`)**:
+  - `unity_catalog_ddl.sql`: Delta `CREATE TABLE` with Liquid Clustering, CDF, Deletion Vectors, comments, Unity Catalog governance tags, and row-filter/column-mask stubs.
+  - `lakeflow_pipeline.py`: Ready-to-run **Lakeflow Declarative Pipelines (DLT)** Bronze → Silver code with column sanitization, legacy date parsing, `@dlt.expect_all` data quality rules, `dlt.apply_changes` Auto CDC, and Structured Streaming watermarks.
+  - `ingestion_sizing.md`: Backfill size, daily incremental delta rate, cadence, and Databricks compute tier plan.
+
+### Manufacturing, OT & Multi-Plant Intelligence
+- **Production Shop-Floor Safety Guardrails**: `--read-uncommitted` (`WITH (NOLOCK)` / `WITH UR`), `--query-timeout`, `--skip-empty-tables` (ERP empty-table triage), `--skip-tables-over-mb`, and `--use-tablesample`.
+- **ERP / SAP Semantic Glossary**: Built-in SAP/MES glossary (`MARA`, `AUFK`, `WERKS`, `MATNR`, etc.), auto-extraction from SAP `DD02T`/`DD03T` if present, and custom `--glossary custom.yml` overrides.
+- **Legacy Date/Time Encoding Detection**: Detects `YYYYMMDD`, Julian (`CYYDDD`/`YYYYDDD`), Excel serial dates, `HHMMSS`, and split DATE + TIME pairs (`ERDAT` + `ERZET`) with ready-to-use PySpark stitching expressions.
+- **OT Historian & PLC Telemetry Detection**: Recognizes narrow EAV tag tables and wide PLC polling tables, measures polling cadence/gaps, catches flatlined sensors and bad OPC quality codes, and recommends streaming watermark delays & Liquid Clustering.
+- **Recursive BOM & Lot Genealogy Detection**: Identifies self-referential parent/child part, lot, work-order, and asset hierarchies.
+- **Manufacturing Governance**: Classifies plant isolation keys (`plant_id`, `werks` → UC row filters), commercial cost/margin columns (`unit_cost` → UC column masks), and ITAR/CAD/IP fields (`cad_drawing_path` → UC compliance tags) alongside consumer PII.
+- **Cross-Plant Schema Harmonization (`tick compare-sources`)**: Compares N plant snapshots to detect site-only columns, PK divergence, and type conflicts, generating unified multi-plant Databricks `UNION ALL` SQL.
 
 ## Installation
 
 ```bash
 pip install -e .
 
-# Install optional database drivers as needed:
+# Optional database drivers:
 pip install -e ".[duckdb]"
+pip install -e ".[databricks]"
 pip install -e ".[postgres]"
 pip install -e ".[mssql]"
-pip install -e ".[mysql]"
-pip install -e ".[snowflake]"
-pip install -e ".[bigquery]"
 pip install -e ".[oracle]"
+pip install -e ".[mysql]"
+pip install -e ".[db2]"
+pip install -e ".[hana]"
 ```
 
 ## Quick Start
 
 ```bash
-# 1. Check available database drivers
+# Check installed drivers
 tick drivers
 
-# 2. Generate a realistic demo DuckDB (or SQLite) database
-tick demo ./demo_warehouse.duckdb
+# Generate Smart Factory (SAP + MES + OT Historian + BOM) demos for two plants
+tick demo ./plant_ohio.duckdb --domain manufacturing --plant plant_ohio
+tick demo ./plant_munich.duckdb --domain manufacturing --plant plant_munich
 
-# 3. Run full automatic discovery and generate all outputs
-tick discover ./demo_warehouse.duckdb --out-dir ./discovery-output
+# Discover Plant Ohio with production safety guardrails & full Databricks + dbt + HTML bundle
+tick discover ./plant_ohio.duckdb \
+  --out-dir ./ohio-discovery \
+  --skip-empty-tables \
+  --use-tablesample \
+  --databricks-catalog manufacturing \
+  --databricks-schema bronze_ohio
 
-# 4. Point at any database URL
-tick discover "postgresql://user:pass@localhost:5432/analytics" -o ./pg-discovery
-tick discover "mssql+pyodbc://user:pass@host:1433/appdb?driver=ODBC+Driver+18+for+SQL+Server" -o ./mssql-discovery
-tick discover ./local.sqlite --redact-pii --html ./report.html --dbt-dir ./dbt_models
+# Discover Plant Munich snapshot
+tick discover ./plant_munich.duckdb --json ./munich_snapshot.json --quiet
 
-# 5. Diff two snapshots in CI to catch breaking schema changes or metric drift
+# Harmonize schemas across plants and generate unified Databricks SQL
+tick compare-sources ./ohio-discovery/snapshot.json ./munich_snapshot.json \
+  --md ./harmonization.md \
+  --sql ./unified_silver_views.sql
+
+# Detect schema drift in CI between two point-in-time snapshots
 tick diff before.json after.json --md drift.md --fail-on-breaking
-```
-
-## Python API
-
-```python
-from tick import DiscoveryConfig, discover_database, diff_snapshots
-
-result = discover_database(
-    "duckdb:///demo_warehouse.duckdb",
-    config=DiscoveryConfig(profile_mode="full", redact_pii=True),
-)
-print(result.overview.model_dump())
 ```

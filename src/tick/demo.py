@@ -355,3 +355,326 @@ def create_demo_database(output_path: str | Path) -> Path:
 
     engine.dispose()
     return path
+
+
+def create_manufacturing_demo_database(
+    output_path: str | Path,
+    plant_variant: str = "plant_ohio",
+) -> Path:
+    """Create a Smart Factory / SAP + MES + OT Historian + BOM demo database (SQLite or DuckDB)."""
+    path = Path(output_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+
+    url = resolve_connection_url(str(path))
+    engine = create_engine(url, future=True)
+
+    rng = random.Random(101 if plant_variant == "plant_ohio" else 202)
+    now = datetime.now(timezone.utc)
+    is_munich = plant_variant != "plant_ohio"
+    plant_code = "DE02" if is_munich else "US01"
+
+    with engine.begin() as conn:
+        # 1. SAP MARA (Material Master — cryptic names + commercial sensitive STPRS cost)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE MARA (
+                    MANDT VARCHAR(3) NOT NULL,
+                    MATNR VARCHAR(18) PRIMARY KEY,
+                    MTART VARCHAR(4) NOT NULL,
+                    MEINS VARCHAR(4) NOT NULL,
+                    STPRS DECIMAL(12, 2) NOT NULL,
+                    ERDAT INTEGER NOT NULL
+                )
+                """
+            )
+        )
+
+        # 2. SAP AUFK (Production Orders — plant isolation WERKS + split ERDAT/ERZET integer date+time!)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE AUFK (
+                    AUFNR VARCHAR(16) PRIMARY KEY,
+                    WERKS VARCHAR(6) NOT NULL,
+                    MATNR VARCHAR(18) NOT NULL,
+                    AUART VARCHAR(6) NOT NULL,
+                    ERDAT INTEGER NOT NULL,
+                    ERZET INTEGER NOT NULL,
+                    AEDAT INTEGER NOT NULL
+                )
+                """
+            )
+        )
+
+        # 3. MES Work Orders (Spaces in column names -> Delta linter!, ITAR/CAD path, unit_cost, site drift!)
+        if is_munich:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE work_orders (
+                        "Order #" VARCHAR(24) PRIMARY KEY,
+                        plant_code VARCHAR(8) NOT NULL,
+                        material_number VARCHAR(18) NOT NULL,
+                        "Qty/Hr" DECIMAL(10, 2) NOT NULL,
+                        unit_cost DECIMAL(12, 2) NOT NULL,
+                        cad_drawing_path VARCHAR(200),
+                        status VARCHAR(20) NOT NULL,
+                        eu_shift_supervisor VARCHAR(80),
+                        created_at TIMESTAMP NOT NULL,
+                        updated_at TIMESTAMP NOT NULL
+                    )
+                    """
+                )
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE work_orders (
+                        "Order #" INTEGER PRIMARY KEY,
+                        plant_code VARCHAR(8) NOT NULL,
+                        material_number VARCHAR(18) NOT NULL,
+                        "Qty/Hr" DECIMAL(10, 2) NOT NULL,
+                        unit_cost DECIMAL(12, 2) NOT NULL,
+                        cad_drawing_path VARCHAR(200),
+                        status VARCHAR(20) NOT NULL,
+                        created_at TIMESTAMP NOT NULL,
+                        updated_at TIMESTAMP NOT NULL
+                    )
+                    """
+                )
+            )
+
+        # 4. Recursive Bill of Materials (multi-level parent_part_id -> child_part_id)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bill_of_materials (
+                    bom_line_id INTEGER PRIMARY KEY,
+                    parent_part_id VARCHAR(18) NOT NULL,
+                    child_part_id VARCHAR(18) NOT NULL,
+                    qty_per DECIMAL(10, 4) NOT NULL,
+                    plant_id VARCHAR(8) NOT NULL
+                )
+                """
+            )
+        )
+
+        # 5. Narrow OT Historian Tag Table (10-second polling + OPC quality codes with bad readings)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE historian_tags (
+                    tag_id VARCHAR(48) NOT NULL,
+                    recorded_at TIMESTAMP NOT NULL,
+                    value DOUBLE NOT NULL,
+                    quality_code INTEGER NOT NULL
+                )
+                """
+            )
+        )
+
+        # 6. Wide PLC Polling Table (with intentionally flatlined vibration_mm_s sensor!)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE plc_press_telemetry (
+                    press_id VARCHAR(16) NOT NULL,
+                    recorded_at TIMESTAMP NOT NULL,
+                    temp_c DOUBLE NOT NULL,
+                    pressure_bar DOUBLE NOT NULL,
+                    spindle_rpm INTEGER NOT NULL,
+                    vibration_mm_s DOUBLE NOT NULL
+                )
+                """
+            )
+        )
+
+        # 7. Empty SAP Z-table (tests --skip-empty-tables guardrail!)
+        if not is_munich:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE empty_sap_ztable (
+                        MANDT VARCHAR(3),
+                        ZKEY VARCHAR(20),
+                        ZVAL VARCHAR(100)
+                    )
+                    """
+                )
+            )
+
+        # Seed MARA (20 materials)
+        mat_rows = []
+        for i in range(1, 21):
+            mtart = "FERT" if i <= 4 else ("HALB" if i <= 10 else "ROH")
+            mat_rows.append(
+                {
+                    "MANDT": "100",
+                    "MATNR": f"MAT-{i:05d}",
+                    "MTART": mtart,
+                    "MEINS": "EA" if i <= 10 else "KG",
+                    "STPRS": round(rng.uniform(4.5, 450.0), 2),
+                    "ERDAT": int((now - timedelta(days=rng.randint(10, 180))).strftime("%Y%m%d")),
+                }
+            )
+        conn.execute(
+            text("INSERT INTO MARA VALUES (:MANDT, :MATNR, :MTART, :MEINS, :STPRS, :ERDAT)"),
+            mat_rows,
+        )
+
+        # Seed AUFK (45 production orders)
+        aufk_rows = []
+        for i in range(1, 46):
+            dt = now - timedelta(days=rng.randint(0, 30), hours=rng.randint(0, 23), minutes=rng.randint(0, 59))
+            upd = dt + timedelta(days=rng.randint(0, 3))
+            aufk_rows.append(
+                {
+                    "AUFNR": f"000100{i:04d}",
+                    "WERKS": plant_code,
+                    "MATNR": f"MAT-{rng.randint(1, 10):05d}",
+                    "AUART": rng.choice(["PP01", "PP02", "PM01"]),
+                    "ERDAT": int(dt.strftime("%Y%m%d")),
+                    "ERZET": int(dt.strftime("%H%M%S")),
+                    "AEDAT": int(upd.strftime("%Y%m%d")),
+                }
+            )
+        conn.execute(
+            text("INSERT INTO AUFK VALUES (:AUFNR, :WERKS, :MATNR, :AUART, :ERDAT, :ERZET, :AEDAT)"),
+            aufk_rows,
+        )
+
+        # Seed work_orders (50 rows)
+        wo_rows = []
+        for i in range(1, 51):
+            created = now - timedelta(days=rng.randint(0, 20), hours=rng.randint(0, 23))
+            updated = created + timedelta(hours=rng.randint(1, 12))
+            row = {
+                "order_num": f"DE-{i:05d}" if is_munich else i,
+                "plant_code": plant_code,
+                "material_number": f"MAT-{rng.randint(1, 10):05d}",
+                "qty_hr": round(rng.uniform(20.0, 180.0), 2),
+                "unit_cost": round(rng.uniform(15.0, 320.0), 2),
+                "cad_drawing_path": f"s3://plm-vault/itar/DWG-{rng.randint(100,999)}.step",
+                "status": rng.choice(["OPEN", "IN_PROGRESS", "COMPLETE", "HOLD"]),
+                "created_at": created.isoformat(sep=" ", timespec="seconds"),
+                "updated_at": updated.isoformat(sep=" ", timespec="seconds"),
+            }
+            if is_munich:
+                row["eu_shift_supervisor"] = rng.choice(["K. Weber", "L. Bauer", "M. Hoffman"])
+            wo_rows.append(row)
+
+        if is_munich:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO work_orders ("Order #", plant_code, material_number, "Qty/Hr", unit_cost, cad_drawing_path, status, eu_shift_supervisor, created_at, updated_at)
+                    VALUES (:order_num, :plant_code, :material_number, :qty_hr, :unit_cost, :cad_drawing_path, :status, :eu_shift_supervisor, :created_at, :updated_at)
+                    """
+                ),
+                wo_rows,
+            )
+        else:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO work_orders ("Order #", plant_code, material_number, "Qty/Hr", unit_cost, cad_drawing_path, status, created_at, updated_at)
+                    VALUES (:order_num, :plant_code, :material_number, :qty_hr, :unit_cost, :cad_drawing_path, :status, :created_at, :updated_at)
+                    """
+                ),
+                wo_rows,
+            )
+
+        # Seed recursive multi-level BOM: FERT (1..4) -> HALB (5..10) -> ROH (11..20)
+        bom_rows = []
+        bid = 1
+        for fert in range(1, 5):
+            for halb in range(5, 8):
+                bom_rows.append(
+                    {
+                        "bom_line_id": bid,
+                        "parent_part_id": f"MAT-{fert:05d}",
+                        "child_part_id": f"MAT-{halb:05d}",
+                        "qty_per": float(rng.randint(1, 4)),
+                        "plant_id": plant_code,
+                    }
+                )
+                bid += 1
+        for halb in range(5, 11):
+            for roh in range(11, 14):
+                bom_rows.append(
+                    {
+                        "bom_line_id": bid,
+                        "parent_part_id": f"MAT-{halb:05d}",
+                        "child_part_id": f"MAT-{roh:05d}",
+                        "qty_per": round(rng.uniform(0.5, 5.0), 2),
+                        "plant_id": plant_code,
+                    }
+                )
+                bid += 1
+        conn.execute(
+            text("INSERT INTO bill_of_materials VALUES (:bom_line_id, :parent_part_id, :child_part_id, :qty_per, :plant_id)"),
+            bom_rows,
+        )
+
+        # Seed historian_tags (180 rows, 10s intervals, 10% bad OPC quality codes < 192)
+        hist_rows = []
+        base_ts = now - timedelta(minutes=30)
+        tags = ["LINE1.PRESS.TEMP", "LINE1.PRESS.BAR", "LINE2.OVEN.TEMP"]
+        for i in range(180):
+            ts = base_ts + timedelta(seconds=i * 10)
+            hist_rows.append(
+                {
+                    "tag_id": tags[i % len(tags)],
+                    "recorded_at": ts.isoformat(sep=" ", timespec="seconds"),
+                    "value": round(rng.uniform(45.0, 210.0), 3),
+                    "quality_code": 64 if i % 10 == 0 else 192,
+                }
+            )
+        conn.execute(
+            text("INSERT INTO historian_tags VALUES (:tag_id, :recorded_at, :value, :quality_code)"),
+            hist_rows,
+        )
+
+        # Seed plc_press_telemetry (100 rows, vibration_mm_s flatlined at 0.42!)
+        plc_rows = []
+        for i in range(100):
+            ts = base_ts + timedelta(seconds=i * 15)
+            plc_rows.append(
+                {
+                    "press_id": f"PRESS-{(i % 3) + 1}",
+                    "recorded_at": ts.isoformat(sep=" ", timespec="seconds"),
+                    "temp_c": round(rng.uniform(62.0, 88.5), 2),
+                    "pressure_bar": round(rng.uniform(110.0, 145.0), 2),
+                    "spindle_rpm": rng.randint(1200, 1850),
+                    "vibration_mm_s": 0.42,  # Stuck sensor!
+                }
+            )
+        conn.execute(
+            text("INSERT INTO plc_press_telemetry VALUES (:press_id, :recorded_at, :temp_c, :pressure_bar, :spindle_rpm, :vibration_mm_s)"),
+            plc_rows,
+        )
+
+        # View reading MES + SAP tables
+        conn.execute(
+            text(
+                """
+                CREATE VIEW v_plant_oee_summary AS
+                SELECT
+                    w.plant_code,
+                    w.material_number,
+                    m.MTART AS material_type,
+                    COUNT(*) AS order_count,
+                    AVG(w."Qty/Hr") AS avg_qty_per_hr
+                FROM work_orders w
+                LEFT JOIN MARA m ON m.MATNR = w.material_number
+                GROUP BY w.plant_code, w.material_number, m.MTART
+                """
+            )
+        )
+
+    engine.dispose()
+    return path

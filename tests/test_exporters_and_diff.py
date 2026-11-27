@@ -36,7 +36,7 @@ def test_all_exporters(tmp_path):
     md_text = md_path.read_text(encoding="utf-8")
     assert "```mermaid\nerDiagram" in md_text
     assert "```mermaid\nflowchart LR" in md_text
-    assert "Data Engineering Ingestion Blueprint" in md_text
+    assert "Ingestion Blueprint" in md_text
     assert "v_customer_ltv" in md_text
 
     # dbt scaffolding

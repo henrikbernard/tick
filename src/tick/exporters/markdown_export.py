@@ -1,4 +1,4 @@
-"""Markdown data dictionary, Mermaid ERD/lineage, and snapshot diff exporters."""
+"""Markdown data dictionary, Mermaid ERD/lineage, Databricks/Mfg signals, and diff exporters."""
 
 from __future__ import annotations
 
@@ -98,10 +98,11 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
     lines: list[str] = []
     badge = tbl.table_type.upper()
     role = tbl.recommendations.entity_role if tbl.recommendations else "unknown"
-    lines.append(f"### `{tbl.full_name}` ({badge} · role: `{role}` · health: `{tbl.quality_score}/100`)")
+    sem = f" — *{tbl.semantic_name}*" if tbl.semantic_name else ""
+    lines.append(f"### `{tbl.full_name}`{sem} ({badge} · role: `{role}` · health: `{tbl.quality_score}/100`)")
     lines.append("")
-    if tbl.comment:
-        lines.append(f"> {tbl.comment}")
+    if tbl.business_description or tbl.comment:
+        lines.append(f"> {tbl.business_description or tbl.comment}")
         lines.append("")
 
     meta_parts = [
@@ -110,8 +111,13 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         f"**PK:** `{', '.join(tbl.primary_key)}`" if tbl.primary_key else "**PK:** None",
         f"**Indexes:** {len(tbl.indexes)}",
     ]
+    if tbl.cdc_readiness and tbl.table_type == "table":
+        meta_parts.append(f"**CDC:** `{tbl.cdc_readiness.status}` (`{tbl.cdc_readiness.connector_recommendation}`)")
     lines.append(" | ".join(meta_parts))
     lines.append("")
+
+    if tbl.skipped_profiling_reason:
+        lines.append(f"- **Profiling skipped:** {tbl.skipped_profiling_reason}")
 
     if tbl.recommendations:
         rec = tbl.recommendations
@@ -121,29 +127,31 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         if rec.watermark_candidates:
             wms = ", ".join(f"`{w.column}` ({w.kind})" for w in rec.watermark_candidates)
             lines.append(f"- **Watermark candidates:** {wms}")
-        if rec.partition_candidates:
-            parts = ", ".join(f"`{p.column}` ({p.granularity})" for p in rec.partition_candidates)
-            lines.append(f"- **Partition candidates:** {parts}")
-        if rec.clustering_candidates:
-            lines.append(
-                f"- **Clustering keys:** {', '.join(f'`{c}`' for c in rec.clustering_candidates)}"
-            )
+        if tbl.delta_compatibility and tbl.delta_compatibility.liquid_clustering_keys:
+            lck = ", ".join(f"`{k}`" for k in tbl.delta_compatibility.liquid_clustering_keys)
+            lines.append(f"- **Databricks Liquid Clustering:** `CLUSTER BY ({lck})`")
         if rec.primary_key_candidates:
             lines.append(
                 f"- **Candidate PKs:** {', '.join(f'`{c}`' for c in rec.primary_key_candidates)}"
             )
-        lines.append("")
-
+    if tbl.telemetry_profile:
+        tp = tbl.telemetry_profile
+        lines.append(
+            f"- **OT Telemetry:** `{tp.pattern}` (ts: `{tp.timestamp_column}`, "
+            f"median cadence: `{tp.median_interval_seconds}s`, watermark delay: `{tp.recommended_watermark_delay}`)"
+        )
+    if tbl.hierarchy:
+        lines.append(f"- **Recursive Hierarchy:** `{tbl.hierarchy.pattern}` — {tbl.hierarchy.reason}")
     if tbl.upstream_tables:
         lines.append(
             f"- **Upstream dependencies:** {', '.join(f'`{u}`' for u in tbl.upstream_tables)}"
         )
-        lines.append("")
+    lines.append("")
 
     lines.append(
-        "| Column | Type | Keys | Nullable | Null % | Distinct | Cardinality | Min / Max | PII | Samples |"
+        "| Column | Semantic Name | Type (Spark) | Keys | Nullable | Null % | Distinct | Min / Max | PII / Gov / Legacy |"
     )
-    lines.append("|---|---|---|---|---:|---:|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---:|---:|---|---|")
     for col in tbl.columns:
         keys = []
         if col.is_primary_key:
@@ -155,31 +163,28 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         key_str = ", ".join(keys) or "—"
 
         prof = col.profile
+        flags: list[str] = []
         if prof and not prof.profile_error:
             null_pct = f"{prof.null_rate:.1%}"
             distinct = _fmt_int(prof.distinct_count)
-            card = prof.cardinality_class
             minmax = (
                 f"{_escape_md(prof.min_value)} .. {_escape_md(prof.max_value)}"
                 if prof.min_value is not None
                 else "—"
             )
-            pii = (
-                ", ".join(f"`{f.category}` ({f.confidence})" for f in prof.pii_findings)
-                if prof.pii_findings
-                else "—"
-            )
-            samples = (
-                ", ".join(f"`{_escape_md(s[:30])}`" for s in prof.sample_values[:3])
-                if prof.sample_values
-                else "—"
-            )
+            for f in prof.pii_findings:
+                flags.append(f"PII:`{f.category}`")
+            for g in prof.governance_findings:
+                flags.append(f"UC:`{g.uc_policy}/{g.uc_tag_value}`")
+            if prof.legacy_date:
+                flags.append(f"LEGACY:`{prof.legacy_date.encoding}`")
         else:
-            null_pct = distinct = card = minmax = pii = samples = "—"
+            null_pct = distinct = minmax = "—"
 
+        spark_note = f" → `{col.spark_type}`" if col.spark_type else ""
         lines.append(
-            f"| `{col.name}` | `{col.raw_type}` ({col.canonical_type}) | {key_str} | "
-            f"{'YES' if col.nullable else 'NO'} | {null_pct} | {distinct} | {card} | {minmax} | {pii} | {samples} |"
+            f"| `{col.name}` | {col.semantic_name or '—'} | `{col.raw_type}`{spark_note} | {key_str} | "
+            f"{'YES' if col.nullable else 'NO'} | {null_pct} | {distinct} | {minmax} | {', '.join(flags) or '—'} |"
         )
 
     lines.append("")
@@ -196,7 +201,7 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
 
 
 def render_markdown_report(result: DiscoveryResult) -> str:
-    """Render a full Markdown data discovery & engineering readiness report."""
+    """Render a full Markdown data discovery & Databricks readiness report."""
     ov = result.overview
     lines: list[str] = [
         f"# Database Discovery Report: `{ov.database_name}`",
@@ -211,33 +216,63 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         "| Metric | Value |",
         "|---|---:|",
         f"| Schemas | {ov.schema_count} |",
-        f"| Base Tables | {ov.table_count} |",
+        f"| Base Tables (Empty) | {ov.table_count} ({ov.empty_table_count}) |",
         f"| Views / Matviews | {ov.view_count} |",
         f"| Total Columns | {ov.column_count:,} |",
         f"| Total Rows | {ov.total_rows:,} |",
         f"| Total Size | {_fmt_bytes(ov.total_size_bytes)} |",
-        f"| Explicit Foreign Keys | {ov.explicit_fk_count} |",
-        f"| Inferred Relationships | {ov.inferred_relationship_count} |",
-        f"| PII Columns Flagged | {ov.pii_column_count} |",
+        f"| Explicit / Inferred Relationships | {ov.explicit_fk_count} / {ov.inferred_relationship_count} |",
+        f"| PII / Governance Columns | {ov.pii_column_count} / {ov.governance_column_count} |",
+        f"| CDC Ready / Blocked Tables | {ov.cdc_ready_table_count} / {ov.cdc_blocked_table_count} |",
+        f"| Delta Compatibility Warnings | {ov.delta_warning_count} |",
         f"| Average Health Score | {ov.avg_quality_score}/100 |",
         "",
     ]
 
-    # Data Engineering Ingestion Plan
-    lines.append("## Data Engineering Ingestion Blueprint")
+    # Data Engineering & Databricks Blueprint
+    lines.append("## Data Engineering & Databricks Ingestion Blueprint")
     lines.append("")
-    lines.append("| Table | Role | Rows | Health | Strategy | Primary Watermark | Partition | Clustering |")
-    lines.append("|---|---|---:|---:|---|---|---|---|")
+    lines.append("| Table | Semantic | Role | Rows | Est. MB | Strategy | CDC Status | Liquid Clustering (`CLUSTER BY`) | Cadence |")
+    lines.append("|---|---|---|---:|---:|---|---|---|---|")
     for tbl in result.tables:
         rec = tbl.recommendations
-        wm = f"`{rec.watermark_candidates[0].column}` ({rec.watermark_candidates[0].kind})" if rec and rec.watermark_candidates else "—"
-        part = f"`{rec.partition_candidates[0].column}` ({rec.partition_candidates[0].granularity})" if rec and rec.partition_candidates else "—"
-        clust = ", ".join(f"`{c}`" for c in rec.clustering_candidates[:3]) if rec and rec.clustering_candidates else "—"
+        cdc = tbl.cdc_readiness
+        dc = tbl.delta_compatibility
+        sz = tbl.ingestion_sizing
+        lck = ", ".join(f"`{k}`" for k in dc.liquid_clustering_keys) if (dc and dc.liquid_clustering_keys) else "—"
         lines.append(
-            f"| `{tbl.full_name}` | `{rec.entity_role if rec else 'unknown'}` | {_fmt_int(tbl.row_count)} | "
-            f"{tbl.quality_score}/100 | `{rec.ingestion_strategy if rec else '—'}` | {wm} | {part} | {clust} |"
+            f"| `{tbl.full_name}` | `{tbl.semantic_name or '—'}` | `{rec.entity_role if rec else 'unknown'}` | "
+            f"{_fmt_int(tbl.row_count)} | {f'{sz.estimated_size_mb:.2f}' if sz else '—'} | "
+            f"`{rec.ingestion_strategy if rec else '—'}` | `{cdc.status if cdc else '—'}` | {lck} | "
+            f"`{sz.recommended_cadence if sz else '—'}` |"
         )
     lines.append("")
+
+    # Manufacturing Signals summary (if any detected)
+    mfg_lines: list[str] = []
+    for tbl in result.tables:
+        if tbl.telemetry_profile:
+            tp = tbl.telemetry_profile
+            mfg_lines.append(
+                f"- **OT Telemetry (`{tbl.full_name}`)**: `{tp.pattern}` — ts=`{tp.timestamp_column}`, "
+                f"median cadence={tp.median_interval_seconds}s, watermark delay=`{tp.recommended_watermark_delay}`"
+                + (f", flatlines={tp.flatline_columns}" if tp.flatline_columns else "")
+            )
+        if tbl.hierarchy:
+            mfg_lines.append(f"- **Recursive Hierarchy (`{tbl.full_name}`)**: `{tbl.hierarchy.pattern}` — {tbl.hierarchy.reason}")
+        for col in tbl.columns:
+            if col.profile and col.profile.legacy_date:
+                ld = col.profile.legacy_date
+                mfg_lines.append(
+                    f"- **Legacy Date (`{tbl.full_name}.{col.name}`)**: `{ld.encoding}`"
+                    + (f" paired with `{ld.paired_column}`" if ld.paired_column else "")
+                    + f" — Spark: `{ld.spark_expression}`"
+                )
+    if mfg_lines:
+        lines.append("## Manufacturing & OT Pattern Signals")
+        lines.append("")
+        lines.extend(mfg_lines)
+        lines.append("")
 
     # Relationships & ERD
     erd = _render_mermaid_erd(result)
@@ -260,7 +295,6 @@ def render_markdown_report(result: DiscoveryResult) -> str:
             )
         lines.append("")
 
-    # View Lineage
     lineage_md = _render_mermaid_lineage(result)
     if lineage_md:
         lines.append("## View SQL Lineage")
@@ -268,9 +302,8 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         lines.append(lineage_md)
         lines.append("")
 
-    # Quality & PII Audit
     if result.quality_issues:
-        lines.append("## Data Quality & PII Findings")
+        lines.append("## Data Quality, Governance & Compatibility Findings")
         lines.append("")
         lines.append("| Severity | Category | Table | Column | Details |")
         lines.append("|---|---|---|---|---|")
@@ -281,7 +314,6 @@ def render_markdown_report(result: DiscoveryResult) -> str:
             )
         lines.append("")
 
-    # Detailed Catalog
     lines.append("## Table & Column Catalog")
     lines.append("")
     for tbl in result.tables:
