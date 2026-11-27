@@ -279,6 +279,15 @@ def normalize_type(raw_type: str) -> CanonicalType:
     return "other"
 
 
+def safe_rollback(conn: Connection) -> None:
+    """Clear an aborted SQL transaction (e.g. PostgreSQL InFailedSqlTransaction) after a caught query error."""
+    try:
+        if conn.in_transaction():
+            conn.rollback()
+    except Exception:
+        pass
+
+
 @dataclass
 class TableStats:
     row_count: int | None = None
@@ -418,6 +427,7 @@ class PostgresAdapter(DialectAdapter):
             row = conn.execute(text("SHOW server_version")).scalar()
             return str(row) if row else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def configure_safe_session(
@@ -430,7 +440,7 @@ class PostgresAdapter(DialectAdapter):
             if query_timeout_seconds and query_timeout_seconds > 0:
                 conn.execute(text(f"SET statement_timeout = {int(query_timeout_seconds * 1000)}"))
         except Exception:
-            pass
+            safe_rollback(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
         wal_level: str | None = None
@@ -443,6 +453,7 @@ class PostgresAdapter(DialectAdapter):
             else:
                 notes.append(f"PostgreSQL wal_level='{wal_level}' (must be 'logical' for Lakeflow Connect / Debezium CDC).")
         except Exception as exc:
+            safe_rollback(conn)
             notes.append(f"Could not inspect wal_level ({type(exc).__name__}); verify logical replication permissions.")
         return CdcDatabaseAudit(
             dialect=self.name,
@@ -470,7 +481,7 @@ class PostgresAdapter(DialectAdapter):
                 ri = ident_map.get(str(row["repl_ident"]), str(row["repl_ident"]))
                 probes[row["table_name"]] = TableCdcProbe(replica_identity=ri)
         except Exception:
-            pass
+            safe_rollback(conn)
         return probes
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
@@ -499,7 +510,7 @@ class PostgresAdapter(DialectAdapter):
                     is_materialized_view=(row["relkind"] == "m"),
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
     def get_materialized_views(self, conn: Connection, schema_name: str) -> list[str]:
@@ -510,6 +521,7 @@ class PostgresAdapter(DialectAdapter):
             ).scalars()
             return list(rows)
         except Exception:
+            safe_rollback(conn)
             return []
 
     def get_view_definition(
@@ -527,6 +539,7 @@ class PostgresAdapter(DialectAdapter):
             ).scalar()
             return str(res).strip() if res else None
         except Exception:
+            safe_rollback(conn)
             return None
 
     def build_sample_query(
@@ -686,7 +699,8 @@ class SqlServerAdapter(DialectAdapter):
     ) -> str:
         hint = " WITH (NOLOCK)" if read_uncommitted else ""
         if use_tablesample and total_rows and total_rows > sample_size * 4:
-            return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table}{hint} TABLESAMPLE ({sample_size * 2} ROWS)"
+            # In T-SQL grammar, TABLESAMPLE must precede table hints such as WITH (NOLOCK)
+            return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table} TABLESAMPLE ({sample_size * 2} ROWS){hint}"
         return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table}{hint}"
 
 

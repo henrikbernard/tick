@@ -46,7 +46,13 @@ def discover_database(
 
         if cfg.detect_manufacturing or cfg.glossary_path:
             _emit("Enriching tables & columns with ERP/MES semantic glossary...")
-            enrich_with_glossary(engine, tables, glossary_path=cfg.glossary_path)
+            enrich_with_glossary(
+                engine,
+                tables,
+                glossary_path=cfg.glossary_path,
+                adapter=adapter,
+                default_schema=default_schema,
+            )
 
         _emit(
             f"Profiling {len(tables)} object(s) (mode={cfg.profile_mode}, sample={cfg.sample_size})..."

@@ -23,7 +23,7 @@ CARD_CANDIDATE_RE = re.compile(r"^(?:\d[\s\-]?){13,19}$")
 # Column-name patterns: category -> list of regexes
 NAME_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "email": [re.compile(r"(?:^|_)(?:e?mail|email_addr(?:ess)?)(?:$|_)", re.I)],
-    "phone": [re.compile(r"(?:^|_)(?:phone|mobile|cell|tel|telephone|fax)(?:$|_|_num|_number)", re.I)],
+    "phone": [re.compile(r"(?:^|_)(?:phone|mobile|cell_?(?:phone|num(?:ber)?)|tel|telephone|fax)(?:$|_|_num|_number)", re.I)],
     "ssn": [re.compile(r"(?:^|_)(?:ssn|social_security|sin_num|national_id|tax_id)(?:$|_)", re.I)],
     "credit_card": [
         re.compile(r"(?:^|_)(?:card_num(?:ber)?|cc_num(?:ber)?|credit_card|pan|debit_card)(?:$|_)", re.I)
@@ -101,9 +101,10 @@ def detect_pii(
 
     # Check every category
     value_check_categories = {"email", "ssn", "phone", "credit_card", "ip_address", "iban", "secret_token"}
+    norm_col = re.sub(r"[\s\-]+", "_", column_name.strip())
 
     for category, patterns in NAME_PATTERNS.items():
-        name_hit = any(p.search(column_name) for p in patterns)
+        name_hit = any(p.search(norm_col) for p in patterns)
         match_rate: float | None = None
         evidence: list[str] = []
 

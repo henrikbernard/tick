@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from collections.abc import Sequence
+
 from tick.models import (
     CanonicalType,
     ColumnInfo,
@@ -27,6 +29,43 @@ def sanitize_delta_column_name(name: str) -> str:
     if cleaned[0].isdigit():
         cleaned = f"c_{cleaned}"
     return cleaned
+
+
+def deduplicate_column_names(col_names: Sequence[str]) -> dict[str, str]:
+    """Deterministically map raw column names to unique Delta-safe snake_case names."""
+    seen: set[str] = set()
+    mapping: dict[str, str] = {}
+    for raw in col_names:
+        base = sanitize_delta_column_name(raw)
+        candidate = base
+        suffix = 2
+        while candidate in seen:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        seen.add(candidate)
+        mapping[raw] = candidate
+    return mapping
+
+
+def deduplicate_table_names(tables: Sequence[TableInfo]) -> dict[str, str]:
+    """Map TableInfo.full_name to unique Delta/Python-safe table identifiers across schemas."""
+    distinct_schemas = {t.schema_name for t in tables}
+    seen: set[str] = set()
+    mapping: dict[str, str] = {}
+    for tbl in tables:
+        raw_base = tbl.semantic_name or tbl.name
+        if len(distinct_schemas) > 1:
+            base = sanitize_delta_column_name(f"{tbl.schema_name}_{raw_base}")
+        else:
+            base = sanitize_delta_column_name(raw_base)
+        candidate = base
+        suffix = 2
+        while candidate in seen:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        seen.add(candidate)
+        mapping[tbl.full_name] = candidate
+    return mapping
 
 
 def map_to_spark_type(raw_type: str, canonical: CanonicalType) -> str:
@@ -72,32 +111,35 @@ def map_to_spark_type(raw_type: str, canonical: CanonicalType) -> str:
     return "STRING"
 
 
-def _choose_liquid_clustering_keys(table: TableInfo) -> list[str]:
+def _choose_liquid_clustering_keys(table: TableInfo, col_map: dict[str, str]) -> list[str]:
     """Recommend up to 4 Databricks Liquid Clustering keys (modern replacement for partitioning + Z-ORDER)."""
     if table.table_type != "table":
         return []
     if table.telemetry_profile and table.telemetry_profile.recommended_liquid_cluster:
-        return [sanitize_delta_column_name(c) for c in table.telemetry_profile.recommended_liquid_cluster[:4]]
+        return [
+            col_map.get(c, sanitize_delta_column_name(c))
+            for c in table.telemetry_profile.recommended_liquid_cluster[:4]
+        ]
 
     keys: list[str] = []
 
     # 1. Plant / site isolation key first (huge win for multi-plant query pruning!)
     for col in table.columns:
         if col.profile and any(g.category == "plant_isolation_key" for g in col.profile.governance_findings):
-            keys.append(sanitize_delta_column_name(col.name))
+            keys.append(col_map.get(col.name, sanitize_delta_column_name(col.name)))
             break
 
     # 2. Primary temporal / watermark column
     if table.recommendations and table.recommendations.watermark_candidates:
         wm = table.recommendations.watermark_candidates[0]
-        sname = sanitize_delta_column_name(wm.column)
+        sname = col_map.get(wm.column, sanitize_delta_column_name(wm.column))
         if sname not in keys:
             keys.append(sname)
 
     # 3. High-selectivity clustering / FK keys
     if table.recommendations:
         for c in table.recommendations.clustering_candidates:
-            sc = sanitize_delta_column_name(c)
+            sc = col_map.get(c, sanitize_delta_column_name(c))
             if sc not in keys:
                 keys.append(sc)
             if len(keys) >= 4:
@@ -105,7 +147,8 @@ def _choose_liquid_clustering_keys(table: TableInfo) -> list[str]:
 
     # 4. Fallback to PK if nothing else
     if not keys and table.primary_key:
-        keys.append(sanitize_delta_column_name(table.primary_key[0]))
+        pk0 = table.primary_key[0]
+        keys.append(col_map.get(pk0, sanitize_delta_column_name(pk0)))
 
     return keys[:4]
 
@@ -115,6 +158,7 @@ def lint_databricks_compatibility(tables: list[TableInfo]) -> None:
     for tbl in tables:
         issues: list[DeltaCompatibilityIssue] = []
         requires_col_mapping = False
+        col_map = deduplicate_column_names([c.name for c in tbl.columns])
 
         for col in tbl.columns:
             col.spark_type = map_to_spark_type(col.raw_type, col.canonical_type)
@@ -196,7 +240,7 @@ def lint_databricks_compatibility(tables: list[TableInfo]) -> None:
                 )
             )
 
-        liquid_keys = _choose_liquid_clustering_keys(tbl)
+        liquid_keys = _choose_liquid_clustering_keys(tbl, col_map)
         has_high = any(i.severity == "high" for i in issues)
 
         tbl.delta_compatibility = DeltaCompatibility(

@@ -10,6 +10,7 @@ import yaml
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from tick.dialects import DialectAdapter, safe_rollback
 from tick.models import TableInfo
 
 # Built-in curated SAP ECC/S4 + Manufacturing ERP/MES glossary
@@ -116,52 +117,71 @@ def load_custom_glossary(path: str | Path) -> tuple[dict[str, tuple[str, str]], 
     return tbl_map, col_map
 
 
-def _try_extract_sap_ddic(engine: Engine, tables: list[TableInfo]) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
-    """If SAP DD02T / DD03T data dictionary tables exist in the discovered DB, extract descriptions."""
+def _try_extract_sap_ddic(
+    engine: Engine,
+    tables: list[TableInfo],
+    adapter: DialectAdapter | None = None,
+    default_schema: str | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """If SAP DD02T / DD03T data dictionary tables exist in the discovered DB, extract business descriptions."""
     table_names_u = {t.name.upper(): t for t in tables}
-    tbl_dict: dict[str, tuple[str, str]] = {}
-    col_dict: dict[str, tuple[str, str]] = {}
+    tbl_desc: dict[str, str] = {}
+    col_desc: dict[str, str] = {}
 
     if "DD02T" not in table_names_u and "DD03T" not in table_names_u:
-        return tbl_dict, col_dict
+        return tbl_desc, col_desc
 
     with engine.connect() as conn:
         if "DD02T" in table_names_u:
+            dd02t_tbl = table_names_u["DD02T"]
+            q_dd02t = (
+                adapter.quote_table(conn, dd02t_tbl.schema_name, dd02t_tbl.name, default_schema)
+                if adapter
+                else dd02t_tbl.name
+            )
             try:
                 rows = conn.execute(
-                    text("SELECT tabname, ddtext FROM dd02t WHERE ddlanguage = 'E'")
+                    text(f"SELECT tabname, ddtext FROM {q_dd02t} WHERE ddlanguage = 'E'")
                 ).fetchall()
                 for tabname, ddtext in rows:
                     if tabname and ddtext:
-                        tbl_dict[str(tabname).upper()] = (str(ddtext).strip(), str(ddtext).strip())
+                        tbl_desc[str(tabname).upper()] = str(ddtext).strip()
             except Exception:
-                pass
+                safe_rollback(conn)
         if "DD03T" in table_names_u:
+            dd03t_tbl = table_names_u["DD03T"]
+            q_dd03t = (
+                adapter.quote_table(conn, dd03t_tbl.schema_name, dd03t_tbl.name, default_schema)
+                if adapter
+                else dd03t_tbl.name
+            )
             try:
                 rows = conn.execute(
-                    text("SELECT fieldname, ddtext FROM dd03t WHERE ddlanguage = 'E'")
+                    text(f"SELECT fieldname, ddtext FROM {q_dd03t} WHERE ddlanguage = 'E'")
                 ).fetchall()
                 for fieldname, ddtext in rows:
                     if fieldname and ddtext:
-                        col_dict[str(fieldname).upper()] = (str(ddtext).strip(), str(ddtext).strip())
+                        col_desc[str(fieldname).upper()] = str(ddtext).strip()
             except Exception:
-                pass
+                safe_rollback(conn)
 
-    return tbl_dict, col_dict
+    return tbl_desc, col_desc
 
 
 def enrich_with_glossary(
     engine: Engine,
     tables: list[TableInfo],
     glossary_path: str | None = None,
+    adapter: DialectAdapter | None = None,
+    default_schema: str | None = None,
 ) -> None:
     """Populate semantic_name and business_description using built-in ERP glossary, SAP DDIC, and user YAML."""
     tbl_glossary = dict(BUILTIN_TABLE_GLOSSARY)
     col_glossary = dict(BUILTIN_COLUMN_GLOSSARY)
 
-    sap_t, sap_c = _try_extract_sap_ddic(engine, tables)
-    tbl_glossary.update(sap_t)
-    col_glossary.update(sap_c)
+    sap_t_desc, sap_c_desc = _try_extract_sap_ddic(
+        engine, tables, adapter=adapter, default_schema=default_schema
+    )
 
     if glossary_path:
         user_t, user_c = load_custom_glossary(glossary_path)
@@ -169,13 +189,20 @@ def enrich_with_glossary(
         col_glossary.update(user_c)
 
     for tbl in tables:
-        t_hit = tbl_glossary.get(tbl.name.upper())
+        key_u = tbl.name.upper()
+        t_hit = tbl_glossary.get(key_u)
         if t_hit:
             tbl.semantic_name = t_hit[0]
             tbl.business_description = t_hit[1] or tbl.comment
+        # SAP DD02T provides human descriptions without overwriting clean identifier semantic_name
+        if key_u in sap_t_desc and not tbl.business_description:
+            tbl.business_description = sap_t_desc[key_u]
 
         for col in tbl.columns:
-            c_hit = col_glossary.get(col.name.upper())
+            ckey_u = col.name.upper()
+            c_hit = col_glossary.get(ckey_u)
             if c_hit:
                 col.semantic_name = c_hit[0]
                 col.business_description = c_hit[1] or col.comment
+            if ckey_u in sap_c_desc and not col.business_description:
+                col.business_description = sap_c_desc[ckey_u]

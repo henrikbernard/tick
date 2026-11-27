@@ -396,12 +396,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   };
   document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
-  window.jumpToTable = (fullName) => {
+  const jumpToTable = (fullName) => {
     selectedTable = fullName;
     switchTab("catalog");
     renderCatalogList();
     renderTableDetail(fullName);
   };
+  document.addEventListener("click", (e) => {
+    const el = e.target.closest("[data-jump]");
+    if (el) jumpToTable(el.getAttribute("data-jump"));
+  });
 
   // OVERVIEW
   const kpis = [
@@ -424,7 +428,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         ${sortedTables.map(t => `
           <tr>
             <td>
-              <span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>
+              <span class="clickable mono" data-jump="${esc(t.full_name)}">${esc(t.full_name)}</span>
               ${t.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(t.semantic_name)}</div>` : ""}
             </td>
             <td><span class="badge b-purple">${esc(t.recommendations?.entity_role || 'unknown')}</span></td>
@@ -485,7 +489,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return `
           <tr>
             <td>
-              <span class="clickable mono" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>
+              <span class="clickable mono" data-jump="${esc(t.full_name)}">${esc(t.full_name)}</span>
               ${t.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(t.semantic_name)}</div>` : ""}
             </td>
             <td class="mono">${fmtInt(t.row_count)}<br><span style="color:var(--text-muted)">${sz.estimated_size_mb != null ? sz.estimated_size_mb.toFixed(2) + ' MB' : '—'}</span></td>
@@ -503,14 +507,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (t.telemetry_profile) {
       const tp = t.telemetry_profile;
       mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
-        <div class="k">OT Telemetry · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></div>
+        <div class="k">OT Telemetry · <span class="clickable" data-jump="${esc(t.full_name)}">${esc(t.full_name)}</span></div>
         <div class="v"><span class="badge b-orange">${esc(tp.pattern)}</span> ts: <code>${esc(tp.timestamp_column)}</code> · cadence: ${tp.median_interval_seconds ?? '—'}s</div>
         <div class="d">Watermark delay: <code>${esc(tp.recommended_watermark_delay)}</code> · Cluster: <code>${esc((tp.recommended_liquid_cluster || []).join(', '))}</code>${tp.flatline_columns?.length ? ` · <span class="badge b-red">Flatlines: ${esc(tp.flatline_columns.join(', '))}</span>` : ""}</div>
       </div>`);
     }
     if (t.hierarchy) {
       mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
-        <div class="k">Recursive Hierarchy · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span></div>
+        <div class="k">Recursive Hierarchy · <span class="clickable" data-jump="${esc(t.full_name)}">${esc(t.full_name)}</span></div>
         <div class="v"><span class="badge b-purple">${esc(t.hierarchy.pattern)}</span> <code>${esc(t.hierarchy.parent_column)} → ${esc(t.hierarchy.child_column)}</code></div>
         <div class="d">${esc(t.hierarchy.reason)}</div>
       </div>`);
@@ -519,7 +523,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (c.profile?.legacy_date) {
         const ld = c.profile.legacy_date;
         mfgItems.push(`<div class="rec-box" style="margin-bottom:8px;">
-          <div class="k">Legacy Date/Time · <span class="clickable" onclick="jumpToTable('${esc(t.full_name)}')">${esc(t.full_name)}</span>.${esc(c.name)}</div>
+          <div class="k">Legacy Date/Time · <span class="clickable" data-jump="${esc(t.full_name)}">${esc(t.full_name)}</span>.${esc(c.name)}</div>
           <div class="v"><span class="badge b-amber">${esc(ld.encoding)}</span>${ld.paired_column ? ` paired with <code>${esc(ld.paired_column)}</code>` : ""}</div>
           <div class="d mono">${esc(ld.spark_expression)}</div>
         </div>`);
@@ -538,7 +542,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       ${lintRows.length ? lintRows.map(r => `
         <tr>
           <td>${sevBadge(r.severity)}</td>
-          <td class="mono"><span class="clickable" onclick="jumpToTable('${esc(r.table)}')">${esc(r.table)}</span>${r.column ? '.' + esc(r.column) : ''}</td>
+          <td class="mono"><span class="clickable" data-jump="${esc(r.table)}">${esc(r.table)}</span>${r.column ? '.' + esc(r.column) : ''}</td>
           <td class="mono">${esc(r.category)}</td>
           <td>${esc(r.message)}<div style="font-size:11px;color:var(--accent)">${esc(r.remediation)}</div></td>
         </tr>`).join("") : `<tr><td colspan="4" style="color:var(--text-muted)">All tables cleanly compatible with Spark/Delta Lake.</td></tr>`}
@@ -573,7 +577,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const piiN = t.columns.filter(c => c.profile?.pii_findings?.length).length;
       const govN = t.columns.filter(c => c.profile?.governance_findings?.length).length;
       return `
-        <div class="tbl-item ${t.full_name === selectedTable ? 'selected' : ''}" onclick="jumpToTable('${esc(t.full_name)}')">
+        <div class="tbl-item ${t.full_name === selectedTable ? 'selected' : ''}" data-jump="${esc(t.full_name)}">
           <div class="name">${esc(t.name)} ${t.table_type !== 'table' ? '<span class="badge b-purple">VIEW</span>' : ''}</div>
           ${t.semantic_name ? `<div class="sem">${esc(t.semantic_name)}</div>` : ""}
           <div class="meta">
@@ -645,7 +649,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         ${tbl.upstream_tables.length ? `
           <div style="margin-top:8px;">
             <strong style="font-size:12px;color:var(--text-muted);">UPSTREAM DEPENDENCIES: </strong>
-            ${tbl.upstream_tables.map(u => `<span class="badge b-purple clickable" onclick="jumpToTable('${esc(u)}')">${esc(u)}</span>`).join("")}
+            ${tbl.upstream_tables.map(u => `<span class="badge b-purple clickable" data-jump="${esc(u)}">${esc(u)}</span>`).join("")}
           </div>` : ""}
 
         ${rels.length ? `
@@ -655,7 +659,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               const isOut = r.source_table === tbl.full_name;
               const other = isOut ? r.target_table : r.source_table;
               const cls = r.kind === "explicit_fk" ? "b-green" : "b-amber";
-              return `<span class="badge ${cls} clickable" onclick="jumpToTable('${esc(other)}')">${isOut ? '→' : '←'} ${esc(other)} (${esc(r.source_column)}→${esc(r.target_column)}${r.kind !== 'explicit_fk' ? ' ' + Math.round(r.confidence*100) + '%' : ''})</span>`;
+              return `<span class="badge ${cls} clickable" data-jump="${esc(other)}">${isOut ? '→' : '←'} ${esc(other)} (${esc(r.source_column)}→${esc(r.target_column)}${r.kind !== 'explicit_fk' ? ' ' + Math.round(r.confidence*100) + '%' : ''})</span>`;
             }).join("")}
           </div>` : ""}
       </div>
@@ -774,7 +778,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <tr>
             <td>${sevBadge(i.severity)}</td>
             <td class="mono">${esc(i.category)}</td>
-            <td><span class="clickable mono" onclick="jumpToTable('${esc(i.table)}')">${esc(i.table)}</span></td>
+            <td><span class="clickable mono" data-jump="${esc(i.table)}">${esc(i.table)}</span></td>
             <td class="mono">${esc(i.column || '—')}</td>
             <td>${esc(i.message)}</td>
           </tr>`).join("") : `<tr><td colspan="5" style="color:var(--text-muted)">No matching findings.</td></tr>`}
@@ -810,8 +814,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <tbody>
       ${data.relationships.length ? data.relationships.map(r => `
         <tr>
-          <td class="mono"><span class="clickable" onclick="jumpToTable('${esc(r.source_table)}')">${esc(r.source_table)}</span>.${esc(r.source_column)}</td>
-          <td class="mono"><span class="clickable" onclick="jumpToTable('${esc(r.target_table)}')">${esc(r.target_table)}</span>.${esc(r.target_column)}</td>
+          <td class="mono"><span class="clickable" data-jump="${esc(r.source_table)}">${esc(r.source_table)}</span>.${esc(r.source_column)}</td>
+          <td class="mono"><span class="clickable" data-jump="${esc(r.target_table)}">${esc(r.target_table)}</span>.${esc(r.target_column)}</td>
           <td><span class="badge ${r.kind === 'explicit_fk' ? 'b-green' : 'b-amber'}">${esc(r.kind)}</span></td>
           <td class="mono">${Math.round(r.confidence * 100)}%</td>
           <td class="mono">${r.overlap_rate != null ? Math.round(r.overlap_rate * 100) + '%' : '—'}</td>
@@ -957,7 +961,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const p = pos[n], isView = typeMap[n] && typeMap[n] !== "table";
       const stroke = isView ? "#a78bfa" : "#38bdf8";
       const label = n.includes(".") ? n.split(".").slice(1).join(".") : n;
-      nodeSvg += `<g style="cursor:pointer;" onclick="jumpToTable('${esc(n)}')">
+      nodeSvg += `<g style="cursor:pointer;" data-jump="${esc(n)}">
         <rect x="${p.x}" y="${p.y}" width="${nodeW}" height="${nodeH}" rx="8" fill="var(--bg-card)" stroke="${stroke}" stroke-width="1.8" />
         <text x="${p.x + 12}" y="${p.y + 20}" fill="var(--text)" font-size="12.5" font-weight="700" font-family="monospace">${esc(label)}</text>
         <text x="${p.x + 12}" y="${p.y + 35}" fill="var(--text-muted)" font-size="10.5" font-family="monospace">${esc(typeMap[n] || 'external')} · ${esc(n)}</text>

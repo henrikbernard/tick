@@ -12,7 +12,10 @@ from tick.models import DiscoveryResult, RelationshipInfo, TableInfo
 
 
 def _slug(text: str) -> str:
-    return re.sub(r"[^a-z0-9_]+", "_", text.lower()).strip("_") or "default"
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", text.lower()).strip("_") or "default"
+    if cleaned[0].isdigit():
+        cleaned = f"c_{cleaned}"
+    return cleaned
 
 
 def render_dbt_sources_yaml(result: DiscoveryResult, source_prefix: str | None = None) -> str:
@@ -140,14 +143,23 @@ def _render_staging_sql(source_name: str, tbl: TableInfo) -> str:
             )
 
     col_lines: list[str] = []
+    seen_aliases: set[str] = set()
     for col in tbl.columns:
-        alias = _slug(col.name)
+        base_alias = _slug(col.name)
+        alias = base_alias
+        suffix = 2
+        while alias in seen_aliases:
+            alias = f"{base_alias}_{suffix}"
+            suffix += 1
+        seen_aliases.add(alias)
+
         pii_comment = ""
         if col.profile and col.profile.pii_findings:
             cats = ", ".join(f.category for f in col.profile.pii_findings)
             pii_comment = f" -- PII: {cats}"
         if alias != col.name:
-            col_lines.append(f'        "{col.name}" as {alias},{pii_comment}')
+            escaped_raw = col.name.replace('"', '""')
+            col_lines.append(f'        "{escaped_raw}" as {alias},{pii_comment}')
         else:
             col_lines.append(f"        {col.name},{pii_comment}")
 

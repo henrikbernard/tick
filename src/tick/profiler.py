@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
-from tick.dialects import DialectAdapter
+from tick.dialects import DialectAdapter, safe_rollback
 from tick.models import ColumnInfo, ColumnProfile, DiscoveryConfig, TableInfo, ValueFrequency
 from tick.pii import detect_governance, detect_pii, redact_value
 
@@ -128,6 +128,7 @@ def _fetch_full_table_aggregates(
     try:
         row = conn.execute(text(sql)).mappings().first()
     except Exception:
+        safe_rollback(conn)
         return {}
     if not row:
         return {}
@@ -227,6 +228,12 @@ def profile_tables(
             try:
                 rows = conn.execute(text(sample_sql)).fetchall()
             except Exception as exc:
+                safe_rollback(conn)
+                adapter.configure_safe_session(
+                    conn,
+                    read_uncommitted=config.read_uncommitted,
+                    query_timeout_seconds=config.query_timeout_seconds,
+                )
                 err_msg = f"Profiling query failed: {type(exc).__name__}: {str(exc)[:180]}"
                 for col in tbl.columns:
                     col.profile = ColumnProfile(profile_error=err_msg)
@@ -263,7 +270,7 @@ def profile_tables(
                 distinct_n = len(counter)
                 distinct_rate = round(distinct_n / non_null_n, 4) if non_null_n > 0 else None
 
-                if distinct_n > 0 and col.canonical_type in {"integer", "string", "uuid"}:
+                if distinct_n > 0 and col.canonical_type in {"integer", "string", "uuid", "decimal"}:
                     artifacts.value_samples[(tbl.full_name, col.name)] = set(list(counter.keys())[:2000])
                 if str_vals:
                     artifacts.raw_str_samples[(tbl.full_name, col.name)] = str_vals[:500]
@@ -280,7 +287,7 @@ def profile_tables(
 
                 if agg and agg.get("min") is not None:
                     min_val = _stringify(agg["min"])
-                    max_val = _stringify(agg["max"])
+                    max_val = _stringify(agg["max"]) if agg.get("max") is not None else min_val
                 elif non_null_vals:
                     if col.canonical_type in {"integer", "float", "decimal"}:
                         nums = [f for f in (_to_float(v) for v in non_null_vals) if f is not None]

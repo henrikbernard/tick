@@ -58,8 +58,10 @@ HIERARCHY_PAIRS: list[tuple[re.Pattern[str], re.Pattern[str], str]] = [
 ]
 
 
-def _clean_col_expr(col_name: str) -> str:
-    return f"`{col_name}`" if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name) else col_name
+TELEMETRY_TS_RE = re.compile(
+    r"(?:^|_)(?:recorded_at|event_time|event_ts|sample_time|reading_time|measured_at|occurred_at|timestamp|ts|time_stamp|opc_ts)(?:$|_)",
+    re.I,
+)
 
 
 def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts) -> None:
@@ -81,7 +83,8 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
         # Normalize decimal-formatted ints like "20261126.0"
         norm_samples = [s[:-2] if s.endswith(".0") else s for s in samples[:200]]
         n = len(norm_samples)
-        cexpr = _clean_col_expr(col.name)
+        col_lit = repr(col.name)
+        norm_col = re.sub(r"[\s\-]+", "_", col.name.strip())
 
         # 1. YYYYMMDD
         ymd_hits = sum(1 for s in norm_samples if YYYYMMDD_RE.match(s))
@@ -89,16 +92,16 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
             enc = "yyyymmdd_int" if col.canonical_type in {"integer", "decimal"} else "yyyymmdd_str"
             col.profile.legacy_date = LegacyDateEncoding(
                 encoding=enc,  # type: ignore[arg-type]
-                confidence="high" if (ymd_hits / n >= 0.95 or DATE_NAME_RE.search(col.name)) else "medium",
+                confidence="high" if (ymd_hits / n >= 0.95 or DATE_NAME_RE.search(norm_col)) else "medium",
                 sample_match_rate=round(ymd_hits / n, 4),
-                spark_expression=f"F.to_date(F.col('{col.name}').cast('string'), 'yyyyMMdd')",
+                spark_expression=f"F.to_date(F.col({col_lit}).cast('string'), 'yyyyMMdd')",
                 note=f"Legacy {enc} date encoding detected in '{col.name}'; parse to Delta DATE in Silver.",
             )
             date_cols[col.name] = col
             continue
 
         # 2. HHMMSS (require time-like column name to avoid matching 6-digit zip/part numbers)
-        if TIME_NAME_RE.search(col.name):
+        if TIME_NAME_RE.search(norm_col):
             padded = [s.zfill(6) if s.isdigit() and len(s) <= 6 else s for s in norm_samples]
             hms_hits = sum(1 for s in padded if HHMMSS_RE.match(s))
             if hms_hits / n >= 0.80:
@@ -106,14 +109,14 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     encoding="hhmmss",
                     confidence="high",
                     sample_match_rate=round(hms_hits / n, 4),
-                    spark_expression=f"F.lpad(F.col('{col.name}').cast('string'), 6, '0')",
+                    spark_expression=f"F.lpad(F.col({col_lit}).cast('string'), 6, '0')",
                     note=f"Legacy HHMMSS time encoding detected in '{col.name}'; stitch with companion date column.",
                 )
                 time_cols[col.name] = col
                 continue
 
         # 3. Julian CYYDDD (SAP/JDE) or YYYYDDD (require date-like column name)
-        if DATE_NAME_RE.search(col.name):
+        if DATE_NAME_RE.search(norm_col):
             cyy_hits = sum(1 for s in norm_samples if JULIAN_CYYDDD_RE.match(s))
             if cyy_hits / n >= 0.80:
                 col.profile.legacy_date = LegacyDateEncoding(
@@ -121,9 +124,9 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     confidence="high",
                     sample_match_rate=round(cyy_hits / n, 4),
                     spark_expression=(
-                        f"F.to_date(F.concat((F.substring(F.col('{col.name}').cast('string'), 1, 1).cast('int') * 100 + 1900 "
-                        f"+ F.substring(F.col('{col.name}').cast('string'), 2, 2).cast('int')).cast('string'), "
-                        f"F.substring(F.col('{col.name}').cast('string'), 4, 3)), 'yyyyDDD')"
+                        f"F.to_date(F.concat((F.substring(F.col({col_lit}).cast('string'), 1, 1).cast('int') * 100 + 1900 "
+                        f"+ F.substring(F.col({col_lit}).cast('string'), 2, 2).cast('int')).cast('string'), "
+                        f"F.substring(F.col({col_lit}).cast('string'), 4, 3)), 'yyyyDDD')"
                     ),
                     note=f"Legacy JDE/ERP CYYDDD Julian date detected in '{col.name}'.",
                 )
@@ -136,7 +139,7 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     encoding="julian_yyyyddd",
                     confidence="high",
                     sample_match_rate=round(yyyyddd_hits / n, 4),
-                    spark_expression=f"F.to_date(F.col('{col.name}').cast('string'), 'yyyyDDD')",
+                    spark_expression=f"F.to_date(F.col({col_lit}).cast('string'), 'yyyyDDD')",
                     note=f"Legacy YYYYDDD Julian date detected in '{col.name}'.",
                 )
                 date_cols[col.name] = col
@@ -149,23 +152,27 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     encoding="excel_serial",
                     confidence="medium",
                     sample_match_rate=round(excel_hits / n, 4),
-                    spark_expression=f"F.date_add(F.lit('1899-12-30'), F.col('{col.name}').cast('int'))",
+                    spark_expression=f"F.date_add(F.lit('1899-12-30'), F.col({col_lit}).cast('int'))",
                     note=f"Possible Excel serial date integer detected in '{col.name}'.",
                 )
                 date_cols[col.name] = col
 
-    # Link split DATE + TIME pairs (e.g. erdat + erzet, mfg_date + mfg_time)
+    # Link split DATE + TIME pairs (e.g. erdat + erzet, mfg_date + mfg_time, "Mfg Date" + "Mfg Time")
     sap_pairs = [("erdat", "erzet"), ("aedat", "aezeit"), ("cpudt", "cputm")]
     for dname, dcol in date_cols.items():
-        dl = dname.lower()
+        dl = re.sub(r"[\s\-]+", "_", dname.strip()).lower()
         matched_time: str | None = None
         for sd, st in sap_pairs:
             if dl == sd:
-                matched_time = next((t for t in time_cols if t.lower() == st), None)
+                matched_time = next(
+                    (t for t in time_cols if re.sub(r"[\s\-]+", "_", t.strip()).lower() == st),
+                    None,
+                )
         if not matched_time:
             stem = re.sub(r"_?(?:date|dt)$", "", dl)
             for tname in time_cols:
-                tstem = re.sub(r"_?(?:time|tm)$", "", tname.lower())
+                tl = re.sub(r"[\s\-]+", "_", tname.strip()).lower()
+                tstem = re.sub(r"_?(?:time|tm)$", "", tl)
                 if stem and stem == tstem:
                     matched_time = tname
                     break
@@ -173,8 +180,8 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
             dcol.profile.legacy_date.paired_column = matched_time
             if dcol.profile.legacy_date.encoding in {"yyyymmdd_int", "yyyymmdd_str"}:
                 dcol.profile.legacy_date.spark_expression = (
-                    f"F.to_timestamp(F.concat(F.col('{dname}').cast('string'), "
-                    f"F.lpad(F.col('{matched_time}').cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
+                    f"F.to_timestamp(F.concat(F.col({dname!r}).cast('string'), "
+                    f"F.lpad(F.col({matched_time!r}).cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
                 )
                 dcol.profile.legacy_date.note = (
                     f"Split legacy DATE ('{dname}') + TIME ('{matched_time}') pair; stitch into TIMESTAMP in Silver."
@@ -192,7 +199,8 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     ts_cols = [c for c in table.columns if c.canonical_type == "timestamp"]
     if not ts_cols:
         return
-    ts_col = ts_cols[0]
+    # Prefer sensor/event timestamp names over ETL/audit timestamps like ingested_at or created_at
+    ts_col = next((c for c in ts_cols if TELEMETRY_TS_RE.search(c.name)), ts_cols[0])
 
     tag_col = next((c for c in table.columns if TAG_COL_RE.search(c.name)), None)
     val_col = next(

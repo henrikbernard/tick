@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection, Engine
 
-from tick.dialects import DialectAdapter, TableStats, normalize_type
+from tick.dialects import DialectAdapter, TableStats, normalize_type, safe_rollback
 from tick.models import (
     ColumnInfo,
     DiscoveryConfig,
@@ -25,6 +25,25 @@ def _matches_patterns(value: str, includes: list[str], excludes: list[str]) -> b
         return False
     if excludes and any(fnmatch.fnmatchcase(value.lower(), p.lower()) for p in excludes):
         return False
+    return True
+
+
+def _matches_table_patterns(
+    obj_name: str, full_name: str, includes: list[str], excludes: list[str]
+) -> bool:
+    """Match table include/exclude globs against both short name and schema-qualified name."""
+    if includes:
+        if not (
+            any(fnmatch.fnmatchcase(obj_name.lower(), p.lower()) for p in includes)
+            or any(fnmatch.fnmatchcase(full_name.lower(), p.lower()) for p in includes)
+        ):
+            return False
+    if excludes:
+        if (
+            any(fnmatch.fnmatchcase(obj_name.lower(), p.lower()) for p in excludes)
+            or any(fnmatch.fnmatchcase(full_name.lower(), p.lower()) for p in excludes)
+        ):
+            return False
     return True
 
 
@@ -147,6 +166,7 @@ def _count_rows_exact(conn: Connection, quoted_table: str) -> int | None:
         val = conn.execute(text(f"SELECT COUNT(*) FROM {quoted_table}")).scalar()
         return int(val) if val is not None else None
     except Exception:
+        safe_rollback(conn)
         return None
 
 
@@ -202,9 +222,8 @@ def introspect_catalog(
 
             for obj_name, obj_type in objects:
                 full_name = f"{schema_name}.{obj_name}"
-                if not (
-                    _matches_patterns(obj_name, config.include_tables, config.exclude_tables)
-                    or _matches_patterns(full_name, config.include_tables, config.exclude_tables)
+                if not _matches_table_patterns(
+                    obj_name, full_name, config.include_tables, config.exclude_tables
                 ):
                     continue
                 if config.max_tables is not None and len(tables) >= config.max_tables:

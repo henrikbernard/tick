@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tick.databricks import map_to_spark_type, sanitize_delta_column_name
+from tick.databricks import deduplicate_column_names, map_to_spark_type, sanitize_delta_column_name
 from tick.models import (
     DiscoveryResult,
     HarmonizationReport,
@@ -56,13 +56,29 @@ def harmonize_snapshots(
     """Compare N plant/site discovery snapshots and generate a unified multi-plant Bronze/Silver schema."""
     source_names = list(sources.keys())
 
-    # Index base tables by lowercase table name across sites
+    # Index base tables across sites; qualify with schema if a single site has duplicate table names across schemas
+    dup_names_within_source: set[str] = set()
+    for res in sources.values():
+        seen_in_src: set[str] = set()
+        for tbl in res.tables:
+            if tbl.table_type != "table":
+                continue
+            low = tbl.name.lower()
+            if low in seen_in_src:
+                dup_names_within_source.add(low)
+            seen_in_src.add(low)
+
     tables_by_name: dict[str, dict[str, TableInfo]] = {}
     for src_name, res in sources.items():
         for tbl in res.tables:
             if tbl.table_type != "table":
                 continue
-            tables_by_name.setdefault(tbl.name.lower(), {})[src_name] = tbl
+            key = (
+                f"{tbl.schema_name.lower()}.{tbl.name.lower()}"
+                if tbl.name.lower() in dup_names_within_source
+                else tbl.name.lower()
+            )
+            tables_by_name.setdefault(key, {})[src_name] = tbl
 
     harmonized_tables: list[HarmonizedTable] = []
     fully_aligned = 0
@@ -76,17 +92,18 @@ def harmonize_snapshots(
         unique_pks = {tuple(v) for v in pks_by_source.values()}
         pk_divergent = len(unique_pks) > 1
 
-        # Gather union of all columns (matched by lowercase sanitized name)
+        # Gather union of all columns (matched by deduplicated sanitized name per site)
         col_order: list[str] = []
-        col_sites: dict[str, dict[str, tuple[str, str, str, bool]]] = {}
+        col_sites: dict[str, dict[str, tuple[str, str, str, str, bool]]] = {}
         for s in present:
+            col_map = deduplicate_column_names([c.name for c in site_map[s].columns])
             for col in site_map[s].columns:
-                ck = sanitize_delta_column_name(col.name)
+                ck = col_map[col.name]
                 if ck not in col_sites:
                     col_order.append(ck)
                     col_sites[ck] = {}
                 spark_t = col.spark_type or map_to_spark_type(col.raw_type, col.canonical_type)
-                col_sites[ck][s] = (col.name, col.raw_type, spark_t, col.nullable)
+                col_sites[ck][s] = (col.name, col.raw_type, spark_t, col.canonical_type, col.nullable)
 
         h_cols: list[HarmonizedColumn] = []
         conflicts = 0
@@ -98,13 +115,10 @@ def harmonize_snapshots(
             c_missing = [s for s in present if s not in smap]
             raw_types = {s: smap[s][1] for s in c_present}
             spark_types = {s: smap[s][2] for s in c_present}
-            canonical_by_src = {
-                s: next(c.canonical_type for c in site_map[s].columns if sanitize_delta_column_name(c.name) == ck)
-                for s in c_present
-            }
+            canonical_by_src = {s: smap[s][3] for s in c_present}
             target_spark, has_conflict = _widen_spark_types(list(spark_types.values()))
             cast_needed = [s for s in c_present if spark_types[s] != target_spark]
-            nullable = bool(c_missing) or any(smap[s][3] for s in c_present)
+            nullable = bool(c_missing) or any(smap[s][4] for s in c_present)
 
             if has_conflict:
                 conflicts += 1
@@ -132,25 +146,28 @@ def harmonize_snapshots(
         for s in present:
             safe_site = sanitize_delta_column_name(s)
             safe_tbl = sanitize_delta_column_name(tbl_key)
-            selects = [f"    '{s}' AS `source_plant`"]
+            escaped_site_lit = s.replace("'", "''")
+            selects = [f"    '{escaped_site_lit}' AS `source_plant`"]
             for hc in h_cols:
                 if s in hc.present_in_sources:
-                    orig_col = col_sites[hc.sanitized_name][s][0]
+                    orig_col = col_sites[hc.sanitized_name][s][0].replace("`", "``")
                     if s in hc.cast_required_sources:
                         selects.append(f"    CAST(`{orig_col}` AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
                     else:
                         selects.append(f"    `{orig_col}` AS `{hc.sanitized_name}`")
                 else:
                     selects.append(f"    CAST(NULL AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
+            cat_esc = catalog.replace("`", "``")
             branch = (
                 "SELECT\n"
                 + ",\n".join(selects)
-                + f"\nFROM `{catalog}`.`{bronze_schema}_{safe_site}`.`{safe_tbl}`"
+                + f"\nFROM `{cat_esc}`.`{bronze_schema}_{safe_site}`.`{safe_tbl}`"
             )
             union_branches.append(branch)
 
+        cat_esc = catalog.replace("`", "``")
         unified_sql = (
-            f"CREATE OR REPLACE VIEW `{catalog}`.`silver`.`unified_{sanitize_delta_column_name(tbl_key)}` AS\n"
+            f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{sanitize_delta_column_name(tbl_key)}` AS\n"
             + "\nUNION ALL\n".join(union_branches)
             + ";\n"
         )
