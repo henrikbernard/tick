@@ -30,10 +30,6 @@ keywords = [
     "postgresql",
 ]
 
-[project.urls]
-Homepage = "https://github.com/henrikbernard/tick"
-Repository = "https://github.com/henrikbernard/tick"
-Issues = "https://github.com/henrikbernard/tick/issues"
 dependencies = [
     "sqlalchemy>=2.0.0",
     "pydantic>=2.7.0",
@@ -42,6 +38,11 @@ dependencies = [
     "pyyaml>=6.0.0",
     "sqlglot>=25.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/henrikbernard/tick"
+Repository = "https://github.com/henrikbernard/tick"
+Issues = "https://github.com/henrikbernard/tick/issues"
 
 [project.optional-dependencies]
 duckdb = ["duckdb>=1.0.0", "duckdb-engine>=0.13.0"]

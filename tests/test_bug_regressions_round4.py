@@ -382,3 +382,15 @@ def test_round4_bug9_diff_html_shows_pct_change_and_empty_zero_label():
     html_text = render_diff_html(diff)
     assert "pct_change" in html_text
     assert "0 (EMPTY)" in html_text
+
+
+def test_pyproject_toml_structure_valid():
+    """Guard against TOML table-ordering bugs like placing dependencies under [project.urls]."""
+    import pathlib
+    import tomllib
+
+    cfg = tomllib.loads((pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    proj = cfg["project"]
+    assert isinstance(proj["dependencies"], list) and len(proj["dependencies"]) >= 5
+    assert "dependencies" not in proj["urls"]
+    assert all(isinstance(v, str) and v.startswith("https://") for v in proj["urls"].values())
