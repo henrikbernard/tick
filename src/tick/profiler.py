@@ -162,7 +162,11 @@ def _apply_metadata_only_scanners(tables: list[TableInfo], config: DiscoveryConf
     for tbl in tables:
         for col in tbl.columns:
             pii = detect_pii(col.name, col.canonical_type, []) if config.detect_pii else []
-            gov = detect_governance(col.name, col.canonical_type) if config.detect_manufacturing else []
+            gov = (
+                detect_governance(col.name, col.canonical_type, semantic_name=col.semantic_name)
+                if config.detect_manufacturing
+                else []
+            )
             if pii or gov:
                 col.profile = ColumnProfile(pii_findings=pii, governance_findings=gov)
 
@@ -261,7 +265,9 @@ def profile_tables(
                 (idx, c.name) for idx, c in enumerate(tbl.columns) if c.canonical_type == "timestamp"
             ]
             tag_col_indices = [
-                (idx, c.name) for idx, c in enumerate(tbl.columns) if _TAG_HINT_RE.search(c.name)
+                (idx, c.name)
+                for idx, c in enumerate(tbl.columns)
+                if _TAG_HINT_RE.search(re.sub(r"[\s\-]+", "_", c.name.strip()))
             ]
             if rows and ts_col_indices and tag_col_indices:
                 for ts_idx, ts_name in ts_col_indices:
@@ -397,7 +403,7 @@ def profile_tables(
                     detect_pii(col.name, col.canonical_type, str_vals) if config.detect_pii else []
                 )
                 gov_findings = (
-                    detect_governance(col.name, col.canonical_type)
+                    detect_governance(col.name, col.canonical_type, semantic_name=col.semantic_name)
                     if config.detect_manufacturing
                     else []
                 )

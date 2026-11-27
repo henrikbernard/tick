@@ -165,12 +165,46 @@ def resolve_connection_url(target: str) -> str:
     return stripped
 
 
+_SENSITIVE_QUERY_KEYS = {
+    "password",
+    "pwd",
+    "pass",
+    "token",
+    "access_token",
+    "auth_token",
+    "secret",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "sas_token",
+    "sig",
+}
+_ODBC_SECRET_RE = re.compile(r"(?i)((?:PWD|Password|AccessToken|Token)\s*=\s*)([^;]+)")
+
+
 def sanitize_url(url: str) -> str:
-    """Return a URL string with any password/token masked."""
+    """Return a URL string with passwords and sensitive query parameters/ODBC secrets masked."""
     try:
-        return make_url(url).render_as_string(hide_password=True)
+        parsed = make_url(url)
+        if parsed.query:
+            clean_query: dict[str, Any] = {}
+            for k, v in parsed.query.items():
+                if k.lower() in _SENSITIVE_QUERY_KEYS:
+                    clean_query[k] = "***"
+                elif k.lower() == "odbc_connect" and isinstance(v, str):
+                    clean_query[k] = _ODBC_SECRET_RE.sub(r"\1***", v)
+                else:
+                    clean_query[k] = v
+            parsed = parsed.set(query=clean_query)
+        return parsed.render_as_string(hide_password=True)
     except Exception:
-        return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", url)
+        masked = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", url)
+        masked = re.sub(
+            r"(?i)([?&](?:password|pwd|pass|token|access_token|auth_token|secret|client_secret|api_key|apikey|sas_token)=)([^&]+)",
+            r"\1***",
+            masked,
+        )
+        return _ODBC_SECRET_RE.sub(r"\1***", masked)
 
 
 def create_db_engine(target: str, read_only: bool = True) -> tuple[Engine, str]:
@@ -455,6 +489,7 @@ class DialectAdapter:
             definition = inspector.get_view_definition(view_name, schema=schema_name)
             return str(definition).strip() if definition else None
         except Exception:
+            safe_rollback(conn)
             return None
 
     def get_materialized_views(self, conn: Connection, schema_name: str) -> list[str]:

@@ -46,14 +46,19 @@ CLUSTER_NAME_RE = re.compile(
 )
 
 
+def _norm_ident(name: str) -> str:
+    return re.sub(r"[\s\-]+", "_", name.strip())
+
+
 def _find_watermarks(table: TableInfo) -> list[WatermarkCandidate]:
     candidates: list[WatermarkCandidate] = []
     for col in table.columns:
         max_val = col.profile.max_value if col.profile else None
         is_temporal = col.canonical_type in {"timestamp", "date"}
         low_nulls = (col.profile.null_rate < 0.15) if col.profile else True
+        norm = _norm_ident(col.name)
 
-        if is_temporal and UPDATED_AT_RE.search(col.name):
+        if is_temporal and UPDATED_AT_RE.search(norm):
             candidates.append(
                 WatermarkCandidate(
                     column=col.name,
@@ -63,7 +68,7 @@ def _find_watermarks(table: TableInfo) -> list[WatermarkCandidate]:
                     max_value=max_val,
                 )
             )
-        elif is_temporal and EVENT_TS_RE.search(col.name):
+        elif is_temporal and EVENT_TS_RE.search(norm):
             candidates.append(
                 WatermarkCandidate(
                     column=col.name,
@@ -73,7 +78,7 @@ def _find_watermarks(table: TableInfo) -> list[WatermarkCandidate]:
                     max_value=max_val,
                 )
             )
-        elif is_temporal and CREATED_AT_RE.search(col.name):
+        elif is_temporal and CREATED_AT_RE.search(norm):
             candidates.append(
                 WatermarkCandidate(
                     column=col.name,
@@ -115,7 +120,8 @@ def _find_partitions(table: TableInfo) -> list[PartitionCandidate]:
             continue
         if col.profile and col.profile.null_rate > 0.20:
             continue
-        if EVENT_TS_RE.search(col.name) or CREATED_AT_RE.search(col.name) or col.name.lower().endswith("_date"):
+        norm = _norm_ident(col.name)
+        if EVENT_TS_RE.search(norm) or CREATED_AT_RE.search(norm) or norm.lower().endswith("_date"):
             candidates.append(
                 PartitionCandidate(
                     column=col.name,
@@ -134,7 +140,7 @@ def _find_clustering_keys(table: TableInfo) -> list[str]:
         score = 0
         if col.is_foreign_key:
             score += 3
-        if CLUSTER_NAME_RE.search(col.name):
+        if CLUSTER_NAME_RE.search(_norm_ident(col.name)):
             score += 2
         if col.profile and col.profile.cardinality_class in {"low", "medium"} and col.profile.null_rate < 0.25:
             score += 1
@@ -315,22 +321,38 @@ def analyze_tables_and_quality(
                 )
                 penalty += 10
 
-            # Unindexed foreign keys on non-trivial tables
-            if (tbl.row_count or 0) >= 100:
+            # Unindexed foreign keys on non-trivial tables (check full leading prefix of PK + indexes)
+            if (tbl.row_count or 0) >= 100 and tbl.foreign_keys:
+                index_col_lists: list[list[str]] = [idx.columns for idx in tbl.indexes if idx.columns]
+                if tbl.primary_key:
+                    index_col_lists.append(list(tbl.primary_key))
+                seen_unindexed_fk: set[tuple[str, ...]] = set()
                 for fk in tbl.foreign_keys:
-                    for fk_col in fk.constrained_columns:
-                        col_obj = next((c for c in tbl.columns if c.name == fk_col), None)
-                        if col_obj and not col_obj.is_indexed:
-                            issues.append(
-                                QualityIssue(
-                                    severity="low",
-                                    category="unindexed_fk",
-                                    table=tbl.full_name,
-                                    column=fk_col,
-                                    message=f"Foreign key column '{fk_col}' has no leading index",
-                                )
+                    fk_cols = list(fk.constrained_columns)
+                    if not fk_cols:
+                        continue
+                    fk_key = tuple(fk_cols)
+                    if fk_key in seen_unindexed_fk:
+                        continue
+                    is_covered = any(
+                        idx_cols[: len(fk_cols)] == fk_cols for idx_cols in index_col_lists
+                    )
+                    if not is_covered and len(fk_cols) == 1:
+                        col_obj = next((c for c in tbl.columns if c.name == fk_cols[0]), None)
+                        is_covered = bool(col_obj and col_obj.is_indexed)
+                    if not is_covered:
+                        seen_unindexed_fk.add(fk_key)
+                        col_label = ", ".join(fk_cols)
+                        issues.append(
+                            QualityIssue(
+                                severity="low",
+                                category="unindexed_fk",
+                                table=tbl.full_name,
+                                column=fk_cols[0],
+                                message=f"Foreign key ({col_label}) has no leading index",
                             )
-                            penalty += 4
+                        )
+                        penalty += 4
 
         # Column-level quality & PII issues
         for col in tbl.columns:

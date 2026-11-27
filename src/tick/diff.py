@@ -3,9 +3,84 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from tick.models import ColumnChange, DiscoveryResult, MetricDrift, SnapshotDiff
+
+_TYPE_ARGS_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
+_INT_RANK = {
+    "TINYINT": 1,
+    "BYTEINT": 1,
+    "UTINYINT": 1,
+    "SMALLINT": 2,
+    "INT2": 2,
+    "SHORT": 2,
+    "USMALLINT": 2,
+    "MEDIUMINT": 3,
+    "INT": 4,
+    "INTEGER": 4,
+    "INT4": 4,
+    "INT32": 4,
+    "UINTEGER": 4,
+    "UINT32": 4,
+    "SERIAL": 4,
+    "BIGINT": 5,
+    "INT8": 5,
+    "INT64": 5,
+    "UBIGINT": 5,
+    "UINT64": 5,
+    "BIGSERIAL": 5,
+    "HUGEINT": 6,
+    "INT128": 6,
+}
+
+
+def _is_breaking_type_change(
+    before_raw: str,
+    before_canon: str,
+    after_raw: str,
+    after_canon: str,
+) -> bool:
+    """Return True if a type change crosses canonical categories or narrows width/precision/scale."""
+    if before_canon != after_canon:
+        return True
+
+    bu = before_raw.strip().upper()
+    au = after_raw.strip().upper()
+    b_base = re.split(r"[\s(]", bu, maxsplit=1)[0]
+    a_base = re.split(r"[\s(]", au, maxsplit=1)[0]
+
+    if before_canon == "integer":
+        b_rank = _INT_RANK.get(b_base)
+        a_rank = _INT_RANK.get(a_base)
+        if b_rank is not None and a_rank is not None and a_rank < b_rank:
+            return True
+        bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
+        if bm and am and int(am.group(1)) < int(bm.group(1)):
+            return True
+
+    if before_canon == "decimal":
+        bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
+        if bm and am:
+            bp, bs = int(bm.group(1)), int(bm.group(2) or 0)
+            ap, as_ = int(am.group(1)), int(am.group(2) or 0)
+            if ap < bp or as_ < bs or (ap - as_) < (bp - bs):
+                return True
+
+    if before_canon == "string":
+        bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
+        # Unbounded TEXT/STRING narrowed to bounded VARCHAR(n), or VARCHAR(255) -> VARCHAR(50)
+        if not bm and am and b_base in {"TEXT", "STRING", "CLOB", "NTEXT", "LONGTEXT", "MEDIUMTEXT"}:
+            return True
+        if bm and am and int(am.group(1)) < int(bm.group(1)):
+            return True
+
+    if before_canon == "float":
+        if b_base in {"DOUBLE", "FLOAT8", "BINARY_DOUBLE"} and a_base in {"FLOAT", "FLOAT4", "REAL", "BINARY_FLOAT"}:
+            return True
+
+    return False
 
 
 def load_snapshot(path: str | Path) -> DiscoveryResult:
@@ -98,7 +173,9 @@ def diff_snapshots(before: DiscoveryResult, after: DiscoveryResult) -> SnapshotD
                         change_type="type_changed",
                         before=bc.raw_type,
                         after=ac.raw_type,
-                        breaking=(bc.canonical_type != ac.canonical_type),
+                        breaking=_is_breaking_type_change(
+                            bc.raw_type, bc.canonical_type, ac.raw_type, ac.canonical_type
+                        ),
                     )
                 )
 

@@ -14,7 +14,7 @@ from tick.models import (
     TableInfo,
     TelemetryProfile,
 )
-from tick.profiler import ProfileArtifacts
+from tick.profiler import ProfileArtifacts, _to_datetime_utc
 
 # Regexes for legacy date/time & OT patterns
 YYYYMMDD_RE = re.compile(r"^(19\d{2}|20\d{2}|2100)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$")
@@ -80,8 +80,8 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
         if len(samples) < 3:
             continue
 
-        # Normalize decimal-formatted ints like "20261126.0"
-        norm_samples = [s[:-2] if s.endswith(".0") else s for s in samples[:200]]
+        # Normalize decimal-formatted ints like "20261126.0" or "20261126.00"
+        norm_samples = [re.sub(r"\.0+$", "", s) for s in samples[:200]]
         n = len(norm_samples)
         col_lit = repr(col.name)
         norm_col = re.sub(r"[\s\-]+", "_", col.name.strip())
@@ -173,7 +173,7 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
             for tname in time_cols:
                 tl = re.sub(r"[\s\-]+", "_", tname.strip()).lower()
                 tstem = re.sub(r"_?(?:time|tm)$", "", tl)
-                if stem and stem == tstem:
+                if (stem and stem == tstem) or (not stem and not tstem and dl in {"date", "dt"} and tl in {"time", "tm"}):
                     matched_time = tname
                     break
         if matched_time and dcol.profile and dcol.profile.legacy_date:
@@ -183,12 +183,22 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     f"F.to_timestamp(F.concat(F.col({dname!r}).cast('string'), "
                     f"F.lpad(F.col({matched_time!r}).cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
                 )
-                dcol.profile.legacy_date.note = (
-                    f"Split legacy DATE ('{dname}') + TIME ('{matched_time}') pair; stitch into TIMESTAMP in Silver."
+            else:
+                date_expr = dcol.profile.legacy_date.spark_expression
+                dcol.profile.legacy_date.spark_expression = (
+                    f"F.to_timestamp(F.concat(F.date_format({date_expr}, 'yyyyMMdd'), "
+                    f"F.lpad(F.col({matched_time!r}).cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
                 )
+            dcol.profile.legacy_date.note = (
+                f"Split legacy DATE ('{dname}') + TIME ('{matched_time}') pair; stitch into TIMESTAMP in Silver."
+            )
             tcol = time_cols[matched_time]
             if tcol.profile and tcol.profile.legacy_date:
                 tcol.profile.legacy_date.paired_column = dname
+
+
+def _norm_col(name: str) -> str:
+    return re.sub(r"[\s\-]+", "_", name.strip())
 
 
 def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -> None:
@@ -200,25 +210,25 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     if not ts_cols:
         return
     # Prefer sensor/event timestamp names over ETL/audit timestamps like ingested_at or created_at
-    ts_col = next((c for c in ts_cols if TELEMETRY_TS_RE.search(c.name)), ts_cols[0])
+    ts_col = next((c for c in ts_cols if TELEMETRY_TS_RE.search(_norm_col(c.name))), ts_cols[0])
 
-    tag_col = next((c for c in table.columns if TAG_COL_RE.search(c.name)), None)
+    tag_col = next((c for c in table.columns if TAG_COL_RE.search(_norm_col(c.name))), None)
     val_col = next(
         (
             c
             for c in table.columns
-            if VALUE_COL_RE.search(c.name) and c.canonical_type in {"float", "decimal", "integer"}
+            if VALUE_COL_RE.search(_norm_col(c.name)) and c.canonical_type in {"float", "decimal", "integer"}
         ),
         None,
     )
-    qual_col = next((c for c in table.columns if QUALITY_COL_RE.search(c.name)), None)
+    qual_col = next((c for c in table.columns if QUALITY_COL_RE.search(_norm_col(c.name))), None)
     sensor_num_cols = [
         c
         for c in table.columns
         if c.canonical_type in {"float", "decimal", "integer"}
         and not c.is_primary_key
         and not c.is_foreign_key
-        and SENSOR_METRIC_RE.search(c.name)
+        and SENSOR_METRIC_RE.search(_norm_col(c.name))
     ]
 
     pattern: str | None = None
@@ -316,9 +326,15 @@ def _detect_hierarchy_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     if table.table_type != "table":
         return
 
-    # 1. Explicit self-referential FK
+    # 1. Explicit self-referential FK (must match both schema and table name!)
     for fk in table.foreign_keys:
-        if fk.referred_table.lower() == table.name.lower() and fk.constrained_columns and fk.referred_columns:
+        ref_schema = (fk.referred_schema or table.schema_name).lower()
+        if (
+            ref_schema == table.schema_name.lower()
+            and fk.referred_table.lower() == table.name.lower()
+            and fk.constrained_columns
+            and fk.referred_columns
+        ):
             pcol = fk.constrained_columns[0]
             ccol = fk.referred_columns[0]
             pat = "bom" if any(k in table.name.lower() for k in ("bom", "material", "part")) else (
@@ -419,12 +435,32 @@ def _estimate_sizing_for_table(table: TableInfo, artifacts: ProfileArtifacts) ->
                 best_ts_col = col.name
                 break
 
-    if best_ts_col:
+    if best_ts_col and row_count > 0:
         dts = artifacts.timestamp_samples[(table.full_name, best_ts_col)]
-        if len(dts) >= 2:
-            span_days = max(1.0, (max(dts) - min(dts)).total_seconds() / 86400.0)
-            scale = (row_count / len(dts)) if (row_count > len(dts) and len(dts) > 0) else 1.0
-            daily_rows = round((len(dts) * scale) / span_days, 1)
+        ts_col_obj = next((c for c in table.columns if c.name == best_ts_col), None)
+        full_min = (
+            _to_datetime_utc(ts_col_obj.profile.min_value)
+            if (ts_col_obj and ts_col_obj.profile and ts_col_obj.profile.min_value)
+            else None
+        )
+        full_max = (
+            _to_datetime_utc(ts_col_obj.profile.max_value)
+            if (ts_col_obj and ts_col_obj.profile and ts_col_obj.profile.max_value)
+            else None
+        )
+        if full_min is not None and full_max is not None and full_max > full_min:
+            span_seconds = (full_max - full_min).total_seconds()
+        elif len(dts) >= 2:
+            span_seconds = (max(dts) - min(dts)).total_seconds()
+        else:
+            span_seconds = 0.0
+
+        if span_seconds > 0:
+            if table.telemetry_profile is not None and span_seconds >= 60.0:
+                span_days = span_seconds / 86400.0
+            else:
+                span_days = max(1.0, span_seconds / 86400.0)
+            daily_rows = round(row_count / span_days, 1)
             daily_mb = round((daily_rows * row_width) / (1024 * 1024), 4)
 
     notes: list[str] = []

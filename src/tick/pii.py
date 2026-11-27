@@ -178,7 +178,7 @@ PLANT_ISOLATION_PATTERNS = [
 
 COMMERCIAL_PATTERNS = [
     re.compile(
-        r"(?:^|_)(?:unit_cost|std_cost|standard_cost|bom_cost|labor_cost|overhead_cost|margin|gross_margin|supplier_price|contract_price|purchase_price|vendor_cost|wholesale_price|net_cost)(?:$|_)",
+        r"(?:^|_)(?:unit_cost|std_cost|standard_cost|standard_price|moving_avg_price|bom_cost|labor_cost|overhead_cost|margin|gross_margin|supplier_price|contract_price|purchase_price|vendor_cost|wholesale_price|net_cost|net_price|cost_price|stprs|verpr|netpr)(?:$|_)",
         re.I,
     ),
 ]
@@ -194,12 +194,17 @@ IP_EXPORT_PATTERNS = [
 def detect_governance(
     column_name: str,
     canonical_type: CanonicalType,
+    semantic_name: str | None = None,
 ) -> list[GovernanceFinding]:
     """Detect manufacturing governance & Unity Catalog policy signals (plant row filters, cost masks, ITAR/IP)."""
     findings: list[GovernanceFinding] = []
-    norm = re.sub(r"[\s\-]+", "_", column_name.strip())
+    candidates = [re.sub(r"[\s\-]+", "_", column_name.strip())]
+    if semantic_name:
+        sem_norm = re.sub(r"[\s\-]+", "_", semantic_name.strip())
+        if sem_norm and sem_norm not in candidates:
+            candidates.append(sem_norm)
 
-    if any(p.search(norm) for p in PLANT_ISOLATION_PATTERNS):
+    if any(p.search(c) for c in candidates for p in PLANT_ISOLATION_PATTERNS):
         findings.append(
             GovernanceFinding(
                 category="plant_isolation_key",
@@ -211,7 +216,7 @@ def detect_governance(
             )
         )
 
-    if any(p.search(norm) for p in COMMERCIAL_PATTERNS) and canonical_type in {"decimal", "float", "integer", "string", "other"}:
+    if any(p.search(c) for c in candidates for p in COMMERCIAL_PATTERNS) and canonical_type in {"decimal", "float", "integer", "string", "other"}:
         findings.append(
             GovernanceFinding(
                 category="commercial_sensitive",
@@ -223,7 +228,7 @@ def detect_governance(
             )
         )
 
-    if any(p.search(norm) for p in IP_EXPORT_PATTERNS):
+    if any(p.search(c) for c in candidates for p in IP_EXPORT_PATTERNS):
         findings.append(
             GovernanceFinding(
                 category="ip_or_export_controlled",

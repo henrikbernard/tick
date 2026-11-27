@@ -292,6 +292,7 @@ def _introspect_object(
     try:
         raw_columns = adapter.get_columns(conn, inspector, schema_name, obj_name)
     except Exception:
+        safe_rollback(conn)
         raw_columns = []
 
     # Primary key
@@ -304,6 +305,7 @@ def _introspect_object(
                 pk_constraint = inspector.get_pk_constraint(obj_name, schema=schema_name)
                 pk_cols = list(pk_constraint.get("constrained_columns") or [])
             except Exception:
+                safe_rollback(conn)
                 pk_cols = []
 
     # Foreign keys
@@ -318,6 +320,7 @@ def _introspect_object(
             try:
                 raw_fks = inspector.get_foreign_keys(obj_name, schema=schema_name)
             except Exception:
+                safe_rollback(conn)
                 raw_fks = []
             for fk in raw_fks:
                 constrained = list(fk.get("constrained_columns") or [])
@@ -338,9 +341,9 @@ def _introspect_object(
                 )
                 fk_col_set.update(constrained)
 
-    # Indexes & unique constraints
+    # Indexes & unique constraints (leading column of PK / index supports lookups)
     indexes: list[IndexInfo] = []
-    indexed_cols: set[str] = set(pk_cols)
+    indexed_cols: set[str] = {pk_cols[0]} if pk_cols else set()
     unique_cols: set[str] = set()
     if len(pk_cols) == 1:
         unique_cols.add(pk_cols[0])
@@ -349,6 +352,7 @@ def _introspect_object(
         try:
             raw_indexes = adapter.get_indexes(conn, inspector, schema_name, obj_name)
         except Exception:
+            safe_rollback(conn)
             raw_indexes = []
         for idx in raw_indexes:
             cols = [c for c in (idx.get("column_names") or []) if c]
@@ -373,6 +377,7 @@ def _introspect_object(
             try:
                 raw_uniques = inspector.get_unique_constraints(obj_name, schema=schema_name)
             except Exception:
+                safe_rollback(conn)
                 raw_uniques = []
             for uq in raw_uniques:
                 cols = list(uq.get("column_names") or [])
@@ -387,6 +392,7 @@ def _introspect_object(
             c_info = inspector.get_table_comment(obj_name, schema=schema_name)
             comment = c_info.get("text") if isinstance(c_info, dict) else None
         except Exception:
+            safe_rollback(conn)
             comment = None
 
     # View definition

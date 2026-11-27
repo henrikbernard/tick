@@ -316,13 +316,19 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
   let selectedTable = (report.tables.find(t => t.conflict_count > 0 || t.site_specific_column_count > 0 || t.missing_in_sources.length > 0 || t.pk_divergent) || report.tables[0])?.table_name || null;
 
   function plantCellState(tbl, src) {
-    if (!tbl.present_in_sources.includes(src)) return { cls: "hc-missing", label: "MISSING" };
+    if (!tbl.present_in_sources.includes(src)) return { cls: "hc-missing", label: "MISSING", title: `Table missing in ${src}` };
     const casts = tbl.columns.filter(c => c.cast_required_sources.includes(src)).length;
     const missCols = tbl.columns.filter(c => c.missing_in_sources.includes(src)).length;
-    if (casts > 0) return { cls: "hc-conflict", label: `CAST (${casts})` };
-    if (missCols > 0) return { cls: "hc-site", label: `-${missCols} COL` };
-    if (tbl.pk_divergent) return { cls: "hc-pk", label: "PK DIFF" };
-    return { cls: "hc-aligned", label: "ALIGNED" };
+    const parts = [];
+    if (casts > 0) parts.push(`${casts} cast(s)`);
+    if (missCols > 0) parts.push(`${missCols} missing col(s)`);
+    if (tbl.pk_divergent) parts.push("PK divergent");
+    const tip = parts.length ? `${src}: ${parts.join(", ")}` : `${src}: fully aligned`;
+    if (casts > 0 && missCols > 0) return { cls: "hc-conflict", label: `CAST(${casts}) -${missCols}C`, title: tip };
+    if (casts > 0) return { cls: "hc-conflict", label: `CAST (${casts})`, title: tip };
+    if (missCols > 0) return { cls: "hc-site", label: `-${missCols} COL`, title: tip };
+    if (tbl.pk_divergent) return { cls: "hc-pk", label: "PK DIFF", title: tip };
+    return { cls: "hc-aligned", label: "ALIGNED", title: tip };
   }
 
   function renderMatrix() {
@@ -353,7 +359,7 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
             <td class="mono"><strong>${esc(t.table_name)}</strong></td>
             ${report.sources.map(s => {
               const st = plantCellState(t, s);
-              return `<td><span class="heat-cell ${st.cls}">${st.label}</span></td>`;
+              return `<td><span class="heat-cell ${st.cls}" title="${esc(st.title)}">${st.label}</span></td>`;
             }).join("")}
             <td class="mono">${t.conflict_count ? `<span class="badge b-amber">${t.conflict_count}</span>` : "0"}</td>
             <td class="mono">${t.site_specific_column_count ? `<span class="badge b-orange">${t.site_specific_column_count}</span>` : "0"}</td>

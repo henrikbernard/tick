@@ -480,14 +480,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   function exportSvgElement(svgEl, filename) {
     const style = getComputedStyle(document.documentElement);
     const vars = ["--bg", "--bg-elev", "--bg-card", "--border", "--text", "--text-muted", "--accent", "--green", "--amber", "--red", "--purple", "--orange"];
-    let raw = svgEl.outerHTML;
+    const vp = svgEl.querySelector("g");
+    let vx = 0, vy = 0, vw = 1200, vh = 700;
+    try {
+      if (vp && typeof vp.getBBox === "function") {
+        const bb = vp.getBBox();
+        if (bb.width > 0 && bb.height > 0) {
+          const pad = 28;
+          vx = Math.floor(bb.x - pad);
+          vy = Math.floor(bb.y - pad);
+          vw = Math.ceil(bb.width + pad * 2);
+          vh = Math.ceil(bb.height + pad * 2);
+        }
+      }
+    } catch (_) {}
+    const inner = vp ? vp.innerHTML : svgEl.innerHTML;
+    let body = `<svg xmlns="http://www.w3.org/2000/svg" width="${vw}" height="${vh}" viewBox="${vx} ${vy} ${vw} ${vh}"><rect x="${vx}" y="${vy}" width="${vw}" height="${vh}" fill="var(--bg)" />${inner}</svg>`;
     vars.forEach(v => {
       const val = style.getPropertyValue(v).trim();
-      if (val) raw = raw.split(`var(${v})`).join(val);
+      if (val) body = body.split(`var(${v})`).join(val);
     });
-    const bg = style.getPropertyValue("--bg").trim() || "#0b0f17";
-    const wrapped = raw.replace("<svg ", `<svg xmlns="http://www.w3.org/2000/svg" style="background:${bg};" `);
-    downloadBlob(filename, wrapped, "image/svg+xml;charset=utf-8");
+    downloadBlob(filename, body, "image/svg+xml;charset=utf-8");
   }
 
   // Inline SVG Donut Chart
@@ -600,10 +613,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   // OVERVIEW KPIs & CHARTS
   const baseTables = data.tables.filter(t => t.table_type === "table");
+  const hasSizing = baseTables.some(t => t.ingestion_sizing != null);
   const totalEstMb = baseTables.reduce((acc, t) => acc + (t.ingestion_sizing?.estimated_size_mb || 0), 0);
+  const sizeHint = ov.total_size_bytes != null
+    ? fmtBytes(ov.total_size_bytes)
+    : (hasSizing ? `est. ${fmtMb(totalEstMb)}` : "size n/a");
   const kpis = [
     { label: "Base Tables", val: fmtInt(ov.table_count), hint: `${ov.view_count} views · ${ov.empty_table_count} empty` },
-    { label: "Total Rows", val: fmtInt(ov.total_rows), hint: `${fmtInt(ov.column_count)} cols · est. ${fmtMb(totalEstMb)}` },
+    { label: "Total Rows", val: fmtInt(ov.total_rows), hint: `${fmtInt(ov.column_count)} cols · ${sizeHint}` },
     { label: "Relationships", val: fmtInt(ov.explicit_fk_count + ov.inferred_relationship_count), hint: `${ov.explicit_fk_count} explicit · ${ov.inferred_relationship_count} inferred` },
     { label: "CDC Readiness", val: `${ov.cdc_ready_table_count} / ${ov.table_count}`, hint: `${ov.cdc_blocked_table_count} blocked · ${ov.delta_warning_count} Delta warns` },
     { label: "PII & UC Gov", val: `${ov.pii_column_count} / ${ov.governance_column_count}`, hint: "PII cols / UC policy cols" },
@@ -1035,8 +1052,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     ["col-search", "col-pii-only", "col-high-null"].forEach(id => {
       const el = document.getElementById(id);
-      if (el) el.addEventListener("input", () => renderColumnRows(tbl));
-      if (el && el.type === "checkbox") el.addEventListener("change", () => renderColumnRows(tbl));
+      if (!el) return;
+      el.addEventListener(el.type === "checkbox" ? "change" : "input", () => renderColumnRows(tbl));
     });
     renderColumnRows(tbl);
   }
