@@ -1,10 +1,11 @@
-"""Dialect-portable data profiling, statistical summaries, freshness, and PII scanning."""
+"""Dialect-portable data profiling, statistical summaries, freshness, PII, and governance scanning."""
 
 from __future__ import annotations
 
 import math
 import statistics
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -14,7 +15,16 @@ from sqlalchemy.engine import Connection, Engine
 
 from tick.dialects import DialectAdapter
 from tick.models import ColumnInfo, ColumnProfile, DiscoveryConfig, TableInfo, ValueFrequency
-from tick.pii import detect_pii, redact_value
+from tick.pii import detect_governance, detect_pii, redact_value
+
+
+@dataclass
+class ProfileArtifacts:
+    """In-memory sample caches captured during profiling for downstream analyzers."""
+
+    value_samples: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    raw_str_samples: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    timestamp_samples: dict[tuple[str, str], list[datetime]] = field(default_factory=dict)
 
 
 def _to_float(val: Any) -> float | None:
@@ -40,7 +50,6 @@ def _to_datetime_utc(val: Any) -> datetime | None:
     s = str(val).strip()
     if not s:
         return None
-    # Normalize trailing Z
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     for candidate in (s, s.replace(" ", "T")):
@@ -67,9 +76,7 @@ def _stringify(val: Any, max_len: int = 120) -> str:
     return s
 
 
-def _classify_cardinality(
-    sample_size: int, non_null: int, distinct: int | None
-) -> str:
+def _classify_cardinality(sample_size: int, non_null: int, distinct: int | None) -> str:
     if sample_size == 0:
         return "empty"
     if non_null == 0:
@@ -138,39 +145,68 @@ def _fetch_full_table_aggregates(
     return out
 
 
+def _apply_metadata_only_scanners(tables: list[TableInfo], config: DiscoveryConfig) -> None:
+    for tbl in tables:
+        for col in tbl.columns:
+            pii = detect_pii(col.name, col.canonical_type, []) if config.detect_pii else []
+            gov = detect_governance(col.name, col.canonical_type) if config.detect_manufacturing else []
+            if pii or gov:
+                col.profile = ColumnProfile(pii_findings=pii, governance_findings=gov)
+
+
 def profile_tables(
     engine: Engine,
     adapter: DialectAdapter,
     tables: list[TableInfo],
     default_schema: str | None,
     config: DiscoveryConfig,
-) -> dict[tuple[str, str], set[str]]:
-    """Profile all tables in-place and return sampled distinct value sets for join verification."""
-    value_samples: dict[tuple[str, str], set[str]] = {}
+) -> ProfileArtifacts:
+    """Profile all tables in-place honoring production safety guardrails."""
+    artifacts = ProfileArtifacts()
 
     if config.profile_mode == "none":
-        # Still run column-name-only PII heuristics if enabled
-        if config.detect_pii:
-            for tbl in tables:
-                for col in tbl.columns:
-                    findings = detect_pii(col.name, col.canonical_type, [])
-                    if findings:
-                        col.profile = ColumnProfile(pii_findings=findings)
-        return value_samples
+        _apply_metadata_only_scanners(tables, config)
+        return artifacts
 
     effective_sample = min(config.sample_size, 1000) if config.profile_mode == "fast" else config.sample_size
     now_utc = datetime.now(timezone.utc)
 
     with engine.connect() as conn:
+        adapter.configure_safe_session(
+            conn,
+            read_uncommitted=config.read_uncommitted,
+            query_timeout_seconds=config.query_timeout_seconds,
+        )
+
         for tbl in tables:
             if not tbl.columns:
                 continue
+
+            # Production safety guardrails: empty table triage & byte-budget skip
+            if config.skip_empty_tables and tbl.table_type == "table" and tbl.row_count == 0:
+                tbl.skipped_profiling_reason = "Empty table (skipped via --skip-empty-tables)"
+                _apply_metadata_only_scanners([tbl], config)
+                continue
+
+            if (
+                config.skip_tables_over_mb is not None
+                and tbl.size_bytes is not None
+                and (tbl.size_bytes / (1024 * 1024)) > config.skip_tables_over_mb
+            ):
+                size_mb = tbl.size_bytes / (1024 * 1024)
+                tbl.skipped_profiling_reason = (
+                    f"Size ({size_mb:.1f} MB) exceeds --skip-tables-over-mb ({config.skip_tables_over_mb} MB)"
+                )
+                _apply_metadata_only_scanners([tbl], config)
+                continue
+
             quoted_table = adapter.quote_table(conn, tbl.schema_name, tbl.name, default_schema)
 
-            # In full mode for base tables larger than sample size, also gather exact aggregates
+            # Full-table exact aggregates only when NOT in tablesample/fast/read-uncommitted large mode
             exact_aggs: dict[str, dict[str, Any]] = {}
             if (
                 config.profile_mode == "full"
+                and not config.use_tablesample
                 and tbl.table_type == "table"
                 and tbl.row_count is not None
                 and tbl.row_count > effective_sample
@@ -178,13 +214,14 @@ def profile_tables(
             ):
                 exact_aggs = _fetch_full_table_aggregates(conn, adapter, quoted_table, tbl.columns)
 
-            # Fetch bounded sample in one query
             col_names_sql = ", ".join(adapter.quote_identifier(conn, c.name) for c in tbl.columns)
             sample_sql = adapter.build_sample_query(
                 quoted_table=quoted_table,
                 columns_sql=col_names_sql,
                 sample_size=effective_sample,
                 total_rows=tbl.row_count,
+                use_tablesample=config.use_tablesample,
+                read_uncommitted=config.read_uncommitted,
             )
 
             try:
@@ -206,7 +243,6 @@ def profile_tables(
                 non_null_n = len(non_null_vals)
                 null_n = sample_n - non_null_n
 
-                # Prefer exact full-table totals when available
                 agg = exact_aggs.get(col.name)
                 if agg and agg["total"] > 0:
                     total_n = agg["total"]
@@ -227,15 +263,21 @@ def profile_tables(
                 distinct_n = len(counter)
                 distinct_rate = round(distinct_n / non_null_n, 4) if non_null_n > 0 else None
 
-                # Store bounded distinct sample set for relationship overlap verification
                 if distinct_n > 0 and col.canonical_type in {"integer", "string", "uuid"}:
-                    value_samples[(tbl.full_name, col.name)] = set(list(counter.keys())[:2000])
+                    artifacts.value_samples[(tbl.full_name, col.name)] = set(list(counter.keys())[:2000])
+                if str_vals:
+                    artifacts.raw_str_samples[(tbl.full_name, col.name)] = str_vals[:500]
 
                 cardinality = _classify_cardinality(sample_n, non_null_n, distinct_n)
 
-                # Min / Max
                 min_val: str | None = None
                 max_val: str | None = None
+                parsed_dts: list[datetime] = []
+                if col.canonical_type in {"date", "timestamp"} and non_null_vals:
+                    parsed_dts = [dt for v in non_null_vals if (dt := _to_datetime_utc(v)) is not None]
+                    if parsed_dts:
+                        artifacts.timestamp_samples[(tbl.full_name, col.name)] = parsed_dts
+
                 if agg and agg.get("min") is not None:
                     min_val = _stringify(agg["min"])
                     max_val = _stringify(agg["max"])
@@ -245,20 +287,13 @@ def profile_tables(
                         if nums:
                             min_val = _stringify(min(nums))
                             max_val = _stringify(max(nums))
-                    elif col.canonical_type in {"date", "timestamp"}:
-                        dts = [(dt, v) for v in non_null_vals if (dt := _to_datetime_utc(v)) is not None]
-                        if dts:
-                            dts.sort(key=lambda x: x[0])
-                            min_val = _stringify(dts[0][1])
-                            max_val = _stringify(dts[-1][1])
-                        else:
-                            min_val = min(str_vals)
-                            max_val = max(str_vals)
+                    elif col.canonical_type in {"date", "timestamp"} and parsed_dts:
+                        min_val = min(parsed_dts).isoformat()
+                        max_val = max(parsed_dts).isoformat()
                     elif col.canonical_type != "binary":
                         min_val = min(str_vals)
                         max_val = max(str_vals)
 
-                # Numeric statistics
                 mean_val = stddev_val = p25 = p50 = p75 = None
                 if col.canonical_type in {"integer", "float", "decimal"} and non_null_vals:
                     nums = sorted(f for f in (_to_float(v) for v in non_null_vals) if f is not None)
@@ -270,7 +305,6 @@ def profile_tables(
                         p50 = round(_quantile(nums, 0.50), 4)
                         p75 = round(_quantile(nums, 0.75), 4)
 
-                # String length statistics
                 min_len = max_len = None
                 avg_len = None
                 if col.canonical_type == "string" and non_null_vals:
@@ -279,29 +313,29 @@ def profile_tables(
                     max_len = max(lengths)
                     avg_len = round(sum(lengths) / len(lengths), 2)
 
-                # Freshness analysis
                 freshness_max_ts: str | None = None
                 freshness_age_hours: float | None = None
                 is_stale = False
                 if col.canonical_type in {"date", "timestamp"}:
                     candidate_max = agg.get("max") if agg else None
                     max_dt = _to_datetime_utc(candidate_max) if candidate_max is not None else None
-                    if max_dt is None and non_null_vals:
-                        parsed = [dt for v in non_null_vals if (dt := _to_datetime_utc(v)) is not None]
-                        if parsed:
-                            max_dt = max(parsed)
+                    if max_dt is None and parsed_dts:
+                        max_dt = max(parsed_dts)
                     if max_dt is not None:
                         freshness_max_ts = max_dt.isoformat()
                         age_h = max(0.0, (now_utc - max_dt).total_seconds() / 3600.0)
                         freshness_age_hours = round(age_h, 2)
                         is_stale = age_h > (config.stale_after_days * 24)
 
-                # PII detection
                 pii_findings = (
                     detect_pii(col.name, col.canonical_type, str_vals) if config.detect_pii else []
                 )
+                gov_findings = (
+                    detect_governance(col.name, col.canonical_type)
+                    if config.detect_manufacturing
+                    else []
+                )
 
-                # Top values & representative sample values
                 top_values: list[ValueFrequency] = []
                 for val_str, cnt in counter.most_common(config.top_k):
                     display = redact_value(val_str, pii_findings) if config.redact_pii else val_str
@@ -348,6 +382,7 @@ def profile_tables(
                     freshness_age_hours=freshness_age_hours,
                     is_stale=is_stale,
                     pii_findings=pii_findings,
+                    governance_findings=gov_findings,
                 )
 
-    return value_samples
+    return artifacts

@@ -1,4 +1,4 @@
-"""Pydantic data models for tick database discovery snapshots and diffs."""
+"""Pydantic data models for tick database discovery, Databricks readiness, and harmonization."""
 
 from __future__ import annotations
 
@@ -34,6 +34,31 @@ class PiiFinding(BaseModel):
     sample_match_rate: float | None = None
 
 
+class GovernanceFinding(BaseModel):
+    category: Literal["plant_isolation_key", "commercial_sensitive", "ip_or_export_controlled"]
+    confidence: Literal["high", "medium", "low"]
+    uc_policy: Literal["row_filter", "column_mask", "uc_tag"]
+    uc_tag_key: str
+    uc_tag_value: str
+    evidence: list[str] = Field(default_factory=list)
+
+
+class LegacyDateEncoding(BaseModel):
+    encoding: Literal[
+        "yyyymmdd_int",
+        "yyyymmdd_str",
+        "julian_cyyddd",
+        "julian_yyyyddd",
+        "excel_serial",
+        "hhmmss",
+    ]
+    confidence: Literal["high", "medium", "low"]
+    sample_match_rate: float = Field(ge=0.0, le=1.0)
+    paired_column: str | None = None
+    spark_expression: str
+    note: str = ""
+
+
 class ValueFrequency(BaseModel):
     value: str
     count: int
@@ -64,6 +89,8 @@ class ColumnProfile(BaseModel):
     freshness_age_hours: float | None = None
     is_stale: bool = False
     pii_findings: list[PiiFinding] = Field(default_factory=list)
+    governance_findings: list[GovernanceFinding] = Field(default_factory=list)
+    legacy_date: LegacyDateEncoding | None = None
     profile_error: str | None = None
 
 
@@ -71,6 +98,9 @@ class ColumnInfo(BaseModel):
     name: str
     raw_type: str
     canonical_type: CanonicalType
+    spark_type: str | None = None
+    semantic_name: str | None = None
+    business_description: str | None = None
     nullable: bool = True
     default: str | None = None
     comment: str | None = None
@@ -139,6 +169,81 @@ class TableRecommendations(BaseModel):
     primary_key_candidates: list[str] = Field(default_factory=list)
 
 
+class CdcReadiness(BaseModel):
+    status: Literal["ready", "needs_config", "blocked", "not_applicable"] = "needs_config"
+    connector_recommendation: str = "watermark_incremental"
+    source_cdc_enabled: bool | None = None
+    source_change_tracking_enabled: bool | None = None
+    has_primary_key: bool = False
+    blockers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class DeltaCompatibilityIssue(BaseModel):
+    severity: Severity
+    category: Literal[
+        "illegal_column_name",
+        "decimal_precision_overflow",
+        "unsupported_type",
+        "timezone_naive_timestamp",
+        "money_type",
+        "over_partitioning",
+    ]
+    column: str | None = None
+    message: str
+    remediation: str
+
+
+class DeltaCompatibility(BaseModel):
+    is_compatible: bool = True
+    requires_column_mapping: bool = False
+    liquid_clustering_keys: list[str] = Field(default_factory=list)
+    enable_change_data_feed: bool = True
+    enable_deletion_vectors: bool = True
+    issues: list[DeltaCompatibilityIssue] = Field(default_factory=list)
+
+
+class TelemetryProfile(BaseModel):
+    pattern: Literal["narrow_historian_eav", "wide_plc_polling"]
+    tag_column: str | None = None
+    timestamp_column: str
+    value_columns: list[str] = Field(default_factory=list)
+    quality_column: str | None = None
+    median_interval_seconds: float | None = None
+    max_gap_seconds: float | None = None
+    flatline_columns: list[str] = Field(default_factory=list)
+    bad_quality_rate: float | None = None
+    recommended_watermark_delay: str = "15 minutes"
+    recommended_liquid_cluster: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class HierarchyInfo(BaseModel):
+    pattern: Literal["bom", "lot_genealogy", "work_order_tree", "asset_or_org_tree"]
+    parent_column: str
+    child_column: str
+    overlap_rate: float | None = None
+    reason: str
+
+
+class IngestionSizing(BaseModel):
+    estimated_row_width_bytes: int = 0
+    estimated_size_mb: float = 0.0
+    estimated_daily_rows: float | None = None
+    estimated_daily_mb: float | None = None
+    recommended_cadence: Literal[
+        "continuous_streaming",
+        "micro_batch_15m",
+        "hourly_batch",
+        "daily_batch",
+        "weekly_full_refresh",
+        "view_downstream",
+    ] = "daily_batch"
+    recommended_databricks_tier: str = "Serverless Lakeflow Pipeline"
+    notes: list[str] = Field(default_factory=list)
+
+
 class QualityIssue(BaseModel):
     severity: Severity
     category: str
@@ -152,10 +257,13 @@ class TableInfo(BaseModel):
     name: str
     full_name: str
     table_type: TableType = "table"
+    semantic_name: str | None = None
+    business_description: str | None = None
     comment: str | None = None
     row_count: int | None = None
     row_count_exact: bool = False
     size_bytes: int | None = None
+    skipped_profiling_reason: str | None = None
     columns: list[ColumnInfo] = Field(default_factory=list)
     primary_key: list[str] = Field(default_factory=list)
     foreign_keys: list[ForeignKeyInfo] = Field(default_factory=list)
@@ -163,6 +271,11 @@ class TableInfo(BaseModel):
     view_definition: str | None = None
     upstream_tables: list[str] = Field(default_factory=list)
     recommendations: TableRecommendations | None = None
+    cdc_readiness: CdcReadiness | None = None
+    delta_compatibility: DeltaCompatibility | None = None
+    telemetry_profile: TelemetryProfile | None = None
+    hierarchy: HierarchyInfo | None = None
+    ingestion_sizing: IngestionSizing | None = None
     quality_issues: list[QualityIssue] = Field(default_factory=list)
     quality_score: int = 100
 
@@ -193,6 +306,16 @@ class SchemaSummary(BaseModel):
     total_size_bytes: int | None = None
 
 
+class CdcDatabaseAudit(BaseModel):
+    dialect: str
+    db_cdc_enabled: bool | None = None
+    db_change_tracking_enabled: bool | None = None
+    wal_level: str | None = None
+    supplemental_logging: str | None = None
+    binlog_format: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class DiscoveryConfig(BaseModel):
     profile_mode: ProfileMode = "full"
     sample_size: int = 5000
@@ -209,6 +332,19 @@ class DiscoveryConfig(BaseModel):
     stale_after_days: int = 30
     max_tables: int | None = None
     exact_row_counts: bool = False
+    # Production safety guardrails
+    read_uncommitted: bool = False
+    query_timeout_seconds: int | None = None
+    skip_empty_tables: bool = False
+    skip_tables_over_mb: float | None = None
+    use_tablesample: bool = False
+    # Manufacturing & Databricks extensions
+    detect_manufacturing: bool = True
+    detect_databricks_compat: bool = True
+    audit_cdc: bool = True
+    glossary_path: str | None = None
+    databricks_catalog: str = "manufacturing"
+    databricks_schema: str = "bronze"
 
 
 class DatabaseOverview(BaseModel):
@@ -222,17 +358,23 @@ class DatabaseOverview(BaseModel):
     schema_count: int = 0
     table_count: int = 0
     view_count: int = 0
+    empty_table_count: int = 0
     column_count: int = 0
     total_rows: int = 0
     total_size_bytes: int | None = None
     pii_column_count: int = 0
+    governance_column_count: int = 0
     explicit_fk_count: int = 0
     inferred_relationship_count: int = 0
+    cdc_ready_table_count: int = 0
+    cdc_blocked_table_count: int = 0
+    delta_warning_count: int = 0
     avg_quality_score: float = 100.0
+    cdc_audit: CdcDatabaseAudit | None = None
 
 
 class DiscoveryResult(BaseModel):
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     config: DiscoveryConfig
     overview: DatabaseOverview
     schemas: list[SchemaSummary] = Field(default_factory=list)
@@ -275,3 +417,36 @@ class SnapshotDiff(BaseModel):
     metric_drifts: list[MetricDrift] = Field(default_factory=list)
     breaking_changes_count: int = 0
     has_breaking_changes: bool = False
+
+
+class HarmonizedColumn(BaseModel):
+    name: str
+    sanitized_name: str
+    present_in_sources: list[str] = Field(default_factory=list)
+    missing_in_sources: list[str] = Field(default_factory=list)
+    types_by_source: dict[str, str] = Field(default_factory=dict)
+    canonical_types_by_source: dict[str, str] = Field(default_factory=dict)
+    target_spark_type: str
+    has_type_conflict: bool = False
+    nullable_in_target: bool = True
+    cast_required_sources: list[str] = Field(default_factory=list)
+
+
+class HarmonizedTable(BaseModel):
+    table_name: str
+    present_in_sources: list[str] = Field(default_factory=list)
+    missing_in_sources: list[str] = Field(default_factory=list)
+    primary_keys_by_source: dict[str, list[str]] = Field(default_factory=dict)
+    pk_divergent: bool = False
+    columns: list[HarmonizedColumn] = Field(default_factory=list)
+    conflict_count: int = 0
+    site_specific_column_count: int = 0
+    unified_sql: str = ""
+
+
+class HarmonizationReport(BaseModel):
+    sources: list[str] = Field(default_factory=list)
+    total_unique_tables: int = 0
+    fully_aligned_tables: int = 0
+    tables_with_drift: int = 0
+    tables: list[HarmonizedTable] = Field(default_factory=list)

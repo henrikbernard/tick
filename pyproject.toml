@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tick-db"
-version = "0.1.0"
+version = "0.2.0"
 description = "Universal automatic database discovery, profiling, lineage, and data engineering readiness tool"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,9 @@ mysql = ["pymysql>=1.1.0"]
 snowflake = ["snowflake-sqlalchemy>=1.5.0"]
 bigquery = ["sqlalchemy-bigquery>=1.11.0"]
 oracle = ["oracledb>=2.0.0"]
+databricks = ["databricks-sql-connector>=3.0.0", "databricks-sqlalchemy>=2.0.0"]
+db2 = ["ibm-db-sa>=0.4.0"]
+hana = ["sqlalchemy-hana>=2.0.0"]
 all = [
     "duckdb>=1.0.0",
     "duckdb-engine>=0.13.0",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.engine.url import make_url
 
-from tick.models import CanonicalType
+from tick.models import CanonicalType, CdcDatabaseAudit
 
 
 class DriverMissingError(RuntimeError):
@@ -29,6 +29,10 @@ DRIVER_INSTALL_HINTS: dict[str, tuple[str, str]] = {
     "snowflake": ("snowflake-sqlalchemy", 'pip install "tick-db[snowflake]"'),
     "bigquery": ("sqlalchemy-bigquery", 'pip install "tick-db[bigquery]"'),
     "oracle": ("oracledb", 'pip install "tick-db[oracle]"'),
+    "databricks": ("databricks-sqlalchemy", 'pip install "tick-db[databricks]"'),
+    "ibm_db_sa": ("ibm-db-sa", 'pip install "tick-db[db2]"'),
+    "db2": ("ibm-db-sa", 'pip install "tick-db[db2]"'),
+    "hana": ("sqlalchemy-hana", 'pip install "tick-db[hana]"'),
 }
 
 
@@ -44,6 +48,12 @@ SUPPORTED_DRIVERS: list[dict[str, str]] = [
         "module": "duckdb_engine",
         "example_url": "duckdb:///path/to/analytics.duckdb",
         "install": 'pip install "tick-db[duckdb]"',
+    },
+    {
+        "dialect": "databricks (Unity Catalog)",
+        "module": "databricks.sqlalchemy",
+        "example_url": "databricks://token:dapi...@host?http_path=/sql/1.0/warehouses/...&catalog=main",
+        "install": 'pip install "tick-db[databricks]"',
     },
     {
         "dialect": "postgresql (psycopg3)",
@@ -70,6 +80,24 @@ SUPPORTED_DRIVERS: list[dict[str, str]] = [
         "install": 'pip install "tick-db[mysql]"',
     },
     {
+        "dialect": "oracle",
+        "module": "oracledb",
+        "example_url": "oracle+oracledb://user:pass@host:1521/?service_name=orcl",
+        "install": 'pip install "tick-db[oracle]"',
+    },
+    {
+        "dialect": "ibm db2 / as400",
+        "module": "ibm_db_sa",
+        "example_url": "db2+ibm_db://user:pass@host:50000/dbname",
+        "install": 'pip install "tick-db[db2]"',
+    },
+    {
+        "dialect": "sap hana",
+        "module": "sqlalchemy_hana",
+        "example_url": "hana://user:pass@host:30015",
+        "install": 'pip install "tick-db[hana]"',
+    },
+    {
         "dialect": "snowflake",
         "module": "snowflake.sqlalchemy",
         "example_url": "snowflake://user:pass@account/db/schema",
@@ -80,12 +108,6 @@ SUPPORTED_DRIVERS: list[dict[str, str]] = [
         "module": "sqlalchemy_bigquery",
         "example_url": "bigquery://gcp-project/dataset",
         "install": 'pip install "tick-db[bigquery]"',
-    },
-    {
-        "dialect": "oracle",
-        "module": "oracledb",
-        "example_url": "oracle+oracledb://user:pass@host:1521/?service_name=orcl",
-        "install": 'pip install "tick-db[oracle]"',
     },
 ]
 
@@ -99,15 +121,7 @@ def _module_installed(module_name: str) -> bool:
 
 def get_driver_status() -> list[dict[str, Any]]:
     """Return availability status of all supported SQLAlchemy database drivers."""
-    results = []
-    for item in SUPPORTED_DRIVERS:
-        results.append(
-            {
-                **item,
-                "installed": _module_installed(item["module"]),
-            }
-        )
-    return results
+    return [{**item, "installed": _module_installed(item["module"])} for item in SUPPORTED_DRIVERS]
 
 
 def resolve_connection_url(target: str) -> str:
@@ -116,7 +130,6 @@ def resolve_connection_url(target: str) -> str:
     if stripped == ":memory:":
         return "sqlite:///:memory:"
 
-    # Local file path shorthand (e.g. ./warehouse.duckdb, /data/app.sqlite)
     if "://" not in stripped:
         path = Path(stripped).expanduser().resolve()
         suffix = path.suffix.lower()
@@ -126,15 +139,13 @@ def resolve_connection_url(target: str) -> str:
             return f"sqlite:///{path}"
         raise ValueError(
             f"Unrecognized connection target '{target}'. Provide a SQLAlchemy URL "
-            "(e.g. postgresql://..., mssql+pyodbc://..., duckdb:///file.duckdb) "
+            "(e.g. postgresql://..., mssql+pyodbc://..., databricks://..., duckdb:///file.duckdb) "
             "or a local .duckdb / .sqlite / .db file path."
         )
 
-    # Normalize heroku-style postgres:// URL
     if stripped.startswith("postgres://"):
         stripped = "postgresql://" + stripped[len("postgres://") :]
 
-    # Auto-select installed driver when user supplies bare dialect prefix
     if stripped.startswith("postgresql://"):
         if not _module_installed("psycopg2") and _module_installed("psycopg"):
             stripped = "postgresql+psycopg://" + stripped[len("postgresql://") :]
@@ -147,12 +158,15 @@ def resolve_connection_url(target: str) -> str:
     elif stripped.startswith("oracle://"):
         if _module_installed("oracledb"):
             stripped = "oracle+oracledb://" + stripped[len("oracle://") :]
+    elif stripped.startswith("db2://"):
+        if _module_installed("ibm_db_sa"):
+            stripped = "db2+ibm_db://" + stripped[len("db2://") :]
 
     return stripped
 
 
 def sanitize_url(url: str) -> str:
-    """Return a URL string with any password masked."""
+    """Return a URL string with any password/token masked."""
     try:
         return make_url(url).render_as_string(hide_password=True)
     except Exception:
@@ -173,7 +187,7 @@ def create_db_engine(target: str, read_only: bool = True) -> tuple[Engine, str]:
         engine = create_engine(resolved, connect_args=connect_args, future=True)
         return engine, resolved
     except ModuleNotFoundError as exc:
-        pkg, hint = DRIVER_INSTALL_HINTS.get(
+        _, hint = DRIVER_INSTALL_HINTS.get(
             backend, (exc.name or backend, f"pip install {exc.name or backend}")
         )
         raise DriverMissingError(
@@ -181,7 +195,7 @@ def create_db_engine(target: str, read_only: bool = True) -> tuple[Engine, str]:
         ) from exc
     except Exception as exc:
         if "NoSuchModuleError" in type(exc).__name__ or "Can't load plugin" in str(exc):
-            pkg, hint = DRIVER_INSTALL_HINTS.get(backend, (backend, f"pip install {backend}"))
+            _, hint = DRIVER_INSTALL_HINTS.get(backend, (backend, f"pip install {backend}"))
             raise DriverMissingError(
                 f"SQLAlchemy plugin for '{backend}' is not installed. Install it with:\n  {hint}"
             ) from exc
@@ -197,7 +211,19 @@ def normalize_type(raw_type: str) -> CanonicalType:
         return "uuid"
     if any(k in t for k in ("JSON", "JSONB", "VARIANT", "SUPER", "OBJECT", "STRUCT", "MAP", "ARRAY")):
         return "json"
-    if any(k in t for k in ("TIMESTAMP", "DATETIME", "SMALLDATETIME", "TIMESTAMPTZ", "DATETIME2", "DATETIMEOFFSET")):
+    if any(
+        k in t
+        for k in (
+            "TIMESTAMP",
+            "DATETIME",
+            "SMALLDATETIME",
+            "TIMESTAMPTZ",
+            "DATETIME2",
+            "DATETIMEOFFSET",
+            "TIMESTAMP_NTZ",
+            "TIMESTAMP_LTZ",
+        )
+    ):
         return "timestamp"
     if base == "DATE":
         return "date"
@@ -205,17 +231,50 @@ def normalize_type(raw_type: str) -> CanonicalType:
         return "time"
     if base in {"BOOL", "BOOLEAN", "BIT"}:
         return "boolean"
-    if any(k in base for k in ("DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY", "NUMBER")):
+    if any(k in base for k in ("DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY", "NUMBER", "DEC")):
         if "(" in t and ",0)" in t.replace(" ", ""):
             return "integer"
         return "decimal"
-    if any(k in base for k in ("INT", "SERIAL", "BIGSERIAL", "SMALLSERIAL", "HUGEINT", "UBIGINT", "UINTEGER", "SHORT", "LONG", "BYTEINT")):
+    if any(
+        k in base
+        for k in (
+            "INT",
+            "SERIAL",
+            "BIGSERIAL",
+            "SMALLSERIAL",
+            "HUGEINT",
+            "UBIGINT",
+            "UINTEGER",
+            "SHORT",
+            "LONG",
+            "BYTEINT",
+            "TINYINT",
+            "SMALLINT",
+        )
+    ):
         return "integer"
     if any(k in base for k in ("FLOAT", "DOUBLE", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE")):
         return "float"
-    if any(k in base for k in ("BLOB", "BYTEA", "BINARY", "VARBINARY", "IMAGE", "BYTES", "RAW")):
+    if any(k in base for k in ("BLOB", "BYTEA", "BINARY", "VARBINARY", "IMAGE", "BYTES", "RAW", "ROWVERSION")):
         return "binary"
-    if any(k in base for k in ("CHAR", "TEXT", "STRING", "CLOB", "NVARCHAR", "NCHAR", "VARCHAR", "ENUM", "CITEXT", "XML", "INET", "CIDR")):
+    if any(
+        k in base
+        for k in (
+            "CHAR",
+            "TEXT",
+            "STRING",
+            "CLOB",
+            "NVARCHAR",
+            "NCHAR",
+            "VARCHAR",
+            "ENUM",
+            "CITEXT",
+            "XML",
+            "INET",
+            "CIDR",
+            "NTEXT",
+        )
+    ):
         return "string"
     return "other"
 
@@ -230,8 +289,16 @@ class TableStats:
     view_definition: str | None = None
 
 
+@dataclass
+class TableCdcProbe:
+    cdc_enabled: bool | None = None
+    change_tracking_enabled: bool | None = None
+    replica_identity: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
 class DialectAdapter:
-    """Base adapter encapsulating dialect-specific catalog & sampling queries."""
+    """Base adapter encapsulating dialect-specific catalog, safety, CDC, and sampling queries."""
 
     name: str = "generic"
     sqlglot_dialect: str | None = None
@@ -248,6 +315,9 @@ class DialectAdapter:
     def get_database_name(self, engine: Engine) -> str:
         db = engine.url.database
         if not db:
+            catalog = engine.url.query.get("catalog")
+            if catalog:
+                return str(catalog)
             return engine.dialect.name
         if db == ":memory:":
             return "memory"
@@ -260,6 +330,24 @@ class DialectAdapter:
         if info:
             return ".".join(str(x) for x in info)
         return None
+
+    def configure_safe_session(
+        self,
+        conn: Connection,
+        read_uncommitted: bool = False,
+        query_timeout_seconds: int | None = None,
+    ) -> None:
+        """Apply dialect-appropriate read-only / lock-free / timeout guardrails."""
+        return None
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            notes=["Source-native CDC inspection not specialized for this dialect; using schema & watermark heuristics."],
+        )
+
+    def audit_table_cdc(self, conn: Connection, schema_name: str) -> dict[str, TableCdcProbe]:
+        return {}
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
         return {}
@@ -308,7 +396,14 @@ class DialectAdapter:
         return q_table
 
     def build_sample_query(
-        self, quoted_table: str, columns_sql: str, sample_size: int, total_rows: int | None
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
     ) -> str:
         return f"SELECT {columns_sql} FROM {quoted_table} LIMIT {sample_size}"
 
@@ -324,6 +419,59 @@ class PostgresAdapter(DialectAdapter):
             return str(row) if row else super().get_server_version(conn)
         except Exception:
             return super().get_server_version(conn)
+
+    def configure_safe_session(
+        self,
+        conn: Connection,
+        read_uncommitted: bool = False,
+        query_timeout_seconds: int | None = None,
+    ) -> None:
+        try:
+            if query_timeout_seconds and query_timeout_seconds > 0:
+                conn.execute(text(f"SET statement_timeout = {int(query_timeout_seconds * 1000)}"))
+        except Exception:
+            pass
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        wal_level: str | None = None
+        notes: list[str] = []
+        try:
+            val = conn.execute(text("SHOW wal_level")).scalar()
+            wal_level = str(val) if val else None
+            if wal_level == "logical":
+                notes.append("PostgreSQL wal_level='logical' — ready for Databricks Lakeflow Connect logical replication.")
+            else:
+                notes.append(f"PostgreSQL wal_level='{wal_level}' (must be 'logical' for Lakeflow Connect / Debezium CDC).")
+        except Exception as exc:
+            notes.append(f"Could not inspect wal_level ({type(exc).__name__}); verify logical replication permissions.")
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            db_cdc_enabled=(wal_level == "logical") if wal_level is not None else None,
+            wal_level=wal_level,
+            notes=notes,
+        )
+
+    def audit_table_cdc(self, conn: Connection, schema_name: str) -> dict[str, TableCdcProbe]:
+        probes: dict[str, TableCdcProbe] = {}
+        try:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT c.relname AS table_name, c.relreplident AS repl_ident
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = :schema AND c.relkind IN ('r', 'p')
+                    """
+                ),
+                {"schema": schema_name},
+            ).mappings()
+            ident_map = {"d": "default", "n": "nothing", "f": "full", "i": "index"}
+            for row in rows:
+                ri = ident_map.get(str(row["repl_ident"]), str(row["repl_ident"]))
+                probes[row["table_name"]] = TableCdcProbe(replica_identity=ri)
+        except Exception:
+            pass
+        return probes
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
         stats: dict[str, TableStats] = {}
@@ -381,6 +529,21 @@ class PostgresAdapter(DialectAdapter):
         except Exception:
             return None
 
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        if use_tablesample and total_rows and total_rows > sample_size * 4:
+            pct = max(0.1, min(25.0, round((sample_size * 2.0 / total_rows) * 100.0, 2)))
+            return f"SELECT {columns_sql} FROM {quoted_table} TABLESAMPLE SYSTEM ({pct}) LIMIT {sample_size}"
+        return f"SELECT {columns_sql} FROM {quoted_table} LIMIT {sample_size}"
+
 
 class SqlServerAdapter(DialectAdapter):
     name = "mssql"
@@ -407,6 +570,81 @@ class SqlServerAdapter(DialectAdapter):
             return str(val) if val else super().get_server_version(conn)
         except Exception:
             return super().get_server_version(conn)
+
+    def configure_safe_session(
+        self,
+        conn: Connection,
+        read_uncommitted: bool = False,
+        query_timeout_seconds: int | None = None,
+    ) -> None:
+        try:
+            if read_uncommitted:
+                conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"))
+            if query_timeout_seconds and query_timeout_seconds > 0:
+                conn.execute(text(f"SET LOCK_TIMEOUT {int(query_timeout_seconds * 1000)}"))
+        except Exception:
+            pass
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        ct_enabled: bool | None = None
+        cdc_enabled: bool | None = None
+        notes: list[str] = []
+        try:
+            ct_row = conn.execute(
+                text("SELECT COUNT(*) FROM sys.change_tracking_databases WHERE database_id = DB_ID()")
+            ).scalar()
+            ct_enabled = bool(ct_row and int(ct_row) > 0)
+        except Exception:
+            notes.append("Could not query sys.change_tracking_databases (insufficient VIEW DATABASE STATE permission).")
+
+        try:
+            cdc_row = conn.execute(
+                text("SELECT is_cdc_enabled FROM sys.databases WHERE database_id = DB_ID()")
+            ).scalar()
+            cdc_enabled = bool(cdc_row) if cdc_row is not None else None
+        except Exception:
+            notes.append("Could not query sys.databases.is_cdc_enabled.")
+
+        if ct_enabled:
+            notes.append("SQL Server Change Tracking is ENABLED (preferred lightweight mode for Databricks Lakeflow Connect).")
+        elif cdc_enabled:
+            notes.append("SQL Server CDC is ENABLED (compatible with Databricks Lakeflow Connect, including tables without PKs).")
+        elif ct_enabled is False and cdc_enabled is False:
+            notes.append("Neither Change Tracking nor SQL Server CDC is enabled on this database; enable CT or CDC for Lakeflow Connect.")
+
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            db_cdc_enabled=cdc_enabled,
+            db_change_tracking_enabled=ct_enabled,
+            notes=notes,
+        )
+
+    def audit_table_cdc(self, conn: Connection, schema_name: str) -> dict[str, TableCdcProbe]:
+        probes: dict[str, TableCdcProbe] = {}
+        try:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT
+                        t.name AS table_name,
+                        t.is_tracked_by_cdc AS cdc_on,
+                        CASE WHEN ct.object_id IS NOT NULL THEN 1 ELSE 0 END AS ct_on
+                    FROM sys.tables t
+                    JOIN sys.schemas s ON t.schema_id = s.schema_id
+                    LEFT JOIN sys.change_tracking_tables ct ON ct.object_id = t.object_id
+                    WHERE s.name = :schema
+                    """
+                ),
+                {"schema": schema_name},
+            ).mappings()
+            for row in rows:
+                probes[row["table_name"]] = TableCdcProbe(
+                    cdc_enabled=bool(row["cdc_on"]),
+                    change_tracking_enabled=bool(row["ct_on"]),
+                )
+        except Exception:
+            pass
+        return probes
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
         stats: dict[str, TableStats] = {}
@@ -437,9 +675,19 @@ class SqlServerAdapter(DialectAdapter):
         return stats
 
     def build_sample_query(
-        self, quoted_table: str, columns_sql: str, sample_size: int, total_rows: int | None
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
     ) -> str:
-        return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table}"
+        hint = " WITH (NOLOCK)" if read_uncommitted else ""
+        if use_tablesample and total_rows and total_rows > sample_size * 4:
+            return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table}{hint} TABLESAMPLE ({sample_size * 2} ROWS)"
+        return f"SELECT TOP ({sample_size}) {columns_sql} FROM {quoted_table}{hint}"
 
 
 class DuckDBAdapter(DialectAdapter):
@@ -646,6 +894,20 @@ class DuckDBAdapter(DialectAdapter):
             pass
         return super().get_view_definition(conn, inspector, schema_name, view_name)
 
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        if use_tablesample and total_rows and total_rows > sample_size * 2:
+            return f"SELECT {columns_sql} FROM {quoted_table} USING SAMPLE {sample_size} ROWS"
+        return f"SELECT {columns_sql} FROM {quoted_table} LIMIT {sample_size}"
+
 
 class SQLiteAdapter(DialectAdapter):
     name = "sqlite"
@@ -669,7 +931,6 @@ class SQLiteAdapter(DialectAdapter):
                 stats[row["name"]] = TableStats(view_definition=row["sql"])
         except Exception:
             pass
-        # Try dbstat virtual table if compiled into sqlite
         try:
             size_rows = conn.execute(
                 text("SELECT name, SUM(pgsize) AS size_bytes FROM dbstat GROUP BY name")
@@ -709,6 +970,40 @@ class MySQLAdapter(DialectAdapter):
         except Exception:
             return super().get_server_version(conn)
 
+    def configure_safe_session(
+        self,
+        conn: Connection,
+        read_uncommitted: bool = False,
+        query_timeout_seconds: int | None = None,
+    ) -> None:
+        try:
+            if read_uncommitted:
+                conn.execute(text("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"))
+            if query_timeout_seconds and query_timeout_seconds > 0:
+                conn.execute(text(f"SET SESSION max_execution_time = {int(query_timeout_seconds * 1000)}"))
+        except Exception:
+            pass
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        fmt: str | None = None
+        notes: list[str] = []
+        try:
+            row = conn.execute(text("SHOW VARIABLES LIKE 'binlog_format'")).first()
+            if row:
+                fmt = str(row[1])
+                if fmt.upper() == "ROW":
+                    notes.append("MySQL binlog_format='ROW' — ready for CDC / Lakeflow Connect.")
+                else:
+                    notes.append(f"MySQL binlog_format='{fmt}' (must be 'ROW' for binlog CDC).")
+        except Exception:
+            notes.append("Could not query MySQL binlog_format.")
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            db_cdc_enabled=(fmt.upper() == "ROW") if fmt else None,
+            binlog_format=fmt,
+            notes=notes,
+        )
+
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
         stats: dict[str, TableStats] = {}
         query = text(
@@ -736,6 +1031,126 @@ class MySQLAdapter(DialectAdapter):
         return stats
 
 
+class DatabricksAdapter(DialectAdapter):
+    name = "databricks"
+    sqlglot_dialect = "databricks"
+    system_schemas = {"information_schema", "INFORMATION_SCHEMA"}
+
+    def get_server_version(self, conn: Connection) -> str | None:
+        try:
+            val = conn.execute(text("SELECT current_version().dbr_version")).scalar()
+            return f"DBR {val}" if val else super().get_server_version(conn)
+        except Exception:
+            return super().get_server_version(conn)
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            db_cdc_enabled=True,
+            notes=["Databricks Unity Catalog Delta tables support Change Data Feed (delta.enableChangeDataFeed=true)."],
+        )
+
+    def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
+        stats: dict[str, TableStats] = {}
+        try:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT table_name, table_type, comment
+                    FROM information_schema.tables
+                    WHERE table_schema = :schema
+                    """
+                ),
+                {"schema": schema_name},
+            ).mappings()
+            for row in rows:
+                stats[row["table_name"]] = TableStats(
+                    comment=row["comment"],
+                    is_materialized_view=(str(row["table_type"]).upper() == "MATERIALIZED_VIEW"),
+                )
+        except Exception:
+            pass
+        return stats
+
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        if use_tablesample and total_rows and total_rows > sample_size * 2:
+            return f"SELECT {columns_sql} FROM {quoted_table} TABLESAMPLE ({sample_size} ROWS)"
+        return f"SELECT {columns_sql} FROM {quoted_table} LIMIT {sample_size}"
+
+
+class OracleAdapter(DialectAdapter):
+    name = "oracle"
+    sqlglot_dialect = "oracle"
+    system_schemas = {"SYS", "SYSTEM", "OUTLN", "XDB", "CTXSYS", "MDSYS", "ORDSYS", "DBSNMP"}
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        supp: str | None = None
+        notes: list[str] = []
+        try:
+            row = conn.execute(
+                text("SELECT log_mode, supplemental_log_data_min FROM v$database")
+            ).first()
+            if row:
+                log_mode, supp = str(row[0]), str(row[1])
+                ok = log_mode.upper() == "ARCHIVELOG" and supp.upper() in {"YES", "IMPLICIT"}
+                notes.append(f"Oracle log_mode={log_mode}, supplemental_log_data_min={supp}.")
+                return CdcDatabaseAudit(
+                    dialect=self.name,
+                    db_cdc_enabled=ok,
+                    supplemental_logging=supp,
+                    notes=notes,
+                )
+        except Exception:
+            notes.append("Could not query v$database (requires SELECT_CATALOG_ROLE); verify ARCHIVELOG & supplemental logging.")
+        return CdcDatabaseAudit(dialect=self.name, supplemental_logging=supp, notes=notes)
+
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        return f"SELECT {columns_sql} FROM {quoted_table} FETCH FIRST {sample_size} ROWS ONLY"
+
+
+class DB2Adapter(DialectAdapter):
+    name = "db2"
+    sqlglot_dialect = None
+    system_schemas = {"SYSIBM", "SYSCAT", "SYSSTAT", "SYSFUN", "SYSPROC", "SYSTOOLS", "NULLID"}
+
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        ur = " WITH UR" if read_uncommitted else ""
+        return f"SELECT {columns_sql} FROM {quoted_table} FETCH FIRST {sample_size} ROWS ONLY{ur}"
+
+
+class HanaAdapter(DialectAdapter):
+    name = "hana"
+    sqlglot_dialect = None
+    system_schemas = {"SYS", "_SYS_BI", "_SYS_BIC", "_SYS_REPO", "_SYS_STATISTICS", "_SYS_XS"}
+
+
 class SnowflakeAdapter(DialectAdapter):
     name = "snowflake"
     sqlglot_dialect = "snowflake"
@@ -746,17 +1161,6 @@ class BigQueryAdapter(DialectAdapter):
     name = "bigquery"
     sqlglot_dialect = "bigquery"
     system_schemas = {"INFORMATION_SCHEMA", "information_schema"}
-
-
-class OracleAdapter(DialectAdapter):
-    name = "oracle"
-    sqlglot_dialect = "oracle"
-    system_schemas = {"SYS", "SYSTEM", "OUTLN", "XDB", "CTXSYS", "MDSYS", "ORDSYS", "DBSNMP"}
-
-    def build_sample_query(
-        self, quoted_table: str, columns_sql: str, sample_size: int, total_rows: int | None
-    ) -> str:
-        return f"SELECT {columns_sql} FROM {quoted_table} FETCH FIRST {sample_size} ROWS ONLY"
 
 
 def get_dialect_adapter(dialect_name: str) -> DialectAdapter:
@@ -772,10 +1176,16 @@ def get_dialect_adapter(dialect_name: str) -> DialectAdapter:
         return SQLiteAdapter()
     if name in {"mysql", "mariadb"}:
         return MySQLAdapter()
+    if name == "databricks":
+        return DatabricksAdapter()
     if name == "snowflake":
         return SnowflakeAdapter()
     if name == "bigquery":
         return BigQueryAdapter()
     if name == "oracle":
         return OracleAdapter()
+    if name in {"db2", "ibm_db_sa"}:
+        return DB2Adapter()
+    if name == "hana":
+        return HanaAdapter()
     return DialectAdapter()

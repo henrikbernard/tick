@@ -160,6 +160,11 @@ def introspect_catalog(
     schema_summaries: list[SchemaSummary] = []
 
     with engine.connect() as conn:
+        adapter.configure_safe_session(
+            conn,
+            read_uncommitted=config.read_uncommitted,
+            query_timeout_seconds=config.query_timeout_seconds,
+        )
         schemas_list, default_schema = _discover_schemas(conn, inspector, adapter, config)
         for schema_name in schemas_list:
             stats_map: dict[str, TableStats] = adapter.get_table_stats(conn, schema_name)
