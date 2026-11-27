@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tick-db"
+version = "0.1.0"
+description = "Universal automatic database discovery, profiling, lineage, and data engineering readiness tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tick contributors" }]
+keywords = [
+    "database",
+    "data-engineering",
+    "data-discovery",
+    "data-profiling",
+    "dbt",
+    "lineage",
+    "erd",
+    "sqlalchemy",
+    "duckdb",
+    "postgresql",
+]
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.7.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pyyaml>=6.0.0",
+    "sqlglot>=25.0.0",
+]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.0.0", "duckdb-engine>=0.13.0"]
+postgres = ["psycopg[binary]>=3.1.0"]
+mssql = ["pyodbc>=5.1.0"]
+mysql = ["pymysql>=1.1.0"]
+snowflake = ["snowflake-sqlalchemy>=1.5.0"]
+bigquery = ["sqlalchemy-bigquery>=1.11.0"]
+oracle = ["oracledb>=2.0.0"]
+all = [
+    "duckdb>=1.0.0",
+    "duckdb-engine>=0.13.0",
+    "psycopg[binary]>=3.1.0",
+    "pymysql>=1.1.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "duckdb>=1.0.0",
+    "duckdb-engine>=0.13.0",
+]
+
+[project.scripts]
+tick = "tick.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
