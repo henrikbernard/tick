@@ -686,6 +686,7 @@ def export_snowflake_bundle(
         get_hierarchy_tables,
         render_snowflake_gold_hierarchies_sql,
     )
+    from tick.exporters.semantic_export import render_cortex_analyst_yaml
 
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -771,5 +772,17 @@ def export_snowflake_bundle(
             encoding="utf-8",
         )
         written.append(fi_path)
+
+    cortex_path = root / "cortex_analyst_semantic_model.yml"
+    cortex_path.write_text(
+        render_cortex_analyst_yaml(
+            result,
+            database=database,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(cortex_path)
 
     return written

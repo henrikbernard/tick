@@ -25,6 +25,11 @@ from tick.exporters.gold_sql import (
     render_databricks_gold_hierarchies_sql,
     render_snowflake_gold_hierarchies_sql,
 )
+from tick.exporters.semantic_export import (
+    render_cortex_analyst_yaml,
+    render_databricks_genie_context_md,
+    render_databricks_metric_views_sql,
+)
 from tick.exporters.snowflake_export import (
     render_snowflake_ddl,
     render_snowflake_dmf_sql,
@@ -435,11 +440,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <button class="btn code-tab" data-code="lakeflow_py">Lakeflow Pipeline (DLT Python)</button>
           <button class="btn code-tab" data-code="dbx_dab">Databricks Asset Bundle</button>
           <button class="btn code-tab" data-code="dbx_gold">Gold BOM SQL (DBX)</button>
+          <button class="btn code-tab" data-code="dbx_mv">Databricks Metric Views</button>
+          <button class="btn code-tab" data-code="dbx_genie">Databricks Genie Guide</button>
           <button class="btn code-tab file-only-tab" data-code="dbx_al">Auto Loader SQL (DBX)</button>
           <button class="btn code-tab" data-code="sf_ddl">Snowflake DDL &amp; Policies</button>
           <button class="btn code-tab" data-code="sf_dt">Snowflake Dynamic Tables</button>
           <button class="btn code-tab" data-code="sf_dmf">Snowflake DMFs</button>
           <button class="btn code-tab" data-code="sf_gold">Gold BOM SQL (SF)</button>
+          <button class="btn code-tab" data-code="sf_cortex">Snowflake Cortex Analyst</button>
           <button class="btn code-tab file-only-tab" data-code="sf_fi">Snowflake File Ingest</button>
           <button class="btn code-tab" data-code="sf_sis">Snowflake Streamlit App</button>
           <button class="btn code-tab" data-code="dbt_yaml">dbt sources.yml</button>
@@ -464,11 +472,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     lakeflow_py: payload.lakeflow_py,
     dbx_dab: payload.dbx_dab,
     dbx_gold: payload.dbx_gold,
+    dbx_mv: payload.dbx_mv,
+    dbx_genie: payload.dbx_genie,
     dbx_al: payload.dbx_al,
     sf_ddl: payload.sf_ddl,
     sf_dt: payload.sf_dt,
     sf_dmf: payload.sf_dmf,
     sf_gold: payload.sf_gold,
+    sf_cortex: payload.sf_cortex,
     sf_fi: payload.sf_fi,
     sf_sis: payload.sf_sis,
     dbt_yaml: payload.dbt_yaml
@@ -478,11 +489,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     lakeflow_py: "lakeflow_pipeline.py",
     dbx_dab: "databricks.yml",
     dbx_gold: "gold_hierarchies.sql",
+    dbx_mv: "metric_views.sql",
+    dbx_genie: "genie_context.md",
     dbx_al: "autoloader_ingest.sql",
     sf_ddl: "snowflake_ddl.sql",
     sf_dt: "snowflake_dynamic_tables.sql",
     sf_dmf: "snowflake_dmf.sql",
     sf_gold: "snowflake_gold_hierarchies.sql",
+    sf_cortex: "cortex_analyst_semantic_model.yml",
     sf_fi: "snowflake_file_ingest.sql",
     sf_sis: "streamlit_app.py",
     dbt_yaml: "sources.yml"
@@ -1524,11 +1538,14 @@ def render_html_report(result: DiscoveryResult) -> str:
         "lakeflow_py": render_lakeflow_pipeline_py(result),
         "dbx_dab": render_databricks_bundle_yml(result),
         "dbx_gold": render_databricks_gold_hierarchies_sql(result),
+        "dbx_mv": render_databricks_metric_views_sql(result),
+        "dbx_genie": render_databricks_genie_context_md(result),
         "dbx_al": render_databricks_autoloader_sql(result) if file_mode else "",
         "sf_ddl": render_snowflake_ddl(result),
         "sf_dt": render_snowflake_dynamic_tables_sql(result),
         "sf_dmf": render_snowflake_dmf_sql(result),
         "sf_gold": render_snowflake_gold_hierarchies_sql(result),
+        "sf_cortex": render_cortex_analyst_yaml(result),
         "sf_fi": render_snowflake_file_ingest_sql(result) if file_mode else "",
         "sf_sis": render_snowflake_streamlit_app(result),
     }

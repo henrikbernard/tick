@@ -610,6 +610,10 @@ def export_databricks_bundle(
         get_hierarchy_tables,
         render_databricks_gold_hierarchies_sql,
     )
+    from tick.exporters.semantic_export import (
+        render_databricks_genie_context_md,
+        render_databricks_metric_views_sql,
+    )
 
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -687,5 +691,30 @@ def export_databricks_bundle(
             encoding="utf-8",
         )
         written.append(al_path)
+
+    mv_path = root / "metric_views.sql"
+    mv_path.write_text(
+        render_databricks_metric_views_sql(
+            result,
+            catalog=catalog,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(mv_path)
+
+    genie_path = root / "genie_context.md"
+    genie_path.write_text(
+        render_databricks_genie_context_md(
+            result,
+            catalog=catalog,
+            bronze_schema=bronze_schema,
+            silver_schema=silver_schema,
+            gold_schema=gold_schema,
+        ),
+        encoding="utf-8",
+    )
+    written.append(genie_path)
 
     return written

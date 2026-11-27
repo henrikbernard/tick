@@ -125,7 +125,7 @@ def test_snowflake_bundle_end_to_end_and_policy_type_matching(tmp_path):
 
     sf_dir = tmp_path / "snowflake_out"
     written = export_snowflake_bundle(res, sf_dir)
-    assert len(written) == 7
+    assert len(written) == 8
 
     ddl = (sf_dir / "snowflake_ddl.sql").read_text(encoding="utf-8")
     assert 'CREATE DATABASE IF NOT EXISTS "MFG_PROD";' in ddl

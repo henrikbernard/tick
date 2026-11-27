@@ -31,6 +31,7 @@ from tick.exporters import (
     export_html,
     export_json,
     export_markdown,
+    export_semantic_bundle,
     export_snowflake_bundle,
 )
 from tick.harmonize import export_harmonization, harmonize_snapshots
@@ -299,6 +300,11 @@ def discover(
     contracts_dir: Optional[Path] = typer.Option(
         None, "--contracts-dir", help="Write Databricks DQX quality YAML and ODCS v3.0.0 data contract YAML."
     ),
+    semantic_dir: Optional[Path] = typer.Option(
+        None,
+        "--semantic-dir",
+        help="Write standalone AI / Semantic Layer files (Cortex Analyst YAML, Databricks Metric Views SQL & Genie guide).",
+    ),
     target_platform: TargetPlatform = typer.Option(
         "both", "--target", help="Target cloud platform(s): databricks | snowflake | both."
     ),
@@ -438,6 +444,9 @@ def discover(
     if contracts_dir is not None:
         contract_files = export_contracts_bundle(result, contracts_dir)
         written.append((f"Data contracts ({len(contract_files)} files)", contracts_dir))
+    if semantic_dir is not None:
+        sem_files = export_semantic_bundle(result, semantic_dir)
+        written.append((f"AI semantic layer ({len(sem_files)} files)", semantic_dir))
 
     if written and not quiet:
         console.print("\n[bold green]Artifacts written:[/bold green]")

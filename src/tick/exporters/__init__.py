@@ -39,6 +39,12 @@ from tick.exporters.markdown_export import (
     render_diff_markdown,
     render_markdown_report,
 )
+from tick.exporters.semantic_export import (
+    export_semantic_bundle,
+    render_cortex_analyst_yaml,
+    render_databricks_genie_context_md,
+    render_databricks_metric_views_sql,
+)
 from tick.exporters.snowflake_export import (
     export_snowflake_bundle,
     render_snowflake_ddl,
@@ -64,6 +70,8 @@ __all__ = [
     "render_lakeview_dashboard_json",
     "render_databricks_gold_hierarchies_sql",
     "render_databricks_autoloader_sql",
+    "render_databricks_metric_views_sql",
+    "render_databricks_genie_context_md",
     "export_snowflake_bundle",
     "render_snowflake_ddl",
     "render_snowflake_dynamic_tables_sql",
@@ -73,6 +81,8 @@ __all__ = [
     "render_snowflake_streamlit_app",
     "render_snowflake_gold_hierarchies_sql",
     "render_snowflake_file_ingest_sql",
+    "render_cortex_analyst_yaml",
+    "export_semantic_bundle",
     "export_contracts_bundle",
     "render_dqx_yaml",
     "render_odcs_yaml",

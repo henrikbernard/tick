@@ -51,6 +51,8 @@ def test_databricks_asset_bundle_lakeview_and_gold_bom_sql(tmp_path):
         "databricks.yml",
         "lakeview_dashboard.lvdash.json",
         "gold_hierarchies.sql",
+        "metric_views.sql",
+        "genie_context.md",
     } == names
 
     # 1. Validate Databricks Asset Bundle YAML
@@ -64,7 +66,12 @@ def test_databricks_asset_bundle_lakeview_and_gold_bom_sql(tmp_path):
     assert pipeline_cfg["libraries"] == [{"file": {"path": "./lakeflow_pipeline.py"}}]
     job_cfg = next(iter(dab["resources"]["jobs"].values()))
     task_keys = [t["task_key"] for t in job_cfg["tasks"]]
-    assert task_keys == ["apply_unity_catalog_ddl", "run_lakeflow_silver_pipeline", "build_gold_hierarchies"]
+    assert task_keys == [
+        "apply_unity_catalog_ddl",
+        "run_lakeflow_silver_pipeline",
+        "build_gold_hierarchies",
+        "publish_gold_metric_views",
+    ]
     assert set(dab["targets"]) == {"dev", "prod"}
 
     # 2. Validate AI/BI Lakeview Dashboard JSON
@@ -121,6 +128,7 @@ def test_snowflake_cli_manifest_streamlit_app_and_gold_bom_sql(tmp_path):
         "snowflake.yml",
         "streamlit_app.py",
         "snowflake_gold_hierarchies.sql",
+        "cortex_analyst_semantic_model.yml",
     } == names
 
     # 1. Validate Snowflake CLI v2 manifest

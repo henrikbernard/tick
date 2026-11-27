@@ -12,8 +12,8 @@ flowchart LR
     CAT --> PROF["Parallel Profiler (--workers N)\nStats · Quantiles · Freshness · PII · Governance"]
     PROF --> INT["DE & Manufacturing Intelligence\nFK Inference · SQL Lineage · CDC Audit\nOT Telemetry · BOMs · Legacy Dates · Delta & SF Lint"]
     INT --> HTML["3 Interactive HTML Dashboards\nDiscovery · Multi-Plant · Diff"]
-    INT --> DBX["Databricks Bundle\nUC DDL · Lakeflow DLT · Sizing"]
-    INT --> SF["Snowflake Bundle\nDDL · Dynamic Tables · DMFs · Sizing"]
+    INT --> DBX["Databricks Bundle\nUC DDL · Lakeflow DLT · Metric Views · Genie"]
+    INT --> SF["Snowflake Bundle\nDDL · Dynamic Tables · DMFs · Cortex Analyst"]
     INT --> CTR["Data Contracts\nDatabricks DQX · ODCS v3.0"]
     INT --> DBT["dbt & Docs\nsources.yml · Staging SQL · Markdown"]
 ```
@@ -57,6 +57,10 @@ flowchart LR
 - **Data Contract Exporter (`--contracts-dir`)**:
   - `dqx_checks.yml`: **Databricks Labs DQX** quality checks (`is_unique`, `is_not_null`, `is_in_list`, `is_in_range`, OT quality checks) with sensitive values excluded.
   - `data_contract.odcs.yml`: **Open Data Contract Standard (ODCS v3.0.0)** YAML targeting Databricks, Snowflake, or both.
+- **AI & Semantic Layer Exporter (`--semantic-dir`, also bundled in `databricks/` & `snowflake/`)**:
+  - `cortex_analyst_semantic_model.yml`: **Snowflake Cortex Analyst** semantic model YAML grounded in discovered Silver Dynamic Tables, Gold exploded BOM tables, ERP/SAP glossary names & synonyms, parsed legacy date time dimensions, verified `many_to_one` joins, safe non-PII `sample_values`/`is_enum`, PII/ITAR exclusions, and Snowflake-validated **Verified Queries (VQRs)**.
+  - `metric_views.sql`: **Databricks Unity Catalog Metric Views** (`WITH METRICS LANGUAGE YAML`, spec v1.1) with governed `dimensions`, calendar grain helpers, star-schema `joins`, `measures` (`SUM`/`AVG`/`COUNT`/`MAX` with currency/percent format hints), OT telemetry views, and Gold BOM rollups.
+  - `genie_context.md`: Copy-paste **Databricks AI/BI Genie Space** setup guide with recommended Silver/Gold assets, Genie general instructions, ERP acronym glossary, verified join paths, PII-free filter value dictionary, and starter benchmark SQL queries.
 
 ### 4. Manufacturing, ERP & OT Intelligence
 - **Production Shop-Floor Safety Guardrails**: `--read-uncommitted` (`WITH (NOLOCK)` / `WITH UR`), `--query-timeout`, `--skip-empty-tables`, `--skip-tables-over-mb`, `--use-tablesample`, and credential masking in URLs/ODBC strings.
@@ -151,6 +155,8 @@ tick discover ./lake_drop --out-dir ./lake-discovery
 | `databricks/lakeflow_pipeline.py` | Databricks Lakeflow Declarative Pipeline (DLT) Bronze → Silver Python code (uses Auto Loader `cloudFiles` for files) |
 | `databricks/autoloader_ingest.sql` | Databricks SQL `COPY INTO` / Volume / `SHALLOW CLONE` ingestion script *(emitted for file sources)* |
 | `databricks/gold_hierarchies.sql` | Recursive CTE Gold Delta SQL for detected BOMs, lot genealogy & asset trees (cycle-safe, plant-scoped) |
+| `databricks/metric_views.sql` | **Databricks Unity Catalog Metric Views** (`WITH METRICS LANGUAGE YAML` v1.1) with joins, dimensions & measures |
+| `databricks/genie_context.md` | **Databricks AI/BI Genie Space** instructions, verified joins, PII-free filter reference & benchmark SQL |
 | `databricks/databricks.yml` | Deployment-ready **Databricks Asset Bundle (DABs)** manifest (`dev`/`prod` jobs, serverless DLT & dashboard) |
 | `databricks/lakeview_dashboard.lvdash.json` | **Databricks AI/BI Lakeview** operational & manufacturing dashboard definition |
 | `databricks/ingestion_sizing.md` | Backfill volume, daily row velocity, cadence, CDC audit, and Delta linter report |
@@ -158,6 +164,7 @@ tick discover ./lake_drop --out-dir ./lake-discovery
 | `snowflake/snowflake_file_ingest.sql` | Snowflake `CREATE FILE FORMAT`, `STAGE`, `COPY INTO` & Snowpipe templates *(emitted for file sources)* |
 | `snowflake/snowflake_dynamic_tables.sql` | Bronze → Silver Snowflake Dynamic Tables with `TARGET_LAG`, legacy dates, OT filters & `QUALIFY` dedup |
 | `snowflake/snowflake_gold_hierarchies.sql` | Recursive CTE Gold Dynamic Tables for BOMs, lot genealogy & asset trees (`ARRAY_CONTAINS` cycle guard) |
+| `snowflake/cortex_analyst_semantic_model.yml` | **Snowflake Cortex Analyst** semantic model YAML with glossary synonyms, joins, safe enums & verified queries |
 | `snowflake/snowflake_dmf.sql` | Snowflake Data Metric Functions (DMFs) for row count, nulls, duplicates, freshness & OPC quality |
 | `snowflake/snowflake.yml` | Deployment-ready **Snowflake CLI (`snow`) v2** project manifest |
 | `snowflake/streamlit_app.py` | **Streamlit in Snowflake (SiS)** observability, Dynamic Table lag, DMF, OT telemetry & BOM monitor app |

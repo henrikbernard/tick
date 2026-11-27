@@ -54,7 +54,7 @@ jobs:
             --html /tmp/tick-ci/diff.html \
             --md /tmp/tick-ci/diff.md
           tick demo /tmp/tick-ci/lake_drop --domain files
-          tick discover /tmp/tick-ci/lake_drop -o /tmp/tick-ci/lake_out --quiet
+          tick discover /tmp/tick-ci/lake_drop -o /tmp/tick-ci/lake_out --semantic-dir /tmp/tick-ci/lake_semantic --quiet
 
   dashboard-js-check:
     name: Validate Dashboard JS Syntax
