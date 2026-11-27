@@ -1290,6 +1290,78 @@ class SnowflakeAdapter(DialectAdapter):
     sqlglot_dialect = "snowflake"
     system_schemas = {"INFORMATION_SCHEMA", "information_schema"}
 
+    def get_server_version(self, conn: Connection) -> str | None:
+        try:
+            val = conn.execute(text("SELECT CURRENT_VERSION()")).scalar()
+            return f"Snowflake {val}" if val else super().get_server_version(conn)
+        except Exception:
+            safe_rollback(conn)
+            return super().get_server_version(conn)
+
+    def configure_safe_session(
+        self,
+        conn: Connection,
+        read_uncommitted: bool = False,
+        query_timeout_seconds: int | None = None,
+    ) -> None:
+        # Snowflake uses lock-free Snapshot Isolation natively; apply statement timeout when requested
+        try:
+            if query_timeout_seconds and query_timeout_seconds > 0:
+                conn.execute(
+                    text(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {int(query_timeout_seconds)}")
+                )
+        except Exception:
+            safe_rollback(conn)
+
+    def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
+        return CdcDatabaseAudit(
+            dialect=self.name,
+            db_cdc_enabled=True,
+            notes=[
+                "Snowflake supports native Change Tracking (CHANGE_TRACKING = TRUE), Streams, and Dynamic Tables for incremental pipelines."
+            ],
+        )
+
+    def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
+        stats: dict[str, TableStats] = {}
+        try:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES, COMMENT
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_SCHEMA = :schema
+                    """
+                ),
+                {"schema": schema_name},
+            ).mappings()
+            for row in rows:
+                ttype = str(row.get("TABLE_TYPE") or "").upper()
+                stats[row["TABLE_NAME"]] = TableStats(
+                    row_count=int(row["ROW_COUNT"]) if row.get("ROW_COUNT") is not None else None,
+                    row_count_exact=True,
+                    size_bytes=int(row["BYTES"]) if row.get("BYTES") is not None else None,
+                    comment=row.get("COMMENT") or None,
+                    is_materialized_view=(ttype == "MATERIALIZED VIEW"),
+                )
+        except Exception:
+            safe_rollback(conn)
+        return stats
+
+    def build_sample_query(
+        self,
+        quoted_table: str,
+        columns_sql: str,
+        sample_size: int,
+        total_rows: int | None,
+        *,
+        use_tablesample: bool = False,
+        read_uncommitted: bool = False,
+    ) -> str:
+        if use_tablesample and total_rows and total_rows > sample_size * 2:
+            return f"SELECT {columns_sql} FROM {quoted_table} SAMPLE ({sample_size} ROWS)"
+        return f"SELECT {columns_sql} FROM {quoted_table} LIMIT {sample_size}"
+
 
 class BigQueryAdapter(DialectAdapter):
     name = "bigquery"

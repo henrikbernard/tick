@@ -1,18 +1,19 @@
-# tick — Universal Automatic Database Discovery for Data Engineering & Databricks
+# tick — Universal Automatic Database Discovery for Data Engineering, Databricks & Snowflake
 
 [![CI](https://github.com/henrikbernard/tick/actions/workflows/ci.yml/badge.svg)](https://github.com/henrikbernard/tick/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-`tick` points at **any SQLAlchemy-supported database** (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Databricks Unity Catalog, Oracle, IBM DB2/AS400, SAP HANA, Snowflake, BigQuery**) and automatically discovers everything a data engineer needs before building pipelines—with first-class **Databricks Lakehouse**, **Manufacturing / ERP / MES / OT**, **Data Contracts**, and **standalone offline HTML dashboards**.
+`tick` points at **any SQLAlchemy-supported database** (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Databricks Unity Catalog, Snowflake, Oracle, IBM DB2/AS400, SAP HANA, BigQuery**) and automatically discovers everything a data engineer needs before building pipelines—with first-class **Databricks Lakehouse**, **Snowflake Data Cloud**, **Manufacturing / ERP / MES / OT**, **Data Contracts**, and **standalone offline HTML dashboards**.
 
 ```mermaid
 flowchart LR
-    SRC[("Any Source DB\nPostgres · MSSQL · Oracle · SAP\nDB2 · MySQL · DuckDB · Databricks")] --> CAT["Catalog & Safe Guardrails\n(NOLOCK / Timeout / Empty Triage)"]
-    CAT --> PROF["Parallel Profiler (--workers N)\nStats · Quantiles · Freshness · PII · UC Gov"]
-    PROF --> INT["DE & Manufacturing Intelligence\nFK Inference · SQL Lineage · CDC Audit\nOT Telemetry · BOMs · Legacy Dates · Delta Lint"]
+    SRC[("Any Source DB\nPostgres · MSSQL · Oracle · SAP\nDB2 · MySQL · DuckDB · Databricks · Snowflake")] --> CAT["Catalog & Safe Guardrails\n(NOLOCK / Timeout / Empty Triage)"]
+    CAT --> PROF["Parallel Profiler (--workers N)\nStats · Quantiles · Freshness · PII · Governance"]
+    PROF --> INT["DE & Manufacturing Intelligence\nFK Inference · SQL Lineage · CDC Audit\nOT Telemetry · BOMs · Legacy Dates · Delta & SF Lint"]
     INT --> HTML["3 Interactive HTML Dashboards\nDiscovery · Multi-Plant · Diff"]
     INT --> DBX["Databricks Bundle\nUC DDL · Lakeflow DLT · Sizing"]
+    INT --> SF["Snowflake Bundle\nDDL · Dynamic Tables · DMFs · Sizing"]
     INT --> CTR["Data Contracts\nDatabricks DQX · ODCS v3.0"]
     INT --> DBT["dbt & Docs\nsources.yml · Staging SQL · Markdown"]
 ```
@@ -32,22 +33,30 @@ flowchart LR
   - Overview KPIs, inline SVG **CDC Readiness Donut**, Health & Entity Role charts, and a 3-tier **Databricks Migration Wave Planner** (Wave 1 Fast-Track / Wave 2 Needs Config / Wave 3 Remediation Required) with Bronze MB/GB & daily row rollups.
   - Interactive **Catalog & Profiler** with column search/PII/null filters, inline SVG **Numeric Quantile Boxplots**, and proportional **Top-Value Bars**.
   - **Interactive ERD & Lineage DAG** with drag-to-pan, scroll-wheel zoom, live highlight search, Fit View, cycle handling, and one-click **Download SVG**.
-  - Persisted Light/Dark theme toggle, **Print / PDF** executive summary layout, and downloadable Unity Catalog DDL / Lakeflow DLT / dbt code.
+  - Persisted Light/Dark theme toggle, **Print / PDF** executive summary layout, and downloadable Unity Catalog DDL / Lakeflow DLT / Snowflake DDL / Dynamic Tables / DMFs / dbt code.
 - **Multi-Plant Harmonization Dashboard (`tick compare-sources --html`)**:
-  - Interactive **Plant × Table Presence & Drift Heatmap**, alignment donut, drift breakdown bars, click-to-inspect column conflict & cast matrices, and copy/download **Unified Multi-Plant Databricks `UNION ALL` SQL**.
+  - Interactive **Plant × Table Presence & Drift Heatmap**, alignment donut, drift breakdown bars, click-to-inspect column conflict & cast matrices, and copy/download **Unified Multi-Plant Databricks or Snowflake (`--target snowflake`) `UNION ALL` SQL**.
 - **Schema & Data Drift Dashboard (`tick diff --html`)**:
   - Breaking vs Safe CI gate banner, added/removed tables & PK change lists, filterable column diffs (including breaking type narrowings), newly detected PII alerts, and Before vs After metric drift bars.
 
-### 3. Databricks Lakeflow, Unity Catalog & Data Contracts
-- **Unity Catalog & Lakeflow Connect CDC Audit**: Inspects SQL Server Change Tracking/CDC, PostgreSQL `wal_level`/`REPLICA IDENTITY`, Oracle `ARCHIVELOG`/supplemental logging, MySQL `binlog_format`, PK presence, and unsupported column types.
-- **Spark / Delta Lake Compatibility Linter**: Flags Delta-illegal column names (`Order #`, `Qty/Hr`), `DECIMAL` precision > 38, `MONEY`/exotic types, timezone-naive timestamps (`TIMESTAMP_NTZ`), and over-partitioning vs. **Liquid Clustering (`CLUSTER BY`)**.
+### 3. Databricks & Snowflake Target Readiness (`--target databricks | snowflake | both`)
+- **Unity Catalog & Snowflake Connectors**: Connect directly to Databricks SQL Warehouses (`databricks://...`) or Snowflake (`snowflake://...`) alongside upstream OLTP/ERP databases (`SAMPLE (N ROWS)`, `INFORMATION_SCHEMA.TABLES`, `STATEMENT_TIMEOUT_IN_SECONDS`).
+- **CDC Readiness Audit**: Inspects SQL Server Change Tracking/CDC, PostgreSQL `wal_level`/`REPLICA IDENTITY`, Oracle `ARCHIVELOG`/supplemental logging, MySQL `binlog_format`, Snowflake Streams/Change Tracking, PK presence, and unsupported column types.
+- **Dual-Platform Compatibility Linters**:
+  - **Spark / Delta Lake**: Flags illegal column names, `DECIMAL` > 38, `MONEY`/exotic types, timezone-naive `TIMESTAMP_NTZ`, and recommends **Liquid Clustering (`CLUSTER BY`)**.
+  - **Snowflake**: Maps native `NUMBER`/`TIMESTAMP_NTZ`/`TIMESTAMP_LTZ`/`TIME`/`VARIANT`/`GEOGRAPHY`, flags quoted identifiers, `NUMBER` > 38, `VARIANT` 16 MB limits, Automatic Clustering cost advisories, and Virtual Warehouse sizing (`XSMALL`–`LARGE`).
 - **Databricks Asset Bundle (`--databricks-dir`)**:
-  - `unity_catalog_ddl.sql`: Delta `CREATE TABLE` with Liquid Clustering, CDF, Deletion Vectors, comments, Unity Catalog governance tags, and type-matched row-filter / column-mask templates.
-  - `lakeflow_pipeline.py`: Ready-to-run **Lakeflow Declarative Pipelines (DLT)** Bronze → Silver code with column sanitization, legacy date stitching, `@dlt.expect_all` rules, `dlt.apply_changes` Auto CDC, batch Materialized Views for `full_refresh`, and Structured Streaming watermarks.
-  - `ingestion_sizing.md`: Backfill size, daily incremental delta rate, cadence, and Databricks compute tier plan.
+  - `unity_catalog_ddl.sql`: Delta `CREATE TABLE` with Liquid Clustering, CDF, Deletion Vectors, UC tags, and type-matched row-filter / column-mask templates.
+  - `lakeflow_pipeline.py`: Ready-to-run **Lakeflow Declarative Pipelines (DLT)** Bronze → Silver Python with atomic column renaming, legacy date stitching, `@dlt.expect_all`, `dlt.apply_changes`, batch Materialized Views, and streaming watermarks.
+  - `ingestion_sizing.md`: Backfill size, daily velocity, cadence, and Databricks compute tier plan.
+- **Snowflake Asset Bundle (`--snowflake-dir`)**:
+  - `snowflake_ddl.sql`: `CREATE TABLE` with `CHANGE_TRACKING = TRUE`, Object Tags (`CREATE TAG`), type-matched **Row Access Policies** (multi-plant isolation), and type-matched **Dynamic Data Masking Policies** (PII / cost / ITAR).
+  - `snowflake_dynamic_tables.sql`: Bronze → Silver **Snowflake Dynamic Tables** (`TARGET_LAG`, `WAREHOUSE`, native `TRY_TO_TIMESTAMP_NTZ` / `DATEADD` legacy date parsing, OT quality `WHERE` filters, and `QUALIFY ROW_NUMBER()` deduplication).
+  - `snowflake_dmf.sql`: **Snowflake Data Metric Functions (DMFs)** (`SNOWFLAKE.CORE.ROW_COUNT`, `DUPLICATE_COUNT`, `NULL_COUNT`, `FRESHNESS`, plus custom `BAD_OPC_QUALITY_COUNT` for numeric OPC Classic sensors).
+  - `snowflake_sizing.md`: Openflow / Snowpipe Streaming / COPY INTO connector plan, Dynamic Table lag, clustering advisory, and Virtual Warehouse sizing.
 - **Data Contract Exporter (`--contracts-dir`)**:
-  - `dqx_checks.yml`: **Databricks Labs DQX** quality checks (`is_unique`, `is_not_null`, `is_in_list`, `is_in_range`, OT quality `is_not_in_list`) with sensitive PII/governance values excluded.
-  - `data_contract.odcs.yml`: **Open Data Contract Standard (ODCS v3.0.0)** YAML with logical/physical Spark types, primary keys, semantic business names, PII/ITAR/commercial classifications, Liquid Clustering metadata, quality rules, and freshness SLAs.
+  - `dqx_checks.yml`: **Databricks Labs DQX** quality checks (`is_unique`, `is_not_null`, `is_in_list`, `is_in_range`, OT quality checks) with sensitive values excluded.
+  - `data_contract.odcs.yml`: **Open Data Contract Standard (ODCS v3.0.0)** YAML targeting Databricks, Snowflake, or both.
 
 ### 4. Manufacturing, ERP & OT Intelligence
 - **Production Shop-Floor Safety Guardrails**: `--read-uncommitted` (`WITH (NOLOCK)` / `WITH UR`), `--query-timeout`, `--skip-empty-tables`, `--skip-tables-over-mb`, `--use-tablesample`, and credential masking in URLs/ODBC strings.
@@ -92,20 +101,26 @@ tick demo ./plant_ohio.duckdb --domain manufacturing --plant plant_ohio
 tick demo ./plant_munich.duckdb --domain manufacturing --plant plant_munich
 
 # 3. Discover Plant Ohio with parallel workers, safety guardrails, and full artifact bundle
-#    Writes: report.html, report.md, snapshot.json, dbt/, databricks/, contracts/
+#    Writes: report.html, report.md, snapshot.json, dbt/, databricks/, snowflake/, contracts/
+#    (Add `--target snowflake` or `--target databricks` to emit only one cloud platform)
 tick discover ./plant_ohio.duckdb \
   --out-dir ./ohio-discovery \
   --workers 4 \
   --skip-empty-tables \
   --use-tablesample \
   --databricks-catalog manufacturing \
-  --databricks-schema bronze_ohio
+  --databricks-schema bronze_ohio \
+  --snowflake-db MANUFACTURING \
+  --snowflake-schema BRONZE_OHIO \
+  --snowflake-warehouse COMPUTE_WH
 
 # 4. Discover Plant Munich
 tick discover ./plant_munich.duckdb --out-dir ./munich-discovery --workers 4 --quiet
 
-# 5. Harmonize schemas across plants & generate interactive HTML dashboard + unified Databricks SQL
+# 5. Harmonize schemas across plants & generate interactive HTML dashboard + unified SQL
+#    (Pass `--target snowflake --database MANUFACTURING` to generate Snowflake UNION ALL views)
 tick compare-sources ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
+  --target databricks \
   --html ./harmonization.html \
   --md ./harmonization.md \
   --sql ./unified_silver_views.sql
@@ -129,6 +144,10 @@ tick diff ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
 | `databricks/unity_catalog_ddl.sql` | Unity Catalog Delta DDL with Liquid Clustering, CDF, tags, and type-matched mask/row-filter stubs |
 | `databricks/lakeflow_pipeline.py` | Databricks Lakeflow Declarative Pipeline (DLT) Bronze → Silver Python code |
 | `databricks/ingestion_sizing.md` | Backfill volume, daily row velocity, cadence, CDC audit, and Delta linter report |
+| `snowflake/snowflake_ddl.sql` | Snowflake `CREATE TABLE` with `CHANGE_TRACKING`, Object Tags, Row Access Policies & Masking Policies |
+| `snowflake/snowflake_dynamic_tables.sql` | Bronze → Silver Snowflake Dynamic Tables with `TARGET_LAG`, legacy dates, OT filters & `QUALIFY` dedup |
+| `snowflake/snowflake_dmf.sql` | Snowflake Data Metric Functions (DMFs) for row count, nulls, duplicates, freshness & OPC quality |
+| `snowflake/snowflake_sizing.md` | Snowflake connector, Dynamic Table lag, clustering advisory, and Virtual Warehouse sizing plan |
 | `contracts/dqx_checks.yml` | Databricks Labs DQX data quality rules YAML |
 | `contracts/data_contract.odcs.yml` | Open Data Contract Standard (ODCS v3.0.0) YAML contract |
 | `dbt/sources.yml` + `dbt/staging/*.sql` | dbt v2 sources with freshness/tests and clean staging SQL models |

@@ -520,6 +520,23 @@ def analyze_tables_and_quality(
                     )
                     penalty += 5 if d_issue.severity == "high" else 2
 
+        if tbl.snowflake_compatibility:
+            # Avoid double-penalizing health score when Delta linter already ran on the same table
+            apply_sf_penalty = tbl.delta_compatibility is None
+            for sf_issue in tbl.snowflake_compatibility.issues:
+                if sf_issue.severity in {"high", "medium"}:
+                    issues.append(
+                        QualityIssue(
+                            severity=sf_issue.severity,
+                            category=f"snowflake_{sf_issue.category}",
+                            table=tbl.full_name,
+                            column=sf_issue.column,
+                            message=f"{sf_issue.message} Remediation: {sf_issue.remediation}",
+                        )
+                    )
+                    if apply_sf_penalty:
+                        penalty += 5 if sf_issue.severity == "high" else 2
+
         tbl.quality_issues = issues
         tbl.quality_score = max(0, min(100, 100 - penalty))
         all_issues.extend(issues)

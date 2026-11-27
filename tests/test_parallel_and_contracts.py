@@ -124,14 +124,16 @@ def test_dqx_and_odcs_data_contract_exporters_and_cli(tmp_path):
         for c in hist_checks
     )
 
-    # Validate ODCS v3.0.0 YAML
+    # Validate ODCS v3.0.0 YAML (default target_platform='both' emits source + databricks + snowflake)
     odcs = yaml.safe_load(odcs_file.read_text(encoding="utf-8"))
     assert odcs["apiVersion"] == "v3.0.0"
     assert odcs["kind"] == "DataContract"
     assert odcs["domain"] == "mfg_prod"
-    assert len(odcs["servers"]) == 2
-    assert odcs["servers"][1]["type"] == "databricks"
-    assert odcs["servers"][1]["catalog"] == "mfg_prod"
+    servers_by_name = {s["server"]: s for s in odcs["servers"]}
+    assert set(servers_by_name) == {"source", "databricks_target", "snowflake_target"}
+    assert servers_by_name["databricks_target"]["type"] == "databricks"
+    assert servers_by_name["databricks_target"]["catalog"] == "mfg_prod"
+    assert servers_by_name["snowflake_target"]["type"] == "snowflake"
     assert len(odcs["slaProperties"]) >= 1
 
     schema_by_name = {s["name"]: s for s in odcs["schema"]}

@@ -16,6 +16,7 @@ from tick.models import CdcDatabaseAudit, DatabaseOverview, DiscoveryConfig, Dis
 from tick.profiler import profile_tables
 from tick.recommendations import analyze_tables_and_quality
 from tick.relationships import discover_relationships, discover_view_lineage
+from tick.snowflake import lint_snowflake_compatibility
 
 ProgressCallback = Callable[[str], None]
 
@@ -88,11 +89,15 @@ def discover_database(
             _emit("Detecting manufacturing patterns (legacy dates, OT telemetry, BOMs, backfill sizing)...")
             analyze_manufacturing_patterns(tables, artifacts)
 
-        if cfg.detect_databricks_compat:
+        if cfg.detect_databricks_compat and cfg.target_platform in {"databricks", "both"}:
             _emit("Linting Spark/Delta Lake compatibility and Liquid Clustering keys...")
             lint_databricks_compatibility(tables)
 
-        # Final quality & issue pass incorporating manufacturing, CDC, and Delta findings
+        if cfg.detect_snowflake_compat and cfg.target_platform in {"snowflake", "both"}:
+            _emit("Linting Snowflake compatibility, clustering keys, and warehouse sizing...")
+            lint_snowflake_compatibility(tables)
+
+        # Final quality & issue pass incorporating manufacturing, CDC, Delta, and Snowflake findings
         quality_issues = analyze_tables_and_quality(tables, relationships)
 
         duration = round(time.perf_counter() - start, 3)
@@ -129,6 +134,11 @@ def discover_database(
             for t in tables
             if t.delta_compatibility
         )
+        snowflake_warnings = sum(
+            len(t.snowflake_compatibility.issues)
+            for t in tables
+            if t.snowflake_compatibility
+        )
         avg_quality = (
             round(sum(t.quality_score for t in tables) / len(tables), 1)
             if tables
@@ -157,6 +167,7 @@ def discover_database(
             cdc_ready_table_count=cdc_ready,
             cdc_blocked_table_count=cdc_blocked,
             delta_warning_count=delta_warnings,
+            snowflake_warning_count=snowflake_warnings,
             avg_quality_score=avg_quality,
             cdc_audit=cdc_audit,
         )

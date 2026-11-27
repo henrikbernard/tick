@@ -237,8 +237,10 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     downloadBlob("unified_multi_plant_views.sql", allSql, "text/sql;charset=utf-8");
   });
 
+  const isSf = report.target_platform === "snowflake";
+  const platName = isSf ? "Snowflake" : "Databricks";
   document.getElementById("hdr-sub").textContent =
-    `Comparing ${report.sources.length} plants/sources: ${report.sources.join(" · ")}`;
+    `Target: ${platName} · Comparing ${report.sources.length} plants/sources: ${report.sources.join(" · ")}`;
 
   const totalConflicts = report.tables.reduce((a, t) => a + t.conflict_count, 0);
   const totalSiteCols = report.tables.reduce((a, t) => a + t.site_specific_column_count, 0);
@@ -411,16 +413,18 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
             <thead>
               <tr>
                 <th>Target Column</th>
-                <th>Widened Spark Type</th>
+                <th>Widened ${platName} Type</th>
                 ${tbl.present_in_sources.map(s => `<th>${esc(s)}</th>`).join("")}
                 <th>Status</th>
               </tr>
             </thead>
             <tbody>
-              ${cols.length ? cols.map(c => `
+              ${cols.length ? cols.map(c => {
+                const tgtType = isSf ? (c.target_snowflake_type || c.target_spark_type) : c.target_spark_type;
+                return `
                 <tr>
                   <td class="mono"><strong>${esc(c.sanitized_name)}</strong>${c.name !== c.sanitized_name ? `<div style="font-size:11px;color:var(--text-muted)">src: ${esc(c.name)}</div>` : ""}</td>
-                  <td><span class="badge b-accent">${esc(c.target_spark_type)}</span>${c.nullable_in_target ? '<span class="badge b-muted">NULL</span>' : '<span class="badge b-green">NN</span>'}</td>
+                  <td><span class="badge b-accent">${esc(tgtType)}</span>${c.nullable_in_target ? '<span class="badge b-muted">NULL</span>' : '<span class="badge b-green">NN</span>'}</td>
                   ${tbl.present_in_sources.map(s => {
                     if (!c.present_in_sources.includes(s)) {
                       return `<td><span class="badge b-red">MISSING → NULL</span></td>`;
@@ -433,13 +437,14 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
                     ${c.missing_in_sources.length ? '<span class="badge b-orange">SITE-ONLY</span>' : ""}
                     ${(!c.has_type_conflict && !c.missing_in_sources.length) ? '<span class="badge b-green">ALIGNED</span>' : ""}
                   </td>
-                </tr>`).join("") : `<tr><td colspan="${tbl.present_in_sources.length + 3}" style="color:var(--text-muted)">No drifted columns on this table.</td></tr>`}
+                </tr>`;
+              }).join("") : `<tr><td colspan="${tbl.present_in_sources.length + 3}" style="color:var(--text-muted)">No drifted columns on this table.</td></tr>`}
             </tbody>
           </table>
         </div>
 
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-          <h2 style="margin:0;">Unified Multi-Plant Databricks SQL</h2>
+          <h2 style="margin:0;">Unified Multi-Plant ${platName} SQL</h2>
           <div style="display:flex;gap:8px;">
             <button class="btn" id="download-tbl-sql">Download SQL</button>
             <button class="btn btn-primary" id="copy-tbl-sql">Copy SQL</button>

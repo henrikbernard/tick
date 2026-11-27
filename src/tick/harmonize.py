@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from tick.databricks import (
     DECIMAL_PREC_RE,
@@ -17,6 +18,12 @@ from tick.models import (
     HarmonizedTable,
     TableInfo,
 )
+from tick.snowflake import (
+    SF_DECIMAL_PREC_RE,
+    deduplicate_snowflake_columns,
+    map_to_snowflake_type,
+    sanitize_snowflake_identifier,
+)
 
 # Widening hierarchy for Spark SQL types when plants disagree on column types
 NUMERIC_WIDENING = {
@@ -26,11 +33,12 @@ NUMERIC_WIDENING = {
     "DECIMAL": 4,
     "DOUBLE": 5,
 }
-_INT_PRECISION_MAP = {"SMALLINT": 5, "INT": 10, "BIGINT": 19}
+_INT_PRECISION_MAP = {"SMALLINT": 5, "INT": 10, "INTEGER": 10, "BIGINT": 19}
+SF_NUMERIC_WIDENING = {"SMALLINT", "INTEGER", "BIGINT", "NUMBER", "FLOAT"}
 
 
-def _widen_decimal_types(types: list[str]) -> str:
-    """Compute a lossless Spark DECIMAL(p, s) covering all input integer/decimal Spark types."""
+def _widen_decimal_types(types: list[str], prefix: str = "DECIMAL") -> str:
+    """Compute a lossless DECIMAL/NUMBER(p, s) covering all input integer/decimal types."""
     max_int_digits = 0
     max_scale = 0
     for t in types:
@@ -39,7 +47,7 @@ def _widen_decimal_types(types: list[str]) -> str:
         if base in _INT_PRECISION_MAP:
             max_int_digits = max(max_int_digits, _INT_PRECISION_MAP[base])
         else:
-            m = DECIMAL_PREC_RE.search(u)
+            m = DECIMAL_PREC_RE.search(u) or SF_DECIMAL_PREC_RE.search(u)
             if m:
                 prec = int(m.group(1))
                 scale = int(m.group(2)) if m.group(2) else 0
@@ -53,7 +61,7 @@ def _widen_decimal_types(types: list[str]) -> str:
     prec = min(38, max(scale, max_int_digits + scale))
     if prec == 0:
         prec = 18
-    return f"DECIMAL({prec}, {scale})"
+    return f"{prefix}({prec}, {scale})"
 
 
 def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
@@ -68,7 +76,7 @@ def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
         if "DOUBLE" in bases:
             return "DOUBLE", True
         if "DECIMAL" in bases:
-            return _widen_decimal_types(unique_exact), True
+            return _widen_decimal_types(unique_exact, prefix="DECIMAL"), True
         if "BIGINT" in bases:
             return "BIGINT", True
         return "INT", True
@@ -81,16 +89,46 @@ def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
     return "STRING", True
 
 
+def _widen_snowflake_types(types: list[str]) -> tuple[str, bool]:
+    """Given Snowflake types across plants for the same column, pick a safe widened target type."""
+    unique_exact = sorted(set(types))
+    if len(unique_exact) == 1:
+        return unique_exact[0], False
+
+    bases = [t.split("(")[0].upper() for t in unique_exact]
+    if all(b in SF_NUMERIC_WIDENING for b in bases):
+        if "FLOAT" in bases:
+            return "FLOAT", True
+        if "NUMBER" in bases:
+            return _widen_decimal_types(unique_exact, prefix="NUMBER"), True
+        if "BIGINT" in bases:
+            return "BIGINT", True
+        return "INTEGER", True
+
+    if set(bases) <= {"DATE", "TIMESTAMP_LTZ", "TIMESTAMP_NTZ"}:
+        return ("TIMESTAMP_LTZ" if "TIMESTAMP_LTZ" in bases else "TIMESTAMP_NTZ"), True
+
+    return "VARCHAR", True
+
+
+def _dq(val: str) -> str:
+    return f'"{val.replace(chr(34), chr(34) * 2)}"'
+
+
 def harmonize_snapshots(
     sources: dict[str, DiscoveryResult],
     catalog: str = "manufacturing",
     bronze_schema: str = "bronze",
+    target_platform: Literal["databricks", "snowflake"] = "databricks",
 ) -> HarmonizationReport:
-    """Compare N plant/site discovery snapshots and generate a unified multi-plant Bronze/Silver schema."""
+    """Compare N plant/site discovery snapshots and generate unified multi-plant Databricks or Snowflake SQL."""
     source_names = list(sources.keys())
     safe_site_map = deduplicate_column_names(source_names)
+    sf_site_map = deduplicate_snowflake_columns(source_names)
     cat_esc = catalog.replace("`", "``")
     bsch_esc = bronze_schema.replace("`", "``")
+    sf_db = catalog.upper() if catalog == "manufacturing" else catalog
+    sf_bsch = bronze_schema.upper() if bronze_schema == "bronze" else bronze_schema
 
     # Index base tables across sites; qualify with schema if a single site has duplicate table names across schemas
     dup_names_within_source: set[str] = set()
@@ -130,7 +168,7 @@ def harmonize_snapshots(
 
         # Gather union of all columns (matched by deduplicated sanitized name per site)
         col_order: list[str] = []
-        col_sites: dict[str, dict[str, tuple[str, str, str, str, bool]]] = {}
+        col_sites: dict[str, dict[str, tuple[str, str, str, str, str, bool]]] = {}
         for s in present:
             col_map = deduplicate_column_names([c.name for c in site_map[s].columns])
             for col in site_map[s].columns:
@@ -139,7 +177,8 @@ def harmonize_snapshots(
                     col_order.append(ck)
                     col_sites[ck] = {}
                 spark_t = col.spark_type or map_to_spark_type(col.raw_type, col.canonical_type)
-                col_sites[ck][s] = (col.name, col.raw_type, spark_t, col.canonical_type, col.nullable)
+                sf_t = col.snowflake_type or map_to_snowflake_type(col.raw_type, col.canonical_type)
+                col_sites[ck][s] = (col.name, col.raw_type, spark_t, sf_t, col.canonical_type, col.nullable)
 
         h_cols: list[HarmonizedColumn] = []
         conflicts = 0
@@ -151,10 +190,17 @@ def harmonize_snapshots(
             c_missing = [s for s in present if s not in smap]
             raw_types = {s: smap[s][1] for s in c_present}
             spark_types = {s: smap[s][2] for s in c_present}
-            canonical_by_src = {s: smap[s][3] for s in c_present}
-            target_spark, has_conflict = _widen_spark_types(list(spark_types.values()))
-            cast_needed = [s for s in c_present if spark_types[s] != target_spark]
-            nullable = bool(c_missing) or any(smap[s][4] for s in c_present)
+            sf_types = {s: smap[s][3] for s in c_present}
+            canonical_by_src = {s: smap[s][4] for s in c_present}
+            target_spark, spark_conflict = _widen_spark_types(list(spark_types.values()))
+            target_sf, sf_conflict = _widen_snowflake_types(list(sf_types.values()))
+            if target_platform == "snowflake":
+                has_conflict = sf_conflict
+                cast_needed = [s for s in c_present if sf_types[s] != target_sf]
+            else:
+                has_conflict = spark_conflict
+                cast_needed = [s for s in c_present if spark_types[s] != target_spark]
+            nullable = bool(c_missing) or any(smap[s][5] for s in c_present)
 
             if has_conflict:
                 conflicts += 1
@@ -171,40 +217,71 @@ def harmonize_snapshots(
                     types_by_source=raw_types,
                     canonical_types_by_source=canonical_by_src,
                     target_spark_type=target_spark,
+                    target_snowflake_type=target_sf,
                     has_type_conflict=has_conflict,
                     nullable_in_target=nullable,
                     cast_required_sources=cast_needed,
                 )
             )
 
-        # Generate Unified Multi-Plant Databricks UNION ALL SQL
+        # Generate Unified Multi-Plant UNION ALL SQL (Databricks Spark SQL or Snowflake SQL)
         union_branches: list[str] = []
-        safe_tbl = sanitize_delta_column_name(tbl_key)
-        for s in present:
-            safe_site = safe_site_map[s]
-            escaped_site_lit = s.replace("'", "''")
-            selects = [f"    '{escaped_site_lit}' AS `source_plant`"]
-            for hc in h_cols:
-                if s in hc.present_in_sources:
-                    orig_col = col_sites[hc.sanitized_name][s][0].replace("`", "``")
-                    if s in hc.cast_required_sources:
-                        selects.append(f"    CAST(`{orig_col}` AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
+        if target_platform == "snowflake":
+            sf_tbl = sanitize_snowflake_identifier(tbl_key)
+            for s in present:
+                sf_site = sf_site_map[s]
+                escaped_site_lit = s.replace("'", "''")
+                selects = [f"    '{escaped_site_lit}' AS \"SOURCE_PLANT\""]
+                for hc in h_cols:
+                    sf_col_alias = sanitize_snowflake_identifier(hc.sanitized_name)
+                    tgt_t = hc.target_snowflake_type or "VARCHAR"
+                    if s in hc.present_in_sources:
+                        orig_col = col_sites[hc.sanitized_name][s][0]
+                        if s in hc.cast_required_sources:
+                            selects.append(f"    CAST({_dq(orig_col)} AS {tgt_t}) AS {_dq(sf_col_alias)}")
+                        else:
+                            selects.append(f"    {_dq(orig_col)} AS {_dq(sf_col_alias)}")
                     else:
-                        selects.append(f"    `{orig_col}` AS `{hc.sanitized_name}`")
-                else:
-                    selects.append(f"    CAST(NULL AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
-            branch = (
-                "SELECT\n"
-                + ",\n".join(selects)
-                + f"\nFROM `{cat_esc}`.`{bsch_esc}_{safe_site}`.`{safe_tbl}`"
-            )
-            union_branches.append(branch)
+                        selects.append(f"    CAST(NULL AS {tgt_t}) AS {_dq(sf_col_alias)}")
+                branch = (
+                    "SELECT\n"
+                    + ",\n".join(selects)
+                    + f"\nFROM {_dq(sf_db)}.{_dq(f'{sf_bsch}_{sf_site}')}.{_dq(sf_tbl)}"
+                )
+                union_branches.append(branch)
 
-        unified_sql = (
-            f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{safe_tbl}` AS\n"
-            + "\nUNION ALL\n".join(union_branches)
-            + ";\n"
-        )
+            unified_sql = (
+                f"CREATE OR REPLACE VIEW {_dq(sf_db)}.\"SILVER\".{_dq(f'UNIFIED_{sf_tbl}')} AS\n"
+                + "\nUNION ALL\n".join(union_branches)
+                + ";\n"
+            )
+        else:
+            safe_tbl = sanitize_delta_column_name(tbl_key)
+            for s in present:
+                safe_site = safe_site_map[s]
+                escaped_site_lit = s.replace("'", "''")
+                selects = [f"    '{escaped_site_lit}' AS `source_plant`"]
+                for hc in h_cols:
+                    if s in hc.present_in_sources:
+                        orig_col = col_sites[hc.sanitized_name][s][0].replace("`", "``")
+                        if s in hc.cast_required_sources:
+                            selects.append(f"    CAST(`{orig_col}` AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
+                        else:
+                            selects.append(f"    `{orig_col}` AS `{hc.sanitized_name}`")
+                    else:
+                        selects.append(f"    CAST(NULL AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
+                branch = (
+                    "SELECT\n"
+                    + ",\n".join(selects)
+                    + f"\nFROM `{cat_esc}`.`{bsch_esc}_{safe_site}`.`{safe_tbl}`"
+                )
+                union_branches.append(branch)
+
+            unified_sql = (
+                f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{safe_tbl}` AS\n"
+                + "\nUNION ALL\n".join(union_branches)
+                + ";\n"
+            )
 
         is_aligned = (not missing) and (not pk_divergent) and conflicts == 0 and site_specific == 0
         if is_aligned:
@@ -225,6 +302,7 @@ def harmonize_snapshots(
         )
 
     return HarmonizationReport(
+        target_platform=target_platform,
         sources=source_names,
         total_unique_tables=len(harmonized_tables),
         fully_aligned_tables=fully_aligned,
@@ -278,17 +356,24 @@ def render_harmonization_markdown(report: HarmonizationReport) -> str:
             col for col in tbl.columns if col.has_type_conflict or col.missing_in_sources
         ]
         if drifted_cols:
-            lines.append("| Target Column | Target Spark Type | Type Conflict | Types by Source | Missing In |")
+            type_col_hdr = "Target Snowflake Type" if report.target_platform == "snowflake" else "Target Spark Type"
+            lines.append(f"| Target Column | {type_col_hdr} | Type Conflict | Types by Source | Missing In |")
             lines.append("|---|---|---|---|---|")
             for col in drifted_cols:
                 tsrc = ", ".join(f"`{s}`: `{t}`" for s, t in col.types_by_source.items())
                 miss = ", ".join(f"`{s}`" for s in col.missing_in_sources) if col.missing_in_sources else "—"
+                tgt_type = (
+                    (col.target_snowflake_type or col.target_spark_type)
+                    if report.target_platform == "snowflake"
+                    else col.target_spark_type
+                )
                 lines.append(
-                    f"| `{col.sanitized_name}` | `{col.target_spark_type}` | "
+                    f"| `{col.sanitized_name}` | `{tgt_type}` | "
                     f"{'**YES**' if col.has_type_conflict else 'no'} | {tsrc} | {miss} |"
                 )
             lines.append("")
-        lines.append("<details><summary>Unified Multi-Plant Databricks SQL</summary>")
+        plat_label = "Snowflake" if report.target_platform == "snowflake" else "Databricks"
+        lines.append(f"<details><summary>Unified Multi-Plant {plat_label} SQL</summary>")
         lines.append("")
         lines.append("```sql")
         lines.append(tbl.unified_sql.rstrip())

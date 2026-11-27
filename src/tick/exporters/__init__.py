@@ -25,6 +25,13 @@ from tick.exporters.markdown_export import (
     render_diff_markdown,
     render_markdown_report,
 )
+from tick.exporters.snowflake_export import (
+    export_snowflake_bundle,
+    render_snowflake_ddl,
+    render_snowflake_dmf_sql,
+    render_snowflake_dynamic_tables_sql,
+    render_snowflake_sizing_md,
+)
 
 __all__ = [
     "export_json",
@@ -39,6 +46,11 @@ __all__ = [
     "render_unity_catalog_ddl",
     "render_lakeflow_pipeline_py",
     "render_databricks_sizing_md",
+    "export_snowflake_bundle",
+    "render_snowflake_ddl",
+    "render_snowflake_dynamic_tables_sql",
+    "render_snowflake_dmf_sql",
+    "render_snowflake_sizing_md",
     "export_contracts_bundle",
     "render_dqx_yaml",
     "render_odcs_yaml",

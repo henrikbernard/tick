@@ -330,17 +330,56 @@ def render_odcs_yaml(
             obj_entry["businessName"] = tbl.semantic_name
         if tbl.business_description or tbl.comment:
             obj_entry["description"] = tbl.business_description or tbl.comment
+        custom_props: list[dict[str, Any]] = []
         if tbl.delta_compatibility and tbl.delta_compatibility.liquid_clustering_keys:
-            obj_entry["customProperties"] = [
+            custom_props.append(
                 {
                     "property": "databricks.liquidClusteringKeys",
                     "value": tbl.delta_compatibility.liquid_clustering_keys,
                 }
-            ]
+            )
+        if tbl.snowflake_compatibility and tbl.snowflake_compatibility.clustering_keys:
+            custom_props.append(
+                {
+                    "property": "snowflake.clusteringKeys",
+                    "value": tbl.snowflake_compatibility.clustering_keys,
+                }
+            )
+        if custom_props:
+            obj_entry["customProperties"] = custom_props
         if table_quality:
             obj_entry["quality"] = table_quality
 
         schema_objects.append(obj_entry)
+
+    servers: list[dict[str, Any]] = [
+        {
+            "server": "source",
+            "type": ov.dialect,
+            "description": f"Discovered source database ({ov.sanitized_url})",
+        }
+    ]
+    if result.config.target_platform in {"databricks", "both"}:
+        servers.append(
+            {
+                "server": "databricks_target",
+                "type": "databricks",
+                "catalog": cat,
+                "schema": sch,
+                "description": "Target Databricks Unity Catalog Lakehouse schema",
+            }
+        )
+    if result.config.target_platform in {"snowflake", "both"}:
+        servers.append(
+            {
+                "server": "snowflake_target",
+                "type": "snowflake",
+                "database": result.config.snowflake_database,
+                "schema": result.config.snowflake_schema,
+                "warehouse": result.config.snowflake_warehouse,
+                "description": "Target Snowflake Data Cloud schema",
+            }
+        )
 
     contract: dict[str, Any] = {
         "apiVersion": "v3.0.0",
@@ -351,22 +390,9 @@ def render_odcs_yaml(
         "name": f"{ov.database_name} Data Contract",
         "domain": cat,
         "description": {
-            "purpose": f"Auto-discovered data contract for {ov.database_name} ({ov.dialect}) targeting Databricks Unity Catalog {cat}.{sch}.",
+            "purpose": f"Auto-discovered data contract for {ov.database_name} ({ov.dialect}) targeting {result.config.target_platform}.",
         },
-        "servers": [
-            {
-                "server": "source",
-                "type": ov.dialect,
-                "description": f"Discovered source database ({ov.sanitized_url})",
-            },
-            {
-                "server": "databricks_target",
-                "type": "databricks",
-                "catalog": cat,
-                "schema": sch,
-                "description": "Target Databricks Unity Catalog Lakehouse schema",
-            },
-        ],
+        "servers": servers,
         "schema": schema_objects,
         "slaProperties": [
             {

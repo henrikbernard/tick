@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tick-db"
-version = "0.3.0"
-description = "Universal automatic database discovery, profiling, lineage, data contracts, and Databricks Lakeflow/Unity Catalog readiness CLI"
+version = "0.4.0"
+description = "Universal automatic database discovery, profiling, lineage, data contracts, and Databricks + Snowflake readiness CLI"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

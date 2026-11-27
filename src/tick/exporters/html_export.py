@@ -11,6 +11,11 @@ from tick.exporters.databricks_export import (
     render_unity_catalog_ddl,
 )
 from tick.exporters.dbt_export import render_dbt_sources_yaml
+from tick.exporters.snowflake_export import (
+    render_snowflake_ddl,
+    render_snowflake_dmf_sql,
+    render_snowflake_dynamic_tables_sql,
+)
 from tick.models import DiscoveryResult
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -335,9 +340,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div style="overflow-x:auto"><table id="delta-lint-table"></table></div>
       </div>
     </div>
+    <div class="card">
+      <h2>Snowflake Dynamic Tables, Clustering &amp; Compatibility Linter</h2>
+      <div style="overflow-x:auto"><table id="sf-lint-table"></table></div>
+    </div>
   </section>
-
-  <!-- ERD -->
   <section id="tab-erd" class="panel">
     <div class="card">
       <div class="canvas-toolbar">
@@ -412,6 +419,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="subtabs">
           <button class="btn btn-primary code-tab" data-code="uc_ddl">Unity Catalog Delta DDL</button>
           <button class="btn code-tab" data-code="lakeflow_py">Lakeflow Pipeline (DLT Python)</button>
+          <button class="btn code-tab" data-code="sf_ddl">Snowflake DDL &amp; Policies</button>
+          <button class="btn code-tab" data-code="sf_dt">Snowflake Dynamic Tables</button>
+          <button class="btn code-tab" data-code="sf_dmf">Snowflake DMFs</button>
           <button class="btn code-tab" data-code="dbt_yaml">dbt sources.yml</button>
         </div>
         <div style="display:flex;gap:8px;">
@@ -432,11 +442,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const codeAssets = {
     uc_ddl: payload.uc_ddl,
     lakeflow_py: payload.lakeflow_py,
+    sf_ddl: payload.sf_ddl,
+    sf_dt: payload.sf_dt,
+    sf_dmf: payload.sf_dmf,
     dbt_yaml: payload.dbt_yaml
   };
   const codeFilenames = {
     uc_ddl: "unity_catalog_ddl.sql",
     lakeflow_py: "lakeflow_pipeline.py",
+    sf_ddl: "snowflake_ddl.sql",
+    sf_dt: "snowflake_dynamic_tables.sql",
+    sf_dmf: "snowflake_dmf.sql",
     dbt_yaml: "sources.yml"
   };
   const ov = data.overview;
@@ -819,6 +835,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </tr>`).join("") : `<tr><td colspan="4" style="color:var(--text-muted)">All tables cleanly compatible with Spark/Delta Lake.</td></tr>`}
     </tbody>`;
 
+  const sfLintRows = [];
+  data.tables.forEach(t => {
+    (t.snowflake_compatibility?.issues || []).forEach(iss => sfLintRows.push({ table: t.full_name, ...iss }));
+  });
+  document.getElementById("sf-lint-table").innerHTML = `
+    <thead><tr><th>Sev</th><th>Table / Col</th><th>Category</th><th>Remediation</th></tr></thead>
+    <tbody>
+      ${sfLintRows.length ? sfLintRows.map(r => `
+        <tr>
+          <td>${sevBadge(r.severity)}</td>
+          <td class="mono"><span class="clickable" data-jump="${esc(r.table)}">${esc(r.table)}</span>${r.column ? '.' + esc(r.column) : ''}</td>
+          <td class="mono">${esc(r.category)}</td>
+          <td>${esc(r.message)}<div style="font-size:11px;color:var(--accent)">${esc(r.remediation)}</div></td>
+        </tr>`).join("") : `<tr><td colspan="4" style="color:var(--text-muted)">All tables cleanly compatible with Snowflake.</td></tr>`}
+    </tbody>`;
+
   // CATALOG & PROFILER
   let selectedTable = data.tables[0]?.full_name || null;
 
@@ -940,7 +972,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             ${c.semantic_name ? `<div style="font-size:11px;color:var(--accent)">${esc(c.semantic_name)}</div>` : ""}
             <div style="margin-top:3px;">${keys}</div>
           </td>
-          <td><div class="mono">${esc(c.raw_type)}</div>${c.spark_type ? `<span class="badge b-accent">${esc(c.spark_type)}</span>` : ""}</td>
+          <td><div class="mono">${esc(c.raw_type)}</div>${c.spark_type ? `<span class="badge b-accent" title="Spark / Delta">DBX: ${esc(c.spark_type)}</span>` : ""}${c.snowflake_type ? `<span class="badge b-purple" title="Snowflake">SF: ${esc(c.snowflake_type)}</span>` : ""}</td>
           <td>${nullHtml}</td>
           <td>${distHtml}</td>
           <td>${statsHtml}</td>
@@ -1428,6 +1460,9 @@ def render_html_report(result: DiscoveryResult) -> str:
         "dbt_yaml": render_dbt_sources_yaml(result),
         "uc_ddl": render_unity_catalog_ddl(result),
         "lakeflow_py": render_lakeflow_pipeline_py(result),
+        "sf_ddl": render_snowflake_ddl(result),
+        "sf_dt": render_snowflake_dynamic_tables_sql(result),
+        "sf_dmf": render_snowflake_dmf_sql(result),
     }
     raw_json = json.dumps(payload).replace("</", "<\\/")
     return (

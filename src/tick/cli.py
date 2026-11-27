@@ -27,9 +27,17 @@ from tick.exporters import (
     export_html,
     export_json,
     export_markdown,
+    export_snowflake_bundle,
 )
 from tick.harmonize import export_harmonization, harmonize_snapshots
-from tick.models import DiscoveryConfig, DiscoveryResult, HarmonizationReport, ProfileMode, SnapshotDiff
+from tick.models import (
+    DiscoveryConfig,
+    DiscoveryResult,
+    HarmonizationReport,
+    ProfileMode,
+    SnapshotDiff,
+    TargetPlatform,
+)
 
 app = typer.Typer(
     name="tick",
@@ -255,11 +263,20 @@ def discover(
     databricks_dir: Optional[Path] = typer.Option(
         None, "--databricks-dir", help="Write Unity Catalog DDL, Lakeflow DLT pipeline, and sizing guide."
     ),
+    snowflake_dir: Optional[Path] = typer.Option(
+        None, "--snowflake-dir", help="Write Snowflake DDL, Dynamic Tables, DMFs, and sizing guide."
+    ),
     contracts_dir: Optional[Path] = typer.Option(
         None, "--contracts-dir", help="Write Databricks DQX quality YAML and ODCS v3.0.0 data contract YAML."
     ),
+    target_platform: TargetPlatform = typer.Option(
+        "both", "--target", help="Target cloud platform(s): databricks | snowflake | both."
+    ),
     databricks_catalog: str = typer.Option("manufacturing", "--databricks-catalog", help="Target Unity Catalog name."),
     databricks_schema: str = typer.Option("bronze", "--databricks-schema", help="Target Unity Catalog bronze schema."),
+    snowflake_db: str = typer.Option("MANUFACTURING", "--snowflake-db", help="Target Snowflake database name."),
+    snowflake_schema: str = typer.Option("BRONZE", "--snowflake-schema", help="Target Snowflake bronze schema."),
+    snowflake_warehouse: str = typer.Option("TRANSFORMING_WH", "--snowflake-warehouse", help="Target Snowflake warehouse for Dynamic Tables."),
     profile: ProfileMode = typer.Option("full", "--profile", "-p", help="Profiling depth: none | fast | full."),
     sample_size: int = typer.Option(5000, "--sample-size", help="Max rows sampled per table for profiling."),
     workers: int = typer.Option(
@@ -298,7 +315,8 @@ def discover(
     ),
     no_manufacturing: bool = typer.Option(False, "--no-manufacturing", help="Disable manufacturing/OT/BOM/governance detectors."),
     no_databricks_compat: bool = typer.Option(False, "--no-databricks-compat", help="Disable Spark/Delta compatibility linting."),
-    no_cdc_audit: bool = typer.Option(False, "--no-cdc-audit", help="Disable source CDC / Lakeflow Connect readiness audit."),
+    no_snowflake_compat: bool = typer.Option(False, "--no-snowflake-compat", help="Disable Snowflake compatibility linting."),
+    no_cdc_audit: bool = typer.Option(False, "--no-cdc-audit", help="Disable source CDC readiness audit."),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress terminal tables (still writes output files)."),
 ) -> None:
     """Point tick at any database and perform automatic data engineering discovery."""
@@ -322,12 +340,17 @@ def discover(
         skip_tables_over_mb=skip_tables_over_mb,
         use_tablesample=use_tablesample,
         workers=workers,
+        target_platform=target_platform,
         glossary_path=str(glossary) if glossary else None,
         detect_manufacturing=not no_manufacturing,
         detect_databricks_compat=not no_databricks_compat,
+        detect_snowflake_compat=not no_snowflake_compat,
         audit_cdc=not no_cdc_audit,
         databricks_catalog=databricks_catalog,
         databricks_schema=databricks_schema,
+        snowflake_database=snowflake_db,
+        snowflake_schema=snowflake_schema,
+        snowflake_warehouse=snowflake_warehouse,
     )
 
     try:
@@ -358,8 +381,12 @@ def discover(
         written.append(("JSON snapshot", export_json(result, out_dir / "snapshot.json")))
         dbt_files = export_dbt_project(result, out_dir / "dbt")
         written.append((f"dbt scaffolding ({len(dbt_files)} files)", out_dir / "dbt"))
-        dbx_files = export_databricks_bundle(result, out_dir / "databricks")
-        written.append((f"Databricks bundle ({len(dbx_files)} files)", out_dir / "databricks"))
+        if target_platform in {"databricks", "both"}:
+            dbx_files = export_databricks_bundle(result, out_dir / "databricks")
+            written.append((f"Databricks bundle ({len(dbx_files)} files)", out_dir / "databricks"))
+        if target_platform in {"snowflake", "both"}:
+            sf_files = export_snowflake_bundle(result, out_dir / "snowflake")
+            written.append((f"Snowflake bundle ({len(sf_files)} files)", out_dir / "snowflake"))
         contract_files = export_contracts_bundle(result, out_dir / "contracts")
         written.append((f"Data contracts ({len(contract_files)} files)", out_dir / "contracts"))
 
@@ -375,6 +402,9 @@ def discover(
     if databricks_dir is not None:
         dbx_files = export_databricks_bundle(result, databricks_dir)
         written.append((f"Databricks bundle ({len(dbx_files)} files)", databricks_dir))
+    if snowflake_dir is not None:
+        sf_files = export_snowflake_bundle(result, snowflake_dir)
+        written.append((f"Snowflake bundle ({len(sf_files)} files)", snowflake_dir))
     if contracts_dir is not None:
         contract_files = export_contracts_bundle(result, contracts_dir)
         written.append((f"Data contracts ({len(contract_files)} files)", contracts_dir))
@@ -422,11 +452,14 @@ def compare_sources(
     html_out: Optional[Path] = typer.Option(None, "--html", help="Write interactive multi-plant HTML harmonization dashboard."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write harmonization matrix Markdown report."),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write harmonization report JSON."),
-    sql_out: Optional[Path] = typer.Option(None, "--sql", help="Write unified multi-plant Databricks UNION ALL SQL."),
-    catalog: str = typer.Option("manufacturing", "--catalog", help="Target Unity Catalog name for unified SQL."),
+    sql_out: Optional[Path] = typer.Option(None, "--sql", help="Write unified multi-plant UNION ALL SQL."),
+    target_platform: Literal["databricks", "snowflake"] = typer.Option(
+        "databricks", "--target", help="Target SQL dialect for unified views: databricks | snowflake."
+    ),
+    catalog: str = typer.Option("manufacturing", "--catalog", "--database", help="Target catalog (Databricks) or database (Snowflake)."),
     bronze_schema: str = typer.Option("bronze", "--bronze-schema", help="Bronze schema prefix per plant."),
 ) -> None:
-    """Harmonize schemas across multiple plants/sites and generate unified multi-plant Databricks SQL."""
+    """Harmonize schemas across multiple plants/sites and generate unified multi-plant Databricks or Snowflake SQL."""
     if len(snapshots) < 2:
         console.print("[bold red]Provide at least 2 snapshot JSON files to compare.[/bold red]")
         raise typer.Exit(code=2)
@@ -446,7 +479,12 @@ def compare_sources(
             suffix += 1
         loaded[label] = snap
 
-    report = harmonize_snapshots(loaded, catalog=catalog, bronze_schema=bronze_schema)
+    report = harmonize_snapshots(
+        loaded,
+        catalog=catalog,
+        bronze_schema=bronze_schema,
+        target_platform=target_platform,
+    )
     _render_harmonization_summary(report)
 
     written = export_harmonization(

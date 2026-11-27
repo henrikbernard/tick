@@ -41,6 +41,11 @@ jobs:
           tick discover /tmp/tick-ci/ohio.duckdb -o /tmp/tick-ci/ohio_out --workers 4 --skip-empty-tables --quiet
           tick discover /tmp/tick-ci/munich.duckdb -o /tmp/tick-ci/munich_out --workers 4 --quiet
           tick compare-sources /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \
+            --target snowflake \
+            --database MFG_PROD \
+            --html /tmp/tick-ci/harmonization_sf.html \
+            --sql /tmp/tick-ci/unified_sf.sql
+          tick compare-sources /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \
             --html /tmp/tick-ci/harmonization.html \
             --md /tmp/tick-ci/harmonization.md \
             --sql /tmp/tick-ci/unified.sql

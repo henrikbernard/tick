@@ -121,6 +121,11 @@ def audit_cdc_readiness(
             status = "ready"
             notes.append("Already on Databricks Delta; enable delta.enableChangeDataFeed=true for downstream incremental reads.")
 
+        elif adapter.name == "snowflake":
+            connector = "snowflake_stream_or_dynamic_table"
+            status = "ready"
+            notes.append("Already on Snowflake; enable CHANGE_TRACKING = TRUE for Streams or Dynamic Tables.")
+
         else:
             # File / warehouse / generic sources (DuckDB, SQLite, Snowflake, DB2, HANA, etc.)
             has_wm = any(

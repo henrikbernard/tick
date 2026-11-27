@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 ProfileMode = Literal["none", "fast", "full"]
+TargetPlatform = Literal["databricks", "snowflake", "both"]
 CanonicalType = Literal[
     "integer",
     "float",
@@ -99,6 +100,7 @@ class ColumnInfo(BaseModel):
     raw_type: str
     canonical_type: CanonicalType
     spark_type: str | None = None
+    snowflake_type: str | None = None
     semantic_name: str | None = None
     business_description: str | None = None
     nullable: bool = True
@@ -204,6 +206,30 @@ class DeltaCompatibility(BaseModel):
     issues: list[DeltaCompatibilityIssue] = Field(default_factory=list)
 
 
+class SnowflakeCompatibilityIssue(BaseModel):
+    severity: Severity
+    category: Literal[
+        "quoted_identifier",
+        "decimal_precision_overflow",
+        "unsupported_type",
+        "timezone_naive_timestamp",
+        "variant_size_limit",
+        "clustering_advisory",
+    ]
+    column: str | None = None
+    message: str
+    remediation: str
+
+
+class SnowflakeCompatibility(BaseModel):
+    is_compatible: bool = True
+    requires_quoted_identifiers: bool = False
+    clustering_keys: list[str] = Field(default_factory=list)
+    enable_change_tracking: bool = True
+    recommended_warehouse_size: str = "XSMALL"
+    issues: list[SnowflakeCompatibilityIssue] = Field(default_factory=list)
+
+
 class TelemetryProfile(BaseModel):
     pattern: Literal["narrow_historian_eav", "wide_plc_polling"]
     tag_column: str | None = None
@@ -273,6 +299,7 @@ class TableInfo(BaseModel):
     recommendations: TableRecommendations | None = None
     cdc_readiness: CdcReadiness | None = None
     delta_compatibility: DeltaCompatibility | None = None
+    snowflake_compatibility: SnowflakeCompatibility | None = None
     telemetry_profile: TelemetryProfile | None = None
     hierarchy: HierarchyInfo | None = None
     ingestion_sizing: IngestionSizing | None = None
@@ -339,13 +366,18 @@ class DiscoveryConfig(BaseModel):
     skip_tables_over_mb: float | None = None
     use_tablesample: bool = False
     workers: int = Field(default=1, ge=1, le=32)
-    # Manufacturing & Databricks extensions
+    # Manufacturing, Databricks & Snowflake extensions
+    target_platform: TargetPlatform = "both"
     detect_manufacturing: bool = True
     detect_databricks_compat: bool = True
+    detect_snowflake_compat: bool = True
     audit_cdc: bool = True
     glossary_path: str | None = None
     databricks_catalog: str = "manufacturing"
     databricks_schema: str = "bronze"
+    snowflake_database: str = "MANUFACTURING"
+    snowflake_schema: str = "BRONZE"
+    snowflake_warehouse: str = "TRANSFORMING_WH"
 
 
 class DatabaseOverview(BaseModel):
@@ -370,6 +402,7 @@ class DatabaseOverview(BaseModel):
     cdc_ready_table_count: int = 0
     cdc_blocked_table_count: int = 0
     delta_warning_count: int = 0
+    snowflake_warning_count: int = 0
     avg_quality_score: float = 100.0
     cdc_audit: CdcDatabaseAudit | None = None
 
@@ -428,6 +461,7 @@ class HarmonizedColumn(BaseModel):
     types_by_source: dict[str, str] = Field(default_factory=dict)
     canonical_types_by_source: dict[str, str] = Field(default_factory=dict)
     target_spark_type: str
+    target_snowflake_type: str | None = None
     has_type_conflict: bool = False
     nullable_in_target: bool = True
     cast_required_sources: list[str] = Field(default_factory=list)
@@ -446,6 +480,7 @@ class HarmonizedTable(BaseModel):
 
 
 class HarmonizationReport(BaseModel):
+    target_platform: Literal["databricks", "snowflake"] = "databricks"
     sources: list[str] = Field(default_factory=list)
     total_unique_tables: int = 0
     fully_aligned_tables: int = 0
