@@ -413,11 +413,18 @@ def compare_sources(
         raise typer.Exit(code=2)
 
     loaded: dict[str, DiscoveryResult] = {}
-    for idx, p in enumerate(snapshots):
+    for p in snapshots:
         snap = load_snapshot(p)
-        label = p.stem
-        if label in loaded:
-            label = f"{label}_{idx + 1}"
+        if p.stem.lower() == "snapshot":
+            parent_name = p.resolve().parent.name
+            base_label = parent_name or snap.overview.database_name or p.stem
+        else:
+            base_label = p.stem
+        label = base_label
+        suffix = 2
+        while label in loaded:
+            label = f"{base_label}_{suffix}"
+            suffix += 1
         loaded[label] = snap
 
     report = harmonize_snapshots(loaded, catalog=catalog, bronze_schema=bronze_schema)

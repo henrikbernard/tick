@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from collections import Counter
 from dataclasses import dataclass, field
@@ -17,14 +18,25 @@ from tick.dialects import DialectAdapter, safe_rollback
 from tick.models import ColumnInfo, ColumnProfile, DiscoveryConfig, TableInfo, ValueFrequency
 from tick.pii import detect_governance, detect_pii, redact_value
 
+VALUE_SAMPLE_LIMIT = 2000
+_TAG_HINT_RE = re.compile(
+    r"(?:^|_)(?:tag|tag_id|tag_name|sensor|sensor_id|point_id|point_name|signal_id|channel_id|opc_tag)(?:$|_)",
+    re.I,
+)
+
 
 @dataclass
 class ProfileArtifacts:
     """In-memory sample caches captured during profiling for downstream analyzers."""
 
     value_samples: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    value_sample_complete: dict[tuple[str, str], bool] = field(default_factory=dict)
     raw_str_samples: dict[tuple[str, str], list[str]] = field(default_factory=dict)
     timestamp_samples: dict[tuple[str, str], list[datetime]] = field(default_factory=dict)
+    # (table_full_name, ts_col_name, tag_col_name) -> {tag_value: [timestamps]}
+    timestamp_by_tag_samples: dict[tuple[str, str, str], dict[str, list[datetime]]] = field(
+        default_factory=dict
+    )
 
 
 def _to_float(val: Any) -> float | None:
@@ -244,6 +256,34 @@ def profile_tables(
                 tbl.row_count = sample_n
                 tbl.row_count_exact = True
 
+            # Capture per-tag timestamp groups for multi-tag OT historian tables
+            ts_col_indices = [
+                (idx, c.name) for idx, c in enumerate(tbl.columns) if c.canonical_type == "timestamp"
+            ]
+            tag_col_indices = [
+                (idx, c.name) for idx, c in enumerate(tbl.columns) if _TAG_HINT_RE.search(c.name)
+            ]
+            if rows and ts_col_indices and tag_col_indices:
+                for ts_idx, ts_name in ts_col_indices:
+                    for tag_idx, tag_name in tag_col_indices:
+                        grouped: dict[str, list[datetime]] = {}
+                        for r in rows:
+                            tv = r[tag_idx]
+                            dt_raw = r[ts_idx]
+                            if tv is None or dt_raw is None:
+                                continue
+                            dt = _to_datetime_utc(dt_raw)
+                            if dt is not None:
+                                grouped.setdefault(_stringify(tv), []).append(dt)
+                        if grouped:
+                            artifacts.timestamp_by_tag_samples[(tbl.full_name, ts_name, tag_name)] = grouped
+
+            table_fully_fetched = (
+                tbl.row_count is not None
+                and sample_n >= tbl.row_count
+                and not (config.use_tablesample and tbl.row_count > effective_sample * 2)
+            )
+
             for col_idx, col in enumerate(tbl.columns):
                 raw_vals = [r[col_idx] for r in rows]
                 non_null_vals = [v for v in raw_vals if v is not None]
@@ -267,15 +307,34 @@ def profile_tables(
 
                 str_vals = [_stringify(v) for v in non_null_vals]
                 counter = Counter(str_vals)
-                distinct_n = len(counter)
+                distinct_n: int | None = len(counter)
                 distinct_rate = round(distinct_n / non_null_n, 4) if non_null_n > 0 else None
 
                 if distinct_n > 0 and col.canonical_type in {"integer", "string", "uuid", "decimal"}:
-                    artifacts.value_samples[(tbl.full_name, col.name)] = set(list(counter.keys())[:2000])
+                    artifacts.value_samples[(tbl.full_name, col.name)] = set(
+                        list(counter.keys())[:VALUE_SAMPLE_LIMIT]
+                    )
+                    artifacts.value_sample_complete[(tbl.full_name, col.name)] = (
+                        table_fully_fetched and distinct_n <= VALUE_SAMPLE_LIMIT
+                    )
                 if str_vals:
                     artifacts.raw_str_samples[(tbl.full_name, col.name)] = str_vals[:500]
 
-                cardinality = _classify_cardinality(sample_n, non_null_n, distinct_n)
+                if non_null_n == 0 and profile_non_null > 0:
+                    # Sample saw only NULLs, but full-table exact aggregates confirm non-null rows exist
+                    distinct_n = None
+                    distinct_rate = None
+                    cardinality = "unknown"
+                else:
+                    cardinality = _classify_cardinality(sample_n, non_null_n, distinct_n)
+                    if (
+                        cardinality == "constant"
+                        and agg
+                        and agg.get("min") is not None
+                        and agg.get("max") is not None
+                        and _stringify(agg["min"]) != _stringify(agg["max"])
+                    ):
+                        cardinality = "low"
 
                 min_val: str | None = None
                 max_val: str | None = None

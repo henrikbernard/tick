@@ -202,14 +202,77 @@ def create_db_engine(target: str, read_only: bool = True) -> tuple[Engine, str]:
         raise
 
 
+_OTHER_TYPE_BASES = {
+    "SQL_VARIANT",
+    "HIERARCHYID",
+    "GEOGRAPHY",
+    "GEOMETRY",
+    "SDO_GEOMETRY",
+    "INTERVAL",
+    "POINT",
+    "LINE",
+    "LSEG",
+    "BOX",
+    "PATH",
+    "POLYGON",
+    "CIRCLE",
+    "BITMAP",
+    "TSVECTOR",
+    "TSQUERY",
+    "USER-DEFINED",
+    "BFILE",
+}
+
+_JSON_TYPE_BASES = {"JSON", "JSONB", "VARIANT", "SUPER", "OBJECT", "STRUCT", "MAP", "ARRAY"}
+
+_INTEGER_TYPE_BASES = {
+    "INT",
+    "INTEGER",
+    "INT2",
+    "INT4",
+    "INT8",
+    "INT16",
+    "INT32",
+    "INT64",
+    "INT128",
+    "UINT8",
+    "UINT16",
+    "UINT32",
+    "UINT64",
+    "TINYINT",
+    "SMALLINT",
+    "MEDIUMINT",
+    "BIGINT",
+    "HUGEINT",
+    "UHUGEINT",
+    "UBIGINT",
+    "UINTEGER",
+    "USMALLINT",
+    "UTINYINT",
+    "BYTEINT",
+    "SERIAL",
+    "SMALLSERIAL",
+    "BIGSERIAL",
+    "SHORT",
+}
+
+_DECIMAL_PREC_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
+
+
 def normalize_type(raw_type: str) -> CanonicalType:
     """Map vendor-specific SQL data types to a canonical data engineering type."""
     t = raw_type.strip().upper()
-    base = re.split(r"[\s(]", t, maxsplit=1)[0]
+    base = re.split(r"[\s(<]", t, maxsplit=1)[0]
 
+    if base in _OTHER_TYPE_BASES:
+        return "other"
     if any(k in t for k in ("UUID", "UNIQUEIDENTIFIER", "GUID")):
         return "uuid"
-    if any(k in t for k in ("JSON", "JSONB", "VARIANT", "SUPER", "OBJECT", "STRUCT", "MAP", "ARRAY")):
+    if (
+        base in _JSON_TYPE_BASES
+        or t.startswith(("STRUCT<", "MAP<", "ARRAY<"))
+        or t.endswith("[]")
+    ):
         return "json"
     if any(
         k in t
@@ -227,52 +290,57 @@ def normalize_type(raw_type: str) -> CanonicalType:
         return "timestamp"
     if base == "DATE":
         return "date"
-    if base in {"TIME", "TIMETZ", "TIME_WITHOUT_TIME_ZONE"} or t.startswith("TIME"):
+    if (
+        base in {"TIME", "TIMETZ", "TIME_WITHOUT_TIME_ZONE"}
+        or t.startswith(("TIME ", "TIME("))
+    ):
         return "time"
     if base in {"BOOL", "BOOLEAN", "BIT"}:
         return "boolean"
-    if any(k in base for k in ("DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY", "NUMBER", "DEC")):
-        if "(" in t and ",0)" in t.replace(" ", ""):
+    if base in {"DECIMAL", "NUMERIC", "MONEY", "SMALLMONEY", "NUMBER", "DEC", "FIXED", "DECFLOAT"}:
+        m = _DECIMAL_PREC_RE.search(t)
+        if m and m.group(2) is not None and int(m.group(2)) == 0 and int(m.group(1)) <= 18:
             return "integer"
         return "decimal"
-    if any(
-        k in base
-        for k in (
-            "INT",
-            "SERIAL",
-            "BIGSERIAL",
-            "SMALLSERIAL",
-            "HUGEINT",
-            "UBIGINT",
-            "UINTEGER",
-            "SHORT",
-            "LONG",
-            "BYTEINT",
-            "TINYINT",
-            "SMALLINT",
-        )
-    ):
-        return "integer"
-    if any(k in base for k in ("FLOAT", "DOUBLE", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE")):
+    if base in {"FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE"}:
         return "float"
-    if any(k in base for k in ("BLOB", "BYTEA", "BINARY", "VARBINARY", "IMAGE", "BYTES", "RAW", "ROWVERSION")):
+    if base in _INTEGER_TYPE_BASES:
+        return "integer"
+    if t.startswith(("LONG RAW", "LONG VARBINARY")) or base in {
+        "BLOB",
+        "TINYBLOB",
+        "MEDIUMBLOB",
+        "LONGBLOB",
+        "BYTEA",
+        "BINARY",
+        "VARBINARY",
+        "IMAGE",
+        "BYTES",
+        "RAW",
+        "ROWVERSION",
+    }:
         return "binary"
-    if any(
-        k in base
-        for k in (
-            "CHAR",
-            "TEXT",
-            "STRING",
-            "CLOB",
-            "NVARCHAR",
-            "NCHAR",
-            "VARCHAR",
-            "ENUM",
-            "CITEXT",
-            "XML",
-            "INET",
-            "CIDR",
-            "NTEXT",
+    if (
+        base == "LONG"
+        or t.startswith("LONG VARCHAR")
+        or any(
+            k in base
+            for k in (
+                "CHAR",
+                "TEXT",
+                "STRING",
+                "CLOB",
+                "NVARCHAR",
+                "NCHAR",
+                "VARCHAR",
+                "ENUM",
+                "CITEXT",
+                "XML",
+                "INET",
+                "CIDR",
+                "NTEXT",
+                "MACADDR",
+            )
         )
     ):
         return "string"
@@ -582,6 +650,7 @@ class SqlServerAdapter(DialectAdapter):
             val = conn.execute(text("SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))")).scalar()
             return str(val) if val else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def configure_safe_session(
@@ -596,7 +665,7 @@ class SqlServerAdapter(DialectAdapter):
             if query_timeout_seconds and query_timeout_seconds > 0:
                 conn.execute(text(f"SET LOCK_TIMEOUT {int(query_timeout_seconds * 1000)}"))
         except Exception:
-            pass
+            safe_rollback(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
         ct_enabled: bool | None = None
@@ -608,6 +677,7 @@ class SqlServerAdapter(DialectAdapter):
             ).scalar()
             ct_enabled = bool(ct_row and int(ct_row) > 0)
         except Exception:
+            safe_rollback(conn)
             notes.append("Could not query sys.change_tracking_databases (insufficient VIEW DATABASE STATE permission).")
 
         try:
@@ -616,6 +686,7 @@ class SqlServerAdapter(DialectAdapter):
             ).scalar()
             cdc_enabled = bool(cdc_row) if cdc_row is not None else None
         except Exception:
+            safe_rollback(conn)
             notes.append("Could not query sys.databases.is_cdc_enabled.")
 
         if ct_enabled:
@@ -656,7 +727,7 @@ class SqlServerAdapter(DialectAdapter):
                     change_tracking_enabled=bool(row["ct_on"]),
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return probes
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
@@ -684,7 +755,7 @@ class SqlServerAdapter(DialectAdapter):
                     size_bytes=int(row["total_bytes"]) if row["total_bytes"] is not None else None,
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
     def build_sample_query(
@@ -714,6 +785,7 @@ class DuckDBAdapter(DialectAdapter):
             val = conn.execute(text("SELECT version()")).scalar()
             return str(val) if val else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def get_schema_names(self, conn: Connection, inspector: Any) -> list[str]:
@@ -733,7 +805,7 @@ class DuckDBAdapter(DialectAdapter):
             if schemas:
                 return schemas
         except Exception:
-            pass
+            safe_rollback(conn)
         return ["main"]
 
     def get_table_names(self, conn: Connection, inspector: Any, schema_name: str) -> list[str]:
@@ -753,6 +825,7 @@ class DuckDBAdapter(DialectAdapter):
             ).scalars()
             return list(rows)
         except Exception:
+            safe_rollback(conn)
             return super().get_table_names(conn, inspector, schema_name)
 
     def get_view_names(self, conn: Connection, inspector: Any, schema_name: str) -> list[str]:
@@ -772,6 +845,7 @@ class DuckDBAdapter(DialectAdapter):
             ).scalars()
             return list(rows)
         except Exception:
+            safe_rollback(conn)
             return super().get_view_names(conn, inspector, schema_name)
 
     def get_columns(
@@ -805,7 +879,7 @@ class DuckDBAdapter(DialectAdapter):
             if cols:
                 return cols
         except Exception:
-            pass
+            safe_rollback(conn)
         return super().get_columns(conn, inspector, schema_name, table_name)
 
     def get_indexes(
@@ -837,7 +911,7 @@ class DuckDBAdapter(DialectAdapter):
                     }
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return results
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
@@ -862,7 +936,7 @@ class DuckDBAdapter(DialectAdapter):
                     comment=row["comment"],
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
 
         try:
             vrows = conn.execute(
@@ -883,7 +957,7 @@ class DuckDBAdapter(DialectAdapter):
                     view_definition=row["sql"],
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
     def get_view_definition(
@@ -905,7 +979,7 @@ class DuckDBAdapter(DialectAdapter):
             if val:
                 return str(val).strip()
         except Exception:
-            pass
+            safe_rollback(conn)
         return super().get_view_definition(conn, inspector, schema_name, view_name)
 
     def build_sample_query(
@@ -933,6 +1007,7 @@ class SQLiteAdapter(DialectAdapter):
             val = conn.execute(text("SELECT sqlite_version()")).scalar()
             return str(val) if val else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def get_table_stats(self, conn: Connection, schema_name: str) -> dict[str, TableStats]:
@@ -944,7 +1019,7 @@ class SQLiteAdapter(DialectAdapter):
             for row in rows:
                 stats[row["name"]] = TableStats(view_definition=row["sql"])
         except Exception:
-            pass
+            safe_rollback(conn)
         try:
             size_rows = conn.execute(
                 text("SELECT name, SUM(pgsize) AS size_bytes FROM dbstat GROUP BY name")
@@ -954,7 +1029,7 @@ class SQLiteAdapter(DialectAdapter):
                 existing.size_bytes = int(row["size_bytes"]) if row["size_bytes"] is not None else None
                 stats[row["name"]] = existing
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
     def get_view_definition(
@@ -968,7 +1043,7 @@ class SQLiteAdapter(DialectAdapter):
             if val:
                 return str(val).strip()
         except Exception:
-            pass
+            safe_rollback(conn)
         return super().get_view_definition(conn, inspector, schema_name, view_name)
 
 
@@ -982,6 +1057,7 @@ class MySQLAdapter(DialectAdapter):
             val = conn.execute(text("SELECT VERSION()")).scalar()
             return str(val) if val else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def configure_safe_session(
@@ -996,7 +1072,7 @@ class MySQLAdapter(DialectAdapter):
             if query_timeout_seconds and query_timeout_seconds > 0:
                 conn.execute(text(f"SET SESSION max_execution_time = {int(query_timeout_seconds * 1000)}"))
         except Exception:
-            pass
+            safe_rollback(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
         fmt: str | None = None
@@ -1010,6 +1086,7 @@ class MySQLAdapter(DialectAdapter):
                 else:
                     notes.append(f"MySQL binlog_format='{fmt}' (must be 'ROW' for binlog CDC).")
         except Exception:
+            safe_rollback(conn)
             notes.append("Could not query MySQL binlog_format.")
         return CdcDatabaseAudit(
             dialect=self.name,
@@ -1041,7 +1118,7 @@ class MySQLAdapter(DialectAdapter):
                     comment=comment or None,
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
 
@@ -1055,6 +1132,7 @@ class DatabricksAdapter(DialectAdapter):
             val = conn.execute(text("SELECT current_version().dbr_version")).scalar()
             return f"DBR {val}" if val else super().get_server_version(conn)
         except Exception:
+            safe_rollback(conn)
             return super().get_server_version(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
@@ -1083,7 +1161,7 @@ class DatabricksAdapter(DialectAdapter):
                     is_materialized_view=(str(row["table_type"]).upper() == "MATERIALIZED_VIEW"),
                 )
         except Exception:
-            pass
+            safe_rollback(conn)
         return stats
 
     def build_sample_query(
@@ -1124,6 +1202,7 @@ class OracleAdapter(DialectAdapter):
                     notes=notes,
                 )
         except Exception:
+            safe_rollback(conn)
             notes.append("Could not query v$database (requires SELECT_CATALOG_ROLE); verify ARCHIVELOG & supplemental logging.")
         return CdcDatabaseAudit(dialect=self.name, supplemental_logging=supp, notes=notes)
 

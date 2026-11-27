@@ -67,7 +67,7 @@ def _is_candidate_target_key(col: ColumnInfo, table: TableInfo) -> bool:
     if col.is_unique:
         return True
     if col.profile and col.profile.cardinality_class == "unique" and col.profile.null_rate == 0.0:
-        if col.canonical_type in {"integer", "string", "uuid"}:
+        if col.canonical_type in {"integer", "string", "uuid", "decimal"}:
             name_l = col.name.lower()
             if name_l == "id" or name_l.endswith(("_id", "_key", "_uuid", "_code", "_sku")):
                 return True
@@ -108,6 +108,7 @@ def discover_relationships(
     tables: list[TableInfo],
     value_samples: dict[tuple[str, str], set[str]],
     config: DiscoveryConfig,
+    value_sample_complete: dict[tuple[str, str], bool] | None = None,
 ) -> tuple[list[RelationshipInfo], list[LineageEdge]]:
     """Collect explicit FKs and infer missing/unenforced relationships between tables."""
     relationships: list[RelationshipInfo] = []
@@ -231,14 +232,25 @@ def discover_relationships(
                                 f"Partial value overlap ({overlap:.0%}) between sampled values"
                             )
                         else:
-                            # If target sample covers the entire target table and overlap is 0%, reject!
-                            tgt_fully_sampled = (
-                                tgt_tbl.row_count is not None
-                                and tgt_tbl.row_count <= config.sample_size
-                            )
+                            # Only reject on 0% overlap if target sample truly covers the entire target table
+                            if value_sample_complete is not None:
+                                tgt_fully_sampled = bool(
+                                    value_sample_complete.get((tgt_tbl.full_name, tgt_col.name), False)
+                                )
+                            else:
+                                effective_sample = (
+                                    min(config.sample_size, 1000)
+                                    if config.profile_mode == "fast"
+                                    else config.sample_size
+                                )
+                                tgt_fully_sampled = (
+                                    tgt_tbl.row_count is not None
+                                    and tgt_tbl.row_count <= min(effective_sample, 2000)
+                                    and not config.use_tablesample
+                                )
                             if tgt_fully_sampled:
                                 continue
-                            final_score = round(base_score * 0.65, 3)
+                            final_score = round(final_score * 0.80, 3)
 
                 if final_score < 0.65:
                     continue
@@ -276,7 +288,14 @@ def _extract_tables_from_sql(sql: str, sqlglot_dialect: str | None) -> set[tuple
                 for cte in stmt.find_all(exp.CTE)
                 if cte.alias_or_name
             }
+            # Exclude the view/table target being created in CREATE VIEW <target> AS SELECT ...
+            create_target_ids: set[int] = set()
+            if isinstance(stmt, exp.Create) and stmt.this is not None:
+                for tnode in stmt.this.find_all(exp.Table):
+                    create_target_ids.add(id(tnode))
             for tbl in stmt.find_all(exp.Table):
+                if id(tbl) in create_target_ids:
+                    continue
                 name = tbl.name
                 if not name:
                     continue

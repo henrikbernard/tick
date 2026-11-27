@@ -74,7 +74,16 @@ def map_to_spark_type(raw_type: str, canonical: CanonicalType) -> str:
     base = re.split(r"[\s(]", u, maxsplit=1)[0]
 
     if canonical == "integer":
-        if any(k in base for k in ("BIGINT", "BIGSERIAL", "INT8", "HUGEINT", "LONG")):
+        if base in {"DECIMAL", "NUMERIC", "NUMBER", "DEC", "FIXED"}:
+            m = DECIMAL_PREC_RE.search(u)
+            if m:
+                prec = int(m.group(1))
+                if prec > 18:
+                    return f"DECIMAL({min(prec, 38)}, 0)"
+                if prec > 9:
+                    return "BIGINT"
+                return "INT"
+        if any(k in base for k in ("BIGINT", "BIGSERIAL", "INT8", "INT64", "HUGEINT", "UBIGINT", "UINT64")):
             return "BIGINT"
         if any(k in base for k in ("SMALLINT", "INT2", "TINYINT")):
             return "SMALLINT"
@@ -179,8 +188,8 @@ def lint_databricks_compatibility(tables: list[TableInfo]) -> None:
                     )
                 )
 
-            # 2. Decimal precision > 38 (Spark limit)
-            if col.canonical_type == "decimal":
+            # 2. Decimal precision > 38 (Spark limit) — check raw decimal/numeric types even if scale=0
+            if col.canonical_type == "decimal" or base in {"DECIMAL", "NUMERIC", "NUMBER", "DEC", "FIXED"}:
                 m = DECIMAL_PREC_RE.search(u)
                 if m and int(m.group(1)) > 38:
                     issues.append(

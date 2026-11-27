@@ -232,19 +232,34 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     else:
         return
 
-    # Polling cadence & max gap from sampled timestamps
-    dts = sorted(artifacts.timestamp_samples.get((table.full_name, ts_col.name), []))
+    # Polling cadence & max gap from sampled timestamps (per-tag for narrow historian EAV tables)
     median_interval: float | None = None
     max_gap: float | None = None
-    if len(dts) >= 3:
-        deltas = [
-            (dts[i] - dts[i - 1]).total_seconds()
-            for i in range(1, len(dts))
-            if (dts[i] - dts[i - 1]).total_seconds() > 0
-        ]
-        if deltas:
-            median_interval = round(statistics.median(deltas), 2)
-            max_gap = round(max(deltas), 2)
+    deltas: list[float] = []
+    if pattern == "narrow_historian_eav" and tag_col is not None:
+        grouped = artifacts.timestamp_by_tag_samples.get((table.full_name, ts_col.name, tag_col.name))
+        if grouped:
+            for tag_dts in grouped.values():
+                if len(tag_dts) < 2:
+                    continue
+                s_dts = sorted(tag_dts)
+                for i in range(1, len(s_dts)):
+                    diff_s = (s_dts[i] - s_dts[i - 1]).total_seconds()
+                    if diff_s > 0:
+                        deltas.append(diff_s)
+
+    if not deltas:
+        dts = sorted(artifacts.timestamp_samples.get((table.full_name, ts_col.name), []))
+        if len(dts) >= 3:
+            deltas = [
+                (dts[i] - dts[i - 1]).total_seconds()
+                for i in range(1, len(dts))
+                if (dts[i] - dts[i - 1]).total_seconds() > 0
+            ]
+
+    if deltas:
+        median_interval = round(statistics.median(deltas), 2)
+        max_gap = round(max(deltas), 2)
 
     # Flatline detection (stuck sensor values with zero variance)
     flatlines: list[str] = []

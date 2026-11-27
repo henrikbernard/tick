@@ -122,6 +122,7 @@ def _try_extract_sap_ddic(
     tables: list[TableInfo],
     adapter: DialectAdapter | None = None,
     default_schema: str | None = None,
+    config: Any | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """If SAP DD02T / DD03T data dictionary tables exist in the discovered DB, extract business descriptions."""
     table_names_u = {t.name.upper(): t for t in tables}
@@ -132,6 +133,12 @@ def _try_extract_sap_ddic(
         return tbl_desc, col_desc
 
     with engine.connect() as conn:
+        if adapter is not None and config is not None:
+            adapter.configure_safe_session(
+                conn,
+                read_uncommitted=config.read_uncommitted,
+                query_timeout_seconds=config.query_timeout_seconds,
+            )
         if "DD02T" in table_names_u:
             dd02t_tbl = table_names_u["DD02T"]
             q_dd02t = (
@@ -174,13 +181,14 @@ def enrich_with_glossary(
     glossary_path: str | None = None,
     adapter: DialectAdapter | None = None,
     default_schema: str | None = None,
+    config: Any | None = None,
 ) -> None:
     """Populate semantic_name and business_description using built-in ERP glossary, SAP DDIC, and user YAML."""
     tbl_glossary = dict(BUILTIN_TABLE_GLOSSARY)
     col_glossary = dict(BUILTIN_COLUMN_GLOSSARY)
 
     sap_t_desc, sap_c_desc = _try_extract_sap_ddic(
-        engine, tables, adapter=adapter, default_schema=default_schema
+        engine, tables, adapter=adapter, default_schema=default_schema, config=config
     )
 
     if glossary_path:

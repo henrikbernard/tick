@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tick.databricks import deduplicate_column_names, map_to_spark_type, sanitize_delta_column_name
+from tick.databricks import (
+    DECIMAL_PREC_RE,
+    deduplicate_column_names,
+    map_to_spark_type,
+    sanitize_delta_column_name,
+)
 from tick.models import (
     DiscoveryResult,
     HarmonizationReport,
@@ -21,6 +26,34 @@ NUMERIC_WIDENING = {
     "DECIMAL": 4,
     "DOUBLE": 5,
 }
+_INT_PRECISION_MAP = {"SMALLINT": 5, "INT": 10, "BIGINT": 19}
+
+
+def _widen_decimal_types(types: list[str]) -> str:
+    """Compute a lossless Spark DECIMAL(p, s) covering all input integer/decimal Spark types."""
+    max_int_digits = 0
+    max_scale = 0
+    for t in types:
+        u = t.strip().upper()
+        base = u.split("(", 1)[0]
+        if base in _INT_PRECISION_MAP:
+            max_int_digits = max(max_int_digits, _INT_PRECISION_MAP[base])
+        else:
+            m = DECIMAL_PREC_RE.search(u)
+            if m:
+                prec = int(m.group(1))
+                scale = int(m.group(2)) if m.group(2) else 0
+                max_int_digits = max(max_int_digits, max(0, prec - scale))
+                max_scale = max(max_scale, scale)
+            else:
+                max_int_digits = max(max_int_digits, 14)
+                max_scale = max(max_scale, 4)
+
+    scale = min(max_scale, 38)
+    prec = min(38, max(scale, max_int_digits + scale))
+    if prec == 0:
+        prec = 18
+    return f"DECIMAL({prec}, {scale})"
 
 
 def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
@@ -35,7 +68,7 @@ def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
         if "DOUBLE" in bases:
             return "DOUBLE", True
         if "DECIMAL" in bases:
-            return "DECIMAL(38, 6)", True
+            return _widen_decimal_types(unique_exact), True
         if "BIGINT" in bases:
             return "BIGINT", True
         return "INT", True
@@ -55,6 +88,9 @@ def harmonize_snapshots(
 ) -> HarmonizationReport:
     """Compare N plant/site discovery snapshots and generate a unified multi-plant Bronze/Silver schema."""
     source_names = list(sources.keys())
+    safe_site_map = deduplicate_column_names(source_names)
+    cat_esc = catalog.replace("`", "``")
+    bsch_esc = bronze_schema.replace("`", "``")
 
     # Index base tables across sites; qualify with schema if a single site has duplicate table names across schemas
     dup_names_within_source: set[str] = set()
@@ -143,9 +179,9 @@ def harmonize_snapshots(
 
         # Generate Unified Multi-Plant Databricks UNION ALL SQL
         union_branches: list[str] = []
+        safe_tbl = sanitize_delta_column_name(tbl_key)
         for s in present:
-            safe_site = sanitize_delta_column_name(s)
-            safe_tbl = sanitize_delta_column_name(tbl_key)
+            safe_site = safe_site_map[s]
             escaped_site_lit = s.replace("'", "''")
             selects = [f"    '{escaped_site_lit}' AS `source_plant`"]
             for hc in h_cols:
@@ -157,17 +193,15 @@ def harmonize_snapshots(
                         selects.append(f"    `{orig_col}` AS `{hc.sanitized_name}`")
                 else:
                     selects.append(f"    CAST(NULL AS {hc.target_spark_type}) AS `{hc.sanitized_name}`")
-            cat_esc = catalog.replace("`", "``")
             branch = (
                 "SELECT\n"
                 + ",\n".join(selects)
-                + f"\nFROM `{cat_esc}`.`{bronze_schema}_{safe_site}`.`{safe_tbl}`"
+                + f"\nFROM `{cat_esc}`.`{bsch_esc}_{safe_site}`.`{safe_tbl}`"
             )
             union_branches.append(branch)
 
-        cat_esc = catalog.replace("`", "``")
         unified_sql = (
-            f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{sanitize_delta_column_name(tbl_key)}` AS\n"
+            f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{safe_tbl}` AS\n"
             + "\nUNION ALL\n".join(union_branches)
             + ";\n"
         )
@@ -224,22 +258,36 @@ def render_harmonization_markdown(report: HarmonizationReport) -> str:
     lines.append("")
 
     for tbl in report.tables:
-        if tbl.conflict_count == 0 and tbl.site_specific_column_count == 0 and not tbl.missing_in_sources:
+        if (
+            tbl.conflict_count == 0
+            and tbl.site_specific_column_count == 0
+            and not tbl.missing_in_sources
+            and not tbl.pk_divergent
+        ):
             continue
         lines.append(f"### `{tbl.table_name}` — Harmonization Plan")
         lines.append("")
-        lines.append("| Target Column | Target Spark Type | Type Conflict | Types by Source | Missing In |")
-        lines.append("|---|---|---|---|---|")
-        for col in tbl.columns:
-            if not col.has_type_conflict and not col.missing_in_sources:
-                continue
-            tsrc = ", ".join(f"`{s}`: `{t}`" for s, t in col.types_by_source.items())
-            miss = ", ".join(f"`{s}`" for s in col.missing_in_sources) if col.missing_in_sources else "—"
-            lines.append(
-                f"| `{col.sanitized_name}` | `{col.target_spark_type}` | "
-                f"{'**YES**' if col.has_type_conflict else 'no'} | {tsrc} | {miss} |"
+        if tbl.pk_divergent:
+            pk_desc = ", ".join(
+                f"`{s}`: `({', '.join(pks) or 'none'})`"
+                for s, pks in tbl.primary_keys_by_source.items()
             )
-        lines.append("")
+            lines.append(f"- **Primary Key Divergence:** {pk_desc}")
+            lines.append("")
+        drifted_cols = [
+            col for col in tbl.columns if col.has_type_conflict or col.missing_in_sources
+        ]
+        if drifted_cols:
+            lines.append("| Target Column | Target Spark Type | Type Conflict | Types by Source | Missing In |")
+            lines.append("|---|---|---|---|---|")
+            for col in drifted_cols:
+                tsrc = ", ".join(f"`{s}`: `{t}`" for s, t in col.types_by_source.items())
+                miss = ", ".join(f"`{s}`" for s in col.missing_in_sources) if col.missing_in_sources else "—"
+                lines.append(
+                    f"| `{col.sanitized_name}` | `{col.target_spark_type}` | "
+                    f"{'**YES**' if col.has_type_conflict else 'no'} | {tsrc} | {miss} |"
+                )
+            lines.append("")
         lines.append("<details><summary>Unified Multi-Plant Databricks SQL</summary>")
         lines.append("")
         lines.append("```sql")

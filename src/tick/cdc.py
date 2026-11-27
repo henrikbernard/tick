@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy.engine import Engine
 
 from tick.dialects import DialectAdapter, TableCdcProbe
-from tick.models import CdcDatabaseAudit, CdcReadiness, TableInfo
+from tick.models import CdcDatabaseAudit, CdcReadiness, DiscoveryConfig, TableInfo
 
 MSSQL_CDC_UNSUPPORTED = {"SQL_VARIANT", "HIERARCHYID", "GEOGRAPHY", "GEOMETRY", "XML", "ROWVERSION", "IMAGE"}
 ORACLE_CDC_WATCHLIST = {"LONG", "LONG RAW", "BFILE", "XMLTYPE", "SDO_GEOMETRY"}
@@ -16,11 +16,18 @@ def audit_cdc_readiness(
     engine: Engine,
     adapter: DialectAdapter,
     tables: list[TableInfo],
+    config: DiscoveryConfig | None = None,
 ) -> CdcDatabaseAudit:
     """Inspect database & table CDC / Lakeflow Connect readiness across dialects."""
     table_probes: dict[tuple[str, str], TableCdcProbe] = {}
 
     with engine.connect() as conn:
+        if config is not None:
+            adapter.configure_safe_session(
+                conn,
+                read_uncommitted=config.read_uncommitted,
+                query_timeout_seconds=config.query_timeout_seconds,
+            )
         db_audit = adapter.audit_database_cdc(conn)
         schemas = sorted({t.schema_name for t in tables if t.table_type == "table"})
         for schema in schemas:

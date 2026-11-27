@@ -496,7 +496,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <td class="mono">${sz.estimated_daily_rows != null ? Math.round(sz.estimated_daily_rows).toLocaleString() : '—'}</td>
             <td>${cdcBadge(cdc.status)}</td>
             <td class="mono">${esc(cdc.connector_recommendation || '—')}</td>
-            <td class="mono">${(dc.liquid_clustering_keys || []).join(", ") || "—"}</td>
+            <td class="mono">${esc((dc.liquid_clustering_keys || []).join(", ")) || "—"}</td>
             <td><span class="badge b-accent">${esc(sz.recommended_cadence || '—')}</span><div style="font-size:11px;color:var(--text-muted)">${esc(sz.recommended_databricks_tier || '')}</div></td>
           </tr>`;
       }).join("")}
@@ -933,12 +933,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     edges.forEach(e => { nodesSet.add(e.upstream_table); nodesSet.add(e.downstream_table); });
     const depth = {}, nodes = [...nodesSet];
     nodes.forEach(n => { depth[n] = 0; });
+    // Break cycles and skip self-loops before computing DAG layer depths
+    const adj = {};
+    nodes.forEach(n => { adj[n] = []; });
+    edges.forEach((e, idx) => {
+      if (e.upstream_table !== e.downstream_table) {
+        adj[e.upstream_table].push({ to: e.downstream_table, idx });
+      }
+    });
+    const colorState = {}; // 0=unvisited, 1=visiting, 2=done
+    const backEdges = new Set();
+    function dfs(u) {
+      colorState[u] = 1;
+      for (const { to, idx } of (adj[u] || [])) {
+        if (colorState[to] === 1) {
+          backEdges.add(idx);
+        } else if (!colorState[to]) {
+          dfs(to);
+        }
+      }
+      colorState[u] = 2;
+    }
+    nodes.forEach(n => { if (!colorState[n]) dfs(n); });
+    const dagEdges = edges.filter((e, idx) => e.upstream_table !== e.downstream_table && !backEdges.has(idx));
     for (let iter = 0; iter < nodes.length; iter++) {
-      edges.forEach(e => {
+      let changed = false;
+      dagEdges.forEach(e => {
         if ((depth[e.downstream_table] || 0) <= (depth[e.upstream_table] || 0)) {
           depth[e.downstream_table] = (depth[e.upstream_table] || 0) + 1;
+          changed = true;
         }
       });
+      if (!changed) break;
     }
     const layers = {};
     nodes.forEach(n => { (layers[depth[n]] = layers[depth[n]] || []).push(n); });
@@ -948,12 +974,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
 
     let edgeSvg = "";
-    edges.forEach(e => {
+    edges.forEach((e, idx) => {
       const a = pos[e.upstream_table], b = pos[e.downstream_table];
       if (!a || !b) return;
-      const sx = a.x + nodeW, sy = a.y + nodeH / 2, ex = b.x, ey = b.y + nodeH / 2, cx = (sx + ex) / 2;
       const color = e.edge_type === "view_dependency" ? "#a78bfa" : "#38bdf8";
-      edgeSvg += `<path d="M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ey}, ${ex} ${ey}" fill="none" stroke="${color}" stroke-width="2" opacity="0.85" /><circle cx="${ex}" cy="${ey}" r="4" fill="${color}" />`;
+      if (e.upstream_table === e.downstream_table) {
+        const lx = a.x + nodeW - 24, ly = a.y;
+        edgeSvg += `<path d="M ${lx - 26} ${ly} C ${lx - 26} ${ly - 26}, ${lx + 18} ${ly - 26}, ${lx + 10} ${ly}" fill="none" stroke="${color}" stroke-width="2" stroke-dasharray="4 3" opacity="0.85" /><circle cx="${lx + 10}" cy="${ly}" r="3.5" fill="${color}" />`;
+        return;
+      }
+      const sx = a.x + nodeW, sy = a.y + nodeH / 2, ex = b.x, ey = b.y + nodeH / 2, cx = (sx + ex) / 2;
+      const dash = backEdges.has(idx) ? ' stroke-dasharray="4 3"' : "";
+      edgeSvg += `<path d="M ${sx} ${sy} C ${cx} ${sy}, ${cx} ${ey}, ${ex} ${ey}" fill="none" stroke="${color}" stroke-width="2"${dash} opacity="0.85" /><circle cx="${ex}" cy="${ey}" r="4" fill="${color}" />`;
     });
 
     let nodeSvg = "";

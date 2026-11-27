@@ -39,6 +39,11 @@ def discover_database(
 
     try:
         with engine.connect() as conn:
+            adapter.configure_safe_session(
+                conn,
+                read_uncommitted=cfg.read_uncommitted,
+                query_timeout_seconds=cfg.query_timeout_seconds,
+            )
             server_version = adapter.get_server_version(conn)
 
         _emit("Introspecting schemas, tables, views, keys, and indexes...")
@@ -52,6 +57,7 @@ def discover_database(
                 glossary_path=cfg.glossary_path,
                 adapter=adapter,
                 default_schema=default_schema,
+                config=cfg,
             )
 
         _emit(
@@ -60,14 +66,19 @@ def discover_database(
         artifacts = profile_tables(engine, adapter, tables, default_schema, cfg)
 
         _emit("Discovering explicit/inferred relationships and view SQL lineage...")
-        relationships, fk_lineage = discover_relationships(tables, artifacts.value_samples, cfg)
+        relationships, fk_lineage = discover_relationships(
+            tables,
+            artifacts.value_samples,
+            cfg,
+            value_sample_complete=artifacts.value_sample_complete,
+        )
         view_lineage = discover_view_lineage(tables, adapter)
         all_lineage = view_lineage + fk_lineage
 
         cdc_audit: CdcDatabaseAudit | None = None
         if cfg.audit_cdc:
             _emit("Auditing Lakeflow Connect / CDC readiness...")
-            cdc_audit = audit_cdc_readiness(engine, adapter, tables)
+            cdc_audit = audit_cdc_readiness(engine, adapter, tables, config=cfg)
 
         # First pass generates watermarks & entity roles needed by sizing/liquid clustering
         _emit("Generating data engineering recommendations...")

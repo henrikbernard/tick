@@ -17,8 +17,40 @@ def _sql_str(val: str) -> str:
     return val.replace("'", "''")
 
 
+def _spark_sql_str(val: str) -> str:
+    """Escape a string literal for Databricks Spark SQL single-quoted expressions."""
+    return (
+        val.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+
+
+def _escape_docstring(val: str) -> str:
+    return val.replace("\\", "\\\\").replace('"""', '\\"\\"\\"').replace("\n", " ").replace("\r", " ")
+
+
+def _escape_md(val: str | None) -> str:
+    if not val:
+        return "—"
+    return val.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
 def _bt(val: str) -> str:
     return f"`{val.replace('`', '``')}`"
+
+
+def _uc_mask_fn_name(spark_type: str) -> str:
+    if spark_type.strip().upper() == "STRING":
+        return "mask_sensitive_string"
+    return f"mask_sensitive_{sanitize_delta_column_name(spark_type)}"
+
+
+def _uc_row_filter_fn_name(spark_type: str) -> str:
+    if spark_type.strip().upper() == "STRING":
+        return "plant_row_filter"
+    return f"plant_row_filter_{sanitize_delta_column_name(spark_type)}"
 
 
 def render_unity_catalog_ddl(
@@ -39,8 +71,10 @@ def render_unity_catalog_ddl(
         "",
     ]
 
-    row_filter_tables: list[tuple[str, str]] = []
-    mask_columns: list[tuple[str, str, str]] = []
+    # fqn -> (first_col_name, spark_type, extra_plant_cols)
+    row_filter_tables: dict[str, tuple[str, str, list[str]]] = {}
+    # (fqn, col_name) -> (spark_type, reasons)
+    mask_columns: dict[tuple[str, str], tuple[str, list[str]]] = {}
 
     base_tables = [t for t in result.tables if t.table_type == "table"]
     tbl_name_map = deduplicate_table_names(base_tables)
@@ -98,21 +132,30 @@ def render_unity_catalog_ddl(
 
         for col in tbl.columns:
             cname = col_map[col.name]
+            stype = col.spark_type or map_to_spark_type(col.raw_type, col.canonical_type)
             if col.profile:
                 if col.profile.pii_findings:
                     cat_tag = col.profile.pii_findings[0].category
                     lines.append(
                         f"ALTER TABLE {fqn} ALTER COLUMN {_bt(cname)} SET TAGS ('pii' = 'true', 'pii_category' = '{_sql_str(cat_tag)}');"
                     )
-                    mask_columns.append((fqn, cname, f"pii_{cat_tag}"))
+                    entry = mask_columns.setdefault((fqn, cname), (stype, []))
+                    reason = f"pii_{cat_tag}"
+                    if reason not in entry[1]:
+                        entry[1].append(reason)
                 for gov in col.profile.governance_findings:
                     lines.append(
                         f"ALTER TABLE {fqn} ALTER COLUMN {_bt(cname)} SET TAGS ('{gov.uc_tag_key}' = '{gov.uc_tag_value}');"
                     )
                     if gov.uc_policy == "row_filter":
-                        row_filter_tables.append((fqn, cname))
+                        if fqn not in row_filter_tables:
+                            row_filter_tables[fqn] = (cname, stype, [])
+                        elif cname != row_filter_tables[fqn][0] and cname not in row_filter_tables[fqn][2]:
+                            row_filter_tables[fqn][2].append(cname)
                     elif gov.uc_policy == "column_mask":
-                        mask_columns.append((fqn, cname, gov.uc_tag_value))
+                        entry = mask_columns.setdefault((fqn, cname), (stype, []))
+                        if gov.uc_tag_value not in entry[1]:
+                            entry[1].append(gov.uc_tag_value)
 
         lines.append("")
 
@@ -123,33 +166,63 @@ def render_unity_catalog_ddl(
         lines.append("-- Review and customize group names before applying in production.")
         lines.append("-- ============================================================================")
         if row_filter_tables:
-            lines.extend(
-                [
-                    f"CREATE OR REPLACE FUNCTION {_bt(cat)}.{_bt(sch)}.plant_row_filter(plant_val STRING)",
-                    "RETURNS BOOLEAN",
-                    "RETURN is_account_group_member('global_manufacturing_admins')",
-                    "    OR plant_val = current_user(); -- Replace with plant-access lookup table",
-                    "",
-                ]
-            )
-            for fqn, col_name in row_filter_tables:
+            seen_rf_types: list[str] = []
+            for _, stype, _ in row_filter_tables.values():
+                if stype not in seen_rf_types:
+                    seen_rf_types.append(stype)
+            for stype in seen_rf_types:
+                fn_name = _uc_row_filter_fn_name(stype)
+                cmp_expr = (
+                    "plant_val = current_user()"
+                    if stype.strip().upper() == "STRING"
+                    else "CAST(plant_val AS STRING) = current_user()"
+                )
+                lines.extend(
+                    [
+                        f"CREATE OR REPLACE FUNCTION {_bt(cat)}.{_bt(sch)}.{fn_name}(plant_val {stype})",
+                        "RETURNS BOOLEAN",
+                        "RETURN is_account_group_member('global_manufacturing_admins')",
+                        f"    OR {cmp_expr}; -- Replace with plant-access lookup table",
+                        "",
+                    ]
+                )
+            for fqn, (col_name, stype, extra_cols) in row_filter_tables.items():
+                fn_name = _uc_row_filter_fn_name(stype)
+                extra_note = (
+                    f" -- Additional plant keys skipped (UC allows 1 row filter/table): {', '.join(extra_cols)}"
+                    if extra_cols
+                    else ""
+                )
                 lines.append(
-                    f"-- ALTER TABLE {fqn} SET ROW FILTER {_bt(cat)}.{_bt(sch)}.plant_row_filter ON ({_bt(col_name)});"
+                    f"-- ALTER TABLE {fqn} SET ROW FILTER {_bt(cat)}.{_bt(sch)}.{fn_name} ON ({_bt(col_name)});{extra_note}"
                 )
             lines.append("")
 
         if mask_columns:
-            lines.extend(
-                [
-                    f"CREATE OR REPLACE FUNCTION {_bt(cat)}.{_bt(sch)}.mask_sensitive_string(val STRING)",
-                    "RETURNS STRING",
-                    "RETURN CASE WHEN is_account_group_member('sensitive_data_readers') THEN val ELSE '***REDACTED***' END;",
-                    "",
-                ]
-            )
-            for fqn, col_name, reason in mask_columns[:25]:
+            mask_items = list(mask_columns.items())[:25]
+            seen_mask_types: list[str] = []
+            for _, (stype, _) in mask_items:
+                if stype not in seen_mask_types:
+                    seen_mask_types.append(stype)
+            for stype in seen_mask_types:
+                fn_name = _uc_mask_fn_name(stype)
+                redacted_expr = (
+                    "'***REDACTED***'"
+                    if stype.strip().upper() == "STRING"
+                    else f"CAST(NULL AS {stype})"
+                )
+                lines.extend(
+                    [
+                        f"CREATE OR REPLACE FUNCTION {_bt(cat)}.{_bt(sch)}.{fn_name}(val {stype})",
+                        f"RETURNS {stype}",
+                        f"RETURN CASE WHEN is_account_group_member('sensitive_data_readers') THEN val ELSE {redacted_expr} END;",
+                        "",
+                    ]
+                )
+            for (fqn, col_name), (stype, reasons) in mask_items:
+                fn_name = _uc_mask_fn_name(stype)
                 lines.append(
-                    f"-- ALTER TABLE {fqn} ALTER COLUMN {_bt(col_name)} SET MASK {_bt(cat)}.{_bt(sch)}.mask_sensitive_string; -- ({reason})"
+                    f"-- ALTER TABLE {fqn} ALTER COLUMN {_bt(col_name)} SET MASK {_bt(cat)}.{_bt(sch)}.{fn_name}; -- ({', '.join(reasons)})"
                 )
             lines.append("")
 
@@ -169,8 +242,8 @@ def render_lakeflow_pipeline_py(
     lines: list[str] = [
         '"""Auto-generated Databricks Lakeflow Declarative Pipeline (DLT) Bronze -> Silver scaffolding.',
         "",
-        f"Source database: {result.overview.database_name} ({result.overview.dialect})",
-        f"Target catalog:  {cat} (bronze={bsch}, silver={silver_schema})",
+        f"Source database: {_escape_docstring(result.overview.database_name)} ({_escape_docstring(result.overview.dialect)})",
+        f"Target catalog:  {_escape_docstring(cat)} (bronze={_escape_docstring(bsch)}, silver={_escape_docstring(silver_schema)})",
         '"""',
         "",
         "import dlt",
@@ -209,7 +282,7 @@ def render_lakeflow_pipeline_py(
                 and not col.profile.governance_findings
             ):
                 vals = ", ".join(
-                    "'" + v.value.replace("'", "''") + "'"
+                    "'" + _spark_sql_str(v.value) + "'"
                     for v in col.profile.top_values[:10]
                 )
                 if vals:
@@ -275,6 +348,12 @@ def render_lakeflow_pipeline_py(
             )
             lines.append("# Build a downstream Gold BOM/genealogy explosion model using recursive CTEs.")
 
+        # Full-refresh tables must use batch reads (Materialized Views) so Bronze overwrites do not break streaming
+        use_streaming = (
+            strategy in {"incremental_merge", "incremental_append", "cdc"}
+            or bool(tbl.telemetry_profile)
+        )
+
         # Staging cleaned view
         stage_fn = f"clean_{safe_tbl}"
         lines.append(f"@dlt.view(name={stage_fn!r})")
@@ -282,7 +361,8 @@ def render_lakeflow_pipeline_py(
             limited_exp = dict(list(expectations.items())[:8])
             lines.append(f"@dlt.expect_all({limited_exp!r})")
         lines.append(f"def {stage_fn}():")
-        lines.append(f"    df = spark.readStream.table({bronze_src!r})")
+        read_call = "spark.readStream.table" if use_streaming else "spark.read.table"
+        lines.append(f"    df = {read_call}({bronze_src!r})")
         if transforms:
             lines.append("    df = (")
             lines.append("        df")
@@ -321,8 +401,10 @@ def render_lakeflow_pipeline_py(
                 lines.append(
                     f"    return dlt.read_stream({stage_fn!r}).withWatermark({ts_c!r}, {delay!r})"
                 )
-            else:
+            elif use_streaming:
                 lines.append(f"    return dlt.read_stream({stage_fn!r})")
+            else:
+                lines.append(f"    return dlt.read({stage_fn!r})")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -366,10 +448,14 @@ def render_databricks_sizing_md(result: DiscoveryResult) -> str:
         tier = sz.recommended_databricks_tier if sz else "—"
         cdc_st = cdc.status.upper() if cdc else "—"
         conn = cdc.connector_recommendation if cdc else "—"
-        lck = ", ".join(f"`{k}`" for k in dc.liquid_clustering_keys) if (dc and dc.liquid_clustering_keys) else "—"
+        lck = (
+            ", ".join(f"`{_escape_md(k)}`" for k in dc.liquid_clustering_keys)
+            if (dc and dc.liquid_clustering_keys)
+            else "—"
+        )
         lines.append(
-            f"| `{tbl.full_name}` | `{tbl.semantic_name or '—'}` | {tbl.row_count or 0:,} | {est_mb} | {daily} | "
-            f"`{cadence}` | **{cdc_st}** | `{conn}` | {lck} | {tier} |"
+            f"| `{_escape_md(tbl.full_name)}` | `{_escape_md(tbl.semantic_name)}` | {tbl.row_count or 0:,} | {est_mb} | {daily} | "
+            f"`{_escape_md(cadence)}` | **{cdc_st}** | `{_escape_md(conn)}` | {lck} | {_escape_md(tier)} |"
         )
     lines.append("")
 
@@ -379,7 +465,8 @@ def render_databricks_sizing_md(result: DiscoveryResult) -> str:
         if tbl.delta_compatibility:
             for iss in tbl.delta_compatibility.issues:
                 lint_rows.append(
-                    f"| **{iss.severity.upper()}** | `{tbl.full_name}` | `{iss.column or '—'}` | `{iss.category}` | {iss.message} | {iss.remediation} |"
+                    f"| **{iss.severity.upper()}** | `{_escape_md(tbl.full_name)}` | `{_escape_md(iss.column)}` | "
+                    f"`{_escape_md(iss.category)}` | {_escape_md(iss.message)} | {_escape_md(iss.remediation)} |"
                 )
     if lint_rows:
         lines.append("## Spark / Delta Lake Compatibility Linter")

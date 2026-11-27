@@ -128,7 +128,8 @@ def test_manufacturing_discovery_end_to_end(tmp_path, ext):
     assert hist.telemetry_profile is not None
     assert hist.telemetry_profile.pattern == "narrow_historian_eav"
     assert hist.telemetry_profile.tag_column == "tag_id"
-    assert hist.telemetry_profile.median_interval_seconds == 10.0
+    # 3 staggered tags emitted every 10s -> 30.0s per-tag polling cadence
+    assert hist.telemetry_profile.median_interval_seconds == 30.0
     assert hist.telemetry_profile.bad_quality_rate is not None and hist.telemetry_profile.bad_quality_rate >= 0.09
 
     plc = tbls["plc_press_telemetry"]

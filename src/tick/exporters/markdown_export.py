@@ -24,13 +24,31 @@ def _fmt_int(num: int | None) -> str:
 
 
 def _mermaid_id(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    if not cleaned:
+        return "n_node"
+    if cleaned[0].isdigit():
+        return f"n_{cleaned}"
+    return cleaned
+
+
+def _escape_mermaid_label(val: str) -> str:
+    return val.replace('"', "'").replace("\n", " ").replace("\r", " ")
 
 
 def _escape_md(val: str | None) -> str:
     if not val:
         return "—"
-    return val.replace("|", "\\|").replace("\n", " ")
+    return val.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def _md_code(val: str | None) -> str:
+    if not val:
+        return "—"
+    escaped = _escape_md(val)
+    if "`" in escaped:
+        return f"`` {escaped} ``"
+    return f"`{escaped}`"
 
 
 def _render_mermaid_erd(result: DiscoveryResult) -> str:
@@ -59,10 +77,12 @@ def _render_mermaid_erd(result: DiscoveryResult) -> str:
         tgt = _mermaid_id(rel.target_table)
         if rel.kind == "explicit_fk":
             connector = "}o--||"
-            label = f"{rel.source_column} -> {rel.target_column}"
+            label = _escape_mermaid_label(f"{rel.source_column} -> {rel.target_column}")
         else:
             connector = "}o..||"
-            label = f"inferred ({rel.confidence:.0%}) {rel.source_column} -> {rel.target_column}"
+            label = _escape_mermaid_label(
+                f"inferred ({rel.confidence:.0%}) {rel.source_column} -> {rel.target_column}"
+            )
         lines.append(f'    {src} {connector} {tgt} : "{label}"')
 
     lines.append("```")
@@ -83,10 +103,11 @@ def _render_mermaid_lineage(result: DiscoveryResult) -> str:
                 seen_nodes.add(node)
                 nid = _mermaid_id(node)
                 ttype = type_map.get(node, "table")
+                safe_node = _escape_mermaid_label(node)
                 if ttype == "table":
-                    lines.append(f'    {nid}[("{node}")]')
+                    lines.append(f'    {nid}[("{safe_node}")]')
                 else:
-                    lines.append(f'    {nid}["{node} ({ttype})"]')
+                    lines.append(f'    {nid}["{safe_node} ({ttype})"]')
         lines.append(
             f"    {_mermaid_id(edge.upstream_table)} --> {_mermaid_id(edge.downstream_table)}"
         )
@@ -181,10 +202,10 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         else:
             null_pct = distinct = minmax = "—"
 
-        spark_note = f" → `{col.spark_type}`" if col.spark_type else ""
+        spark_note = f" → {_md_code(col.spark_type)}" if col.spark_type else ""
         lines.append(
-            f"| `{col.name}` | {col.semantic_name or '—'} | `{col.raw_type}`{spark_note} | {key_str} | "
-            f"{'YES' if col.nullable else 'NO'} | {null_pct} | {distinct} | {minmax} | {', '.join(flags) or '—'} |"
+            f"| {_md_code(col.name)} | {_escape_md(col.semantic_name)} | {_md_code(col.raw_type)}{spark_note} | {key_str} | "
+            f"{'YES' if col.nullable else 'NO'} | {null_pct} | {distinct} | {minmax} | {_escape_md(', '.join(flags)) if flags else '—'} |"
         )
 
     lines.append("")
@@ -239,9 +260,9 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         cdc = tbl.cdc_readiness
         dc = tbl.delta_compatibility
         sz = tbl.ingestion_sizing
-        lck = ", ".join(f"`{k}`" for k in dc.liquid_clustering_keys) if (dc and dc.liquid_clustering_keys) else "—"
+        lck = ", ".join(_md_code(k) for k in dc.liquid_clustering_keys) if (dc and dc.liquid_clustering_keys) else "—"
         lines.append(
-            f"| `{tbl.full_name}` | `{tbl.semantic_name or '—'}` | `{rec.entity_role if rec else 'unknown'}` | "
+            f"| {_md_code(tbl.full_name)} | {_md_code(tbl.semantic_name)} | `{rec.entity_role if rec else 'unknown'}` | "
             f"{_fmt_int(tbl.row_count)} | {f'{sz.estimated_size_mb:.2f}' if sz else '—'} | "
             f"`{rec.ingestion_strategy if rec else '—'}` | `{cdc.status if cdc else '—'}` | {lck} | "
             f"`{sz.recommended_cadence if sz else '—'}` |"
@@ -290,7 +311,7 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         for rel in result.relationships:
             ovlp = f"{rel.overlap_rate:.0%}" if rel.overlap_rate is not None else "—"
             lines.append(
-                f"| `{rel.source_table}.{rel.source_column}` | `{rel.target_table}.{rel.target_column}` | "
+                f"| {_md_code(f'{rel.source_table}.{rel.source_column}')} | {_md_code(f'{rel.target_table}.{rel.target_column}')} | "
                 f"`{rel.kind}` | {rel.confidence:.0%} | {ovlp} | {_escape_md('; '.join(rel.evidence))} |"
             )
         lines.append("")
@@ -309,8 +330,8 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         lines.append("|---|---|---|---|---|")
         for issue in result.quality_issues:
             lines.append(
-                f"| **{issue.severity.upper()}** | `{issue.category}` | `{issue.table}` | "
-                f"{f'`{issue.column}`' if issue.column else '—'} | {_escape_md(issue.message)} |"
+                f"| **{issue.severity.upper()}** | `{_escape_md(issue.category)}` | {_md_code(issue.table)} | "
+                f"{_md_code(issue.column)} | {_escape_md(issue.message)} |"
             )
         lines.append("")
 
@@ -362,7 +383,7 @@ def render_diff_markdown(diff: SnapshotDiff) -> str:
         lines.append("|---|---|---|---|---|---|")
         for c in diff.column_changes:
             lines.append(
-                f"| `{c.table}` | `{c.column}` | `{c.change_type}` | `{c.before or '—'}` | `{c.after or '—'}` | "
+                f"| {_md_code(c.table)} | {_md_code(c.column)} | `{_escape_md(c.change_type)}` | {_md_code(c.before)} | {_md_code(c.after)} | "
                 f"{'YES' if c.breaking else 'no'} |"
             )
         lines.append("")
@@ -378,7 +399,7 @@ def render_diff_markdown(diff: SnapshotDiff) -> str:
         lines.append("|---|---|---|---|---:|---:|---:|")
         for m in diff.metric_drifts:
             lines.append(
-                f"| **{m.severity.upper()}** | `{m.table}` | `{m.column or '—'}` | `{m.metric}` | "
+                f"| **{m.severity.upper()}** | {_md_code(m.table)} | {_md_code(m.column)} | `{_escape_md(m.metric)}` | "
                 f"{m.before} | {m.after} | {m.delta} |"
             )
         lines.append("")

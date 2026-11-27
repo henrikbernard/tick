@@ -18,6 +18,10 @@ def _slug(text: str) -> str:
     return cleaned
 
 
+def _jinja_str(val: str) -> str:
+    return val.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def render_dbt_sources_yaml(result: DiscoveryResult, source_prefix: str | None = None) -> str:
     """Render a dbt version 2 sources.yml with freshness, metadata, and data tests."""
     rel_by_source_col: dict[tuple[str, str], RelationshipInfo] = {}
@@ -26,9 +30,11 @@ def render_dbt_sources_yaml(result: DiscoveryResult, source_prefix: str | None =
             rel_by_source_col.setdefault((rel.source_table, rel.source_column), rel)
 
     schemas_map: dict[str, list[TableInfo]] = {}
+    included_tables: set[str] = set()
     for tbl in result.tables:
         if tbl.table_type == "table":
             schemas_map.setdefault(tbl.schema_name, []).append(tbl)
+            included_tables.add(tbl.full_name)
 
     sources_list: list[dict[str, Any]] = []
     prefix = _slug(source_prefix or result.overview.database_name)
@@ -83,7 +89,7 @@ def render_dbt_sources_yaml(result: DiscoveryResult, source_prefix: str | None =
                         tests.append("unique")
 
                 rel = rel_by_source_col.get((tbl.full_name, col.name))
-                if rel and rel.target_table != tbl.full_name:
+                if rel and rel.target_table != tbl.full_name and rel.target_table in included_tables:
                     target_schema, target_tbl = (
                         rel.target_table.split(".", 1)
                         if "." in rel.target_table
@@ -95,7 +101,7 @@ def render_dbt_sources_yaml(result: DiscoveryResult, source_prefix: str | None =
                     tests.append(
                         {
                             "relationships": {
-                                "to": f"source('{tgt_source_name}', '{target_tbl}')",
+                                "to": f"source('{_jinja_str(tgt_source_name)}', '{_jinja_str(target_tbl)}')",
                                 "field": rel.target_column,
                             }
                         }
@@ -175,7 +181,7 @@ def _render_staging_sql(source_name: str, tbl: TableInfo) -> str:
         *header_lines,
         "",
         "with source as (",
-        f"    select * from {{{{ source('{source_name}', '{tbl.name}') }}}}",
+        f"    select * from {{{{ source('{_jinja_str(source_name)}', '{_jinja_str(tbl.name)}') }}}}",
         "),",
         "",
         "renamed as (",
@@ -214,12 +220,19 @@ def export_dbt_project(
         staging_dir = root / "staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
 
+        seen_models: set[str] = set()
         for tbl in base_tables:
             source_name = (
                 f"{prefix}_{_slug(tbl.schema_name)}" if len(distinct_schemas) > 1 else prefix
             )
-            model_name = f"stg_{_slug(tbl.schema_name)}__{_slug(tbl.name)}.sql"
-            sql_path = staging_dir / model_name
+            base_model = f"stg_{_slug(tbl.schema_name)}__{_slug(tbl.name)}"
+            model_stem = base_model
+            suffix = 2
+            while model_stem in seen_models:
+                model_stem = f"{base_model}_{suffix}"
+                suffix += 1
+            seen_models.add(model_stem)
+            sql_path = staging_dir / f"{model_stem}.sql"
             sql_path.write_text(_render_staging_sql(source_name, tbl), encoding="utf-8")
             written.append(sql_path)
 

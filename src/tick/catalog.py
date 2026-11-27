@@ -86,7 +86,7 @@ def _duckdb_foreign_keys(conn: Connection, schema_name: str, table_name: str) ->
                     )
                 )
     except Exception:
-        pass
+        safe_rollback(conn)
     return fks
 
 
@@ -109,7 +109,7 @@ def _duckdb_primary_key(conn: Connection, schema_name: str, table_name: str) -> 
             if col_names:
                 return list(col_names)
     except Exception:
-        pass
+        safe_rollback(conn)
     return []
 
 
@@ -133,7 +133,7 @@ def _duckdb_unique_columns(conn: Connection, schema_name: str, table_name: str) 
             if col_names and len(col_names) == 1:
                 uniques.add(col_names[0])
     except Exception:
-        pass
+        safe_rollback(conn)
     return uniques
 
 
@@ -174,8 +174,6 @@ def introspect_catalog(
     engine: Engine, adapter: DialectAdapter, config: DiscoveryConfig
 ) -> tuple[list[SchemaSummary], list[TableInfo], str | None]:
     """Introspect all schemas, tables, views, columns, constraints, and sizes."""
-    inspector = inspect(engine)
-
     tables: list[TableInfo] = []
     schema_summaries: list[SchemaSummary] = []
 
@@ -185,13 +183,18 @@ def introspect_catalog(
             read_uncommitted=config.read_uncommitted,
             query_timeout_seconds=config.query_timeout_seconds,
         )
+        # Inspect bound to `conn` so all metadata queries inherit safe-session guardrails
+        inspector = inspect(conn)
         schemas_list, default_schema = _discover_schemas(conn, inspector, adapter, config)
         for schema_name in schemas_list:
+            if config.max_tables is not None and len(tables) >= config.max_tables:
+                break
             stats_map: dict[str, TableStats] = adapter.get_table_stats(conn, schema_name)
 
             try:
                 table_names = adapter.get_table_names(conn, inspector, schema_name)
             except Exception:
+                safe_rollback(conn)
                 table_names = []
 
             view_names: list[str] = []
@@ -200,6 +203,7 @@ def introspect_catalog(
                 try:
                     view_names = adapter.get_view_names(conn, inspector, schema_name)
                 except Exception:
+                    safe_rollback(conn)
                     view_names = []
                 matview_names = adapter.get_materialized_views(conn, schema_name)
 

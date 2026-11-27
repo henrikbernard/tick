@@ -121,8 +121,15 @@ def diff_snapshots(before: DiscoveryResult, after: DiscoveryResult) -> SnapshotD
             if added_pii:
                 new_pii.append(f"{tbl_name}.{cname} ({', '.join(added_pii)})")
 
-            # Null rate regression (>= +10pp)
-            if bc.profile and ac.profile:
+            # Null rate regression (>= +10pp) — only when both snapshots actually profiled the column
+            if (
+                bc.profile
+                and ac.profile
+                and not bc.profile.profile_error
+                and not ac.profile.profile_error
+                and bc.profile.sample_size > 0
+                and ac.profile.sample_size > 0
+            ):
                 delta_null = ac.profile.null_rate - bc.profile.null_rate
                 if delta_null >= 0.10:
                     metric_drifts.append(
