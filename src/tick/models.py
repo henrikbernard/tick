@@ -278,11 +278,24 @@ class QualityIssue(BaseModel):
     message: str
 
 
+class FileSourceInfo(BaseModel):
+    path: str
+    file_format: Literal["parquet", "csv", "tsv", "json", "jsonl", "delta"]
+    file_count: int = 1
+    total_bytes: int = 0
+    compression: str | None = None
+    delimiter: str | None = None
+    has_header: bool | None = None
+    hive_partitioned: bool = False
+    partition_columns: list[str] = Field(default_factory=list)
+
+
 class TableInfo(BaseModel):
     schema_name: str
     name: str
     full_name: str
     table_type: TableType = "table"
+    file_source: FileSourceInfo | None = None
     semantic_name: str | None = None
     business_description: str | None = None
     comment: str | None = None

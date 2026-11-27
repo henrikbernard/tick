@@ -388,15 +388,41 @@ def render_lakeflow_pipeline_py(
             or bool(tbl.telemetry_profile)
         )
 
-        # Staging cleaned view
+        # Staging cleaned view (for flat-file / data-lake sources, generate Auto Loader cloudFiles Bronze first!)
         stage_fn = f"clean_{safe_tbl}"
+        if tbl.file_source is not None:
+            fs = tbl.file_source
+            bronze_fn = f"bronze_{safe_tbl}"
+            al_fmt = "parquet" if fs.file_format in {"parquet", "delta"} else ("csv" if fs.file_format in {"csv", "tsv"} else "json")
+            vol_path = f"/Volumes/{cat}/{bsch}/landing_zone/{safe_tbl}/"
+            lines.append(f"@dlt.table(name={bronze_fn!r}, comment={f'Auto Loader Bronze ingestion ({fs.file_format}) for {tbl.full_name}'!r})")
+            lines.append(f"def {bronze_fn}():")
+            lines.append("    return (")
+            lines.append("        spark.readStream.format('cloudFiles')")
+            lines.append(f"        .option('cloudFiles.format', {al_fmt!r})")
+            if al_fmt in {"csv", "json"}:
+                lines.append("        .option('cloudFiles.inferColumnTypes', 'true')")
+            if al_fmt == "csv":
+                lines.append(f"        .option('header', {'true' if fs.has_header is not False else 'false'!r})")
+                delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
+                lines.append(f"        .option('sep', {delim!r})")
+            elif fs.file_format == "json":
+                lines.append("        .option('multiLine', 'true')")
+            lines.append(f"        .load({vol_path!r})")
+            lines.append("    )")
+            lines.append("")
+            use_streaming = True
+
         lines.append(f"@dlt.view(name={stage_fn!r})")
         if expectations:
             limited_exp = dict(list(expectations.items())[:8])
             lines.append(f"@dlt.expect_all({limited_exp!r})")
         lines.append(f"def {stage_fn}():")
-        read_call = "spark.readStream.table" if use_streaming else "spark.read.table"
-        lines.append(f"    df = {read_call}({bronze_src!r})")
+        if tbl.file_source is not None:
+            lines.append(f"    df = dlt.read_stream({f'bronze_{safe_tbl}'!r})")
+        else:
+            read_call = "spark.readStream.table" if use_streaming else "spark.read.table"
+            lines.append(f"    df = {read_call}({bronze_src!r})")
         if transforms:
             lines.append("    df = (")
             lines.append("        df")
@@ -532,6 +558,10 @@ def export_databricks_bundle(
         render_databricks_bundle_yml,
         render_lakeview_dashboard_json,
     )
+    from tick.exporters.file_ingest_export import (
+        has_file_sources,
+        render_databricks_autoloader_sql,
+    )
     from tick.exporters.gold_sql import (
         get_hierarchy_tables,
         render_databricks_gold_hierarchies_sql,
@@ -605,5 +635,13 @@ def export_databricks_bundle(
             encoding="utf-8",
         )
         written.append(gold_path)
+
+    if has_file_sources(result):
+        al_path = root / "autoloader_ingest.sql"
+        al_path.write_text(
+            render_databricks_autoloader_sql(result, catalog=catalog, schema=bronze_schema),
+            encoding="utf-8",
+        )
+        written.append(al_path)
 
     return written

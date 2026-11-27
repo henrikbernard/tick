@@ -10,6 +10,7 @@ from tick.catalog import introspect_catalog
 from tick.cdc import audit_cdc_readiness
 from tick.databricks import lint_databricks_compatibility
 from tick.dialects import create_db_engine, get_dialect_adapter, sanitize_url
+from tick.file_lake import MountedFileLake, is_file_lake_target, mount_file_lake_engine
 from tick.glossary import enrich_with_glossary
 from tick.manufacturing import analyze_manufacturing_patterns
 from tick.models import CdcDatabaseAudit, DatabaseOverview, DiscoveryConfig, DiscoveryResult
@@ -34,21 +35,49 @@ def discover_database(
         if progress_cb:
             progress_cb(msg)
 
-    _emit("Connecting to database...")
-    engine, resolved_url = create_db_engine(target, read_only=True, workers=cfg.workers)
+    mounted_lake: MountedFileLake | None = None
+    if is_file_lake_target(target):
+        _emit("Scanning local/data-lake files and mounting virtual catalog...")
+        mounted_lake = mount_file_lake_engine(target, cfg)
+        engine = mounted_lake.engine
+        resolved_url = mounted_lake.resolved_url
+    else:
+        _emit("Connecting to database...")
+        engine, resolved_url = create_db_engine(target, read_only=True, workers=cfg.workers)
     adapter = get_dialect_adapter(engine.dialect.name)
 
     try:
-        with engine.connect() as conn:
-            adapter.configure_safe_session(
-                conn,
-                read_uncommitted=cfg.read_uncommitted,
-                query_timeout_seconds=cfg.query_timeout_seconds,
-            )
-            server_version = adapter.get_server_version(conn)
+        if mounted_lake is not None:
+            server_version = mounted_lake.backend_note
+        else:
+            with engine.connect() as conn:
+                adapter.configure_safe_session(
+                    conn,
+                    read_uncommitted=cfg.read_uncommitted,
+                    query_timeout_seconds=cfg.query_timeout_seconds,
+                )
+                server_version = adapter.get_server_version(conn)
 
         _emit("Introspecting schemas, tables, views, keys, and indexes...")
         schemas, tables, default_schema = introspect_catalog(engine, adapter, cfg)
+
+        # Attach file-source metadata, exact pre-limit row counts, and exact byte sizes
+        if mounted_lake is not None:
+            for tbl in tables:
+                fs = mounted_lake.file_sources.get(tbl.full_name)
+                if fs is not None:
+                    tbl.file_source = fs
+                if tbl.full_name in mounted_lake.exact_row_counts:
+                    tbl.row_count = mounted_lake.exact_row_counts[tbl.full_name]
+                    tbl.row_count_exact = True
+                if tbl.full_name in mounted_lake.size_bytes_map:
+                    tbl.size_bytes = mounted_lake.size_bytes_map[tbl.full_name]
+            # Recompute schema summaries using exact file row counts and file byte sizes
+            for sch_sum in schemas:
+                sch_tbls = [t for t in tables if t.schema_name == sch_sum.name and t.table_type == "table"]
+                sch_sum.total_rows = sum(t.row_count or 0 for t in sch_tbls)
+                sch_sizes = [t.size_bytes for t in sch_tbls if t.size_bytes is not None]
+                sch_sum.total_size_bytes = sum(sch_sizes) if sch_sizes else None
 
         if cfg.detect_manufacturing or cfg.glossary_path:
             _emit("Enriching tables & columns with ERP/MES semantic glossary...")
@@ -146,11 +175,11 @@ def discover_database(
         )
 
         overview = DatabaseOverview(
-            dialect=engine.dialect.name,
+            dialect="files" if mounted_lake is not None else engine.dialect.name,
             driver=engine.dialect.driver,
-            database_name=adapter.get_database_name(engine),
+            database_name=mounted_lake.database_name if mounted_lake is not None else adapter.get_database_name(engine),
             server_version=server_version,
-            sanitized_url=sanitize_url(resolved_url),
+            sanitized_url=resolved_url if mounted_lake is not None else sanitize_url(resolved_url),
             discovered_at=datetime.now(timezone.utc).isoformat(),
             duration_seconds=duration,
             schema_count=len(schemas),

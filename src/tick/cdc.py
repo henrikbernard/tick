@@ -21,18 +21,30 @@ def audit_cdc_readiness(
     """Inspect database & table CDC / Lakeflow Connect readiness across dialects."""
     table_probes: dict[tuple[str, str], TableCdcProbe] = {}
 
-    with engine.connect() as conn:
-        if config is not None:
-            adapter.configure_safe_session(
-                conn,
-                read_uncommitted=config.read_uncommitted,
-                query_timeout_seconds=config.query_timeout_seconds,
-            )
-        db_audit = adapter.audit_database_cdc(conn)
-        schemas = sorted({t.schema_name for t in tables if t.table_type == "table"})
-        for schema in schemas:
-            for tbl_name, probe in adapter.audit_table_cdc(conn, schema).items():
-                table_probes[(schema, tbl_name)] = probe
+    base_tables_all = [t for t in tables if t.table_type == "table"]
+    is_file_lake = bool(base_tables_all) and all(t.file_source is not None for t in base_tables_all)
+
+    if is_file_lake:
+        db_audit = CdcDatabaseAudit(
+            dialect="files",
+            db_cdc_enabled=True,
+            notes=[
+                "File / Data Lake landing zone — use Databricks Auto Loader (cloudFiles) or Snowflake Snowpipe / COPY INTO for incremental file ingestion."
+            ],
+        )
+    else:
+        with engine.connect() as conn:
+            if config is not None:
+                adapter.configure_safe_session(
+                    conn,
+                    read_uncommitted=config.read_uncommitted,
+                    query_timeout_seconds=config.query_timeout_seconds,
+                )
+            db_audit = adapter.audit_database_cdc(conn)
+            schemas = sorted({t.schema_name for t in tables if t.table_type == "table"})
+            for schema in schemas:
+                for tbl_name, probe in adapter.audit_table_cdc(conn, schema).items():
+                    table_probes[(schema, tbl_name)] = probe
 
     for tbl in tables:
         if tbl.table_type != "table":
@@ -40,6 +52,28 @@ def audit_cdc_readiness(
                 status="not_applicable",
                 connector_recommendation="downstream_lakeflow_view",
                 notes=["Views are rebuilt as Silver/Gold Lakeflow Declarative Pipeline tables rather than CDC-replicated."],
+            )
+            continue
+
+        if tbl.file_source is not None:
+            fs = tbl.file_source
+            connector = (
+                "snowpipe_or_copy_into"
+                if (config is not None and config.target_platform == "snowflake")
+                else "databricks_autoloader_cloudfiles"
+            )
+            file_notes = [
+                f"File source ({fs.file_format.upper()}, {fs.file_count} file(s), {fs.total_bytes:,} bytes): "
+                "ready for incremental cloud file ingestion (Databricks Auto Loader / Snowflake Snowpipe or COPY INTO)."
+            ]
+            if fs.hive_partitioned and fs.partition_columns:
+                file_notes.append(f"Hive partition columns detected: {', '.join(fs.partition_columns)}.")
+            tbl.cdc_readiness = CdcReadiness(
+                status="ready",
+                connector_recommendation=connector,
+                source_cdc_enabled=True,
+                has_primary_key=len(tbl.primary_key) > 0,
+                notes=file_notes,
             )
             continue
 

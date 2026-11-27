@@ -524,6 +524,8 @@ def render_snowflake_dmf_sql(
 
 
 def _snowflake_connector_rec(tbl: TableInfo, dialect: str) -> str:
+    if tbl.file_source is not None:
+        return "snowpipe_or_copy_into"
     if dialect == "snowflake":
         return "snowflake_stream_dynamic_table"
     if tbl.telemetry_profile is not None:
@@ -615,6 +617,10 @@ def export_snowflake_bundle(
         render_snowflake_project_yml,
         render_snowflake_streamlit_app,
     )
+    from tick.exporters.file_ingest_export import (
+        has_file_sources,
+        render_snowflake_file_ingest_sql,
+    )
     from tick.exporters.gold_sql import (
         get_hierarchy_tables,
         render_snowflake_gold_hierarchies_sql,
@@ -696,5 +702,13 @@ def export_snowflake_bundle(
             encoding="utf-8",
         )
         written.append(gold_path)
+
+    if has_file_sources(result):
+        fi_path = root / "snowflake_file_ingest.sql"
+        fi_path.write_text(
+            render_snowflake_file_ingest_sql(result, database=database, schema=schema),
+            encoding="utf-8",
+        )
+        written.append(fi_path)
 
     return written

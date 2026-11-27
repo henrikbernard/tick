@@ -4,11 +4,11 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-`tick` points at **any SQLAlchemy-supported database** (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Databricks Unity Catalog, Snowflake, Oracle, IBM DB2/AS400, SAP HANA, BigQuery**) and automatically discovers everything a data engineer needs before building pipelines—with first-class **Databricks Lakehouse**, **Snowflake Data Cloud**, **Manufacturing / ERP / MES / OT**, **Data Contracts**, and **standalone offline HTML dashboards**.
+`tick` points at **any SQLAlchemy-supported database** (**PostgreSQL, SQL Server, DuckDB, SQLite, MySQL/MariaDB, Databricks Unity Catalog, Snowflake, Oracle, IBM DB2/AS400, SAP HANA, BigQuery**) OR **local/data-lake files & landing zones** (**Parquet, CSV, TSV, JSON/JSONL, `.gz`, Hive-partitioned directories, Delta Lake**) and automatically discovers everything a data engineer needs before building pipelines—with first-class **Databricks Lakehouse**, **Snowflake Data Cloud**, **Manufacturing / ERP / MES / OT**, **Data Contracts**, and **standalone offline HTML dashboards**.
 
 ```mermaid
 flowchart LR
-    SRC[("Any Source DB\nPostgres · MSSQL · Oracle · SAP\nDB2 · MySQL · DuckDB · Databricks · Snowflake")] --> CAT["Catalog & Safe Guardrails\n(NOLOCK / Timeout / Empty Triage)"]
+    SRC[("Any DB or File Lake\nPostgres · MSSQL · Oracle · SAP · DB2\nDatabricks · Snowflake · Parquet · CSV · JSONL · Delta")] --> CAT["Catalog & Safe Guardrails\n(NOLOCK / Timeout / Empty Triage)"]
     CAT --> PROF["Parallel Profiler (--workers N)\nStats · Quantiles · Freshness · PII · Governance"]
     PROF --> INT["DE & Manufacturing Intelligence\nFK Inference · SQL Lineage · CDC Audit\nOT Telemetry · BOMs · Legacy Dates · Delta & SF Lint"]
     INT --> HTML["3 Interactive HTML Dashboards\nDiscovery · Multi-Plant · Diff"]
@@ -22,8 +22,8 @@ flowchart LR
 
 ## Key Capabilities
 
-### 1. Core Discovery, Profiling & Lineage
-- **Universal Schema Catalog & Stats**: Introspects schemas, tables, views, materialized views, cross-dialect canonical types, PKs, FKs, unique constraints, indexes, row counts, and sizes.
+### 1. Core Discovery, File Lake Scanning, Profiling & Lineage
+- **Universal Schema Catalog & File Lake Mounting**: Introspects RDBMS schemas, tables, views, materialized views, PKs, FKs, indexes, row counts, and sizes—OR point `tick discover` directly at a single file, glob (`./drop/*.csv`), Hive-partitioned folder, Delta Lake directory, or multi-format landing zone (`.parquet`, `.csv`, `.tsv`, `.json`, `.jsonl`, `.gz`).
 - **Parallel Data Profiling (`--workers N`)**: Bounded thread-pool profiling for large ERP databases with null rates, distinct counts, cardinality classes, min/max, numeric mean/stddev/quantiles (`p25`/`p50`/`p75`), string lengths, top-K frequencies, and timestamp freshness/staleness checks.
 - **Relationship & View SQL Lineage**: Collects explicit FKs, infers missing/unenforced joins with value-overlap verification, and parses view SQL via `sqlglot` for multi-hop lineage graphs.
 - **Data Engineering Blueprint**: Classifies entity roles (`fact`, `dimension`, `event_log`, `bridge`, `reference`, `staging`, `view`), recommends ingestion strategies, watermarks, candidate PKs, and 0–100 table health scores.
@@ -132,6 +132,10 @@ tick diff ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
   --html ./drift.html \
   --md ./drift.md \
   --fail-on-breaking
+
+# 7. Discover a multi-format Data Lake / SFTP file landing zone (Parquet, CSV, JSONL, Hive partitions)
+tick demo ./lake_drop --domain files
+tick discover ./lake_drop --out-dir ./lake-discovery
 ```
 
 ---
@@ -144,12 +148,14 @@ tick diff ./ohio-discovery/snapshot.json ./munich-discovery/snapshot.json \
 | `report.md` | GitHub-flavored Markdown data dictionary with Mermaid ERD & Lineage diagrams |
 | `snapshot.json` | Machine-readable Pydantic snapshot for `tick diff` and `tick compare-sources` |
 | `databricks/unity_catalog_ddl.sql` | Unity Catalog Delta DDL with Liquid Clustering, CDF, tags, and type-matched mask/row-filter stubs |
-| `databricks/lakeflow_pipeline.py` | Databricks Lakeflow Declarative Pipeline (DLT) Bronze → Silver Python code |
+| `databricks/lakeflow_pipeline.py` | Databricks Lakeflow Declarative Pipeline (DLT) Bronze → Silver Python code (uses Auto Loader `cloudFiles` for files) |
+| `databricks/autoloader_ingest.sql` | Databricks SQL `COPY INTO` / Volume / `SHALLOW CLONE` ingestion script *(emitted for file sources)* |
 | `databricks/gold_hierarchies.sql` | Recursive CTE Gold Delta SQL for detected BOMs, lot genealogy & asset trees (cycle-safe, plant-scoped) |
 | `databricks/databricks.yml` | Deployment-ready **Databricks Asset Bundle (DABs)** manifest (`dev`/`prod` jobs, serverless DLT & dashboard) |
 | `databricks/lakeview_dashboard.lvdash.json` | **Databricks AI/BI Lakeview** operational & manufacturing dashboard definition |
 | `databricks/ingestion_sizing.md` | Backfill volume, daily row velocity, cadence, CDC audit, and Delta linter report |
 | `snowflake/snowflake_ddl.sql` | Snowflake `CREATE TABLE` with `CHANGE_TRACKING`, Object Tags, Row Access Policies & Masking Policies |
+| `snowflake/snowflake_file_ingest.sql` | Snowflake `CREATE FILE FORMAT`, `STAGE`, `COPY INTO` & Snowpipe templates *(emitted for file sources)* |
 | `snowflake/snowflake_dynamic_tables.sql` | Bronze → Silver Snowflake Dynamic Tables with `TARGET_LAG`, legacy dates, OT filters & `QUALIFY` dedup |
 | `snowflake/snowflake_gold_hierarchies.sql` | Recursive CTE Gold Dynamic Tables for BOMs, lot genealogy & asset trees (`ARRAY_CONTAINS` cycle guard) |
 | `snowflake/snowflake_dmf.sql` | Snowflake Data Metric Functions (DMFs) for row count, nulls, duplicates, freshness & OPC quality |

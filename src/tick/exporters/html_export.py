@@ -15,6 +15,11 @@ from tick.exporters.deploy_export import (
     render_databricks_bundle_yml,
     render_snowflake_streamlit_app,
 )
+from tick.exporters.file_ingest_export import (
+    has_file_sources,
+    render_databricks_autoloader_sql,
+    render_snowflake_file_ingest_sql,
+)
 from tick.exporters.gold_sql import (
     render_databricks_gold_hierarchies_sql,
     render_snowflake_gold_hierarchies_sql,
@@ -429,10 +434,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <button class="btn code-tab" data-code="lakeflow_py">Lakeflow Pipeline (DLT Python)</button>
           <button class="btn code-tab" data-code="dbx_dab">Databricks Asset Bundle</button>
           <button class="btn code-tab" data-code="dbx_gold">Gold BOM SQL (DBX)</button>
+          <button class="btn code-tab file-only-tab" data-code="dbx_al">Auto Loader SQL (DBX)</button>
           <button class="btn code-tab" data-code="sf_ddl">Snowflake DDL &amp; Policies</button>
           <button class="btn code-tab" data-code="sf_dt">Snowflake Dynamic Tables</button>
           <button class="btn code-tab" data-code="sf_dmf">Snowflake DMFs</button>
           <button class="btn code-tab" data-code="sf_gold">Gold BOM SQL (SF)</button>
+          <button class="btn code-tab file-only-tab" data-code="sf_fi">Snowflake File Ingest</button>
           <button class="btn code-tab" data-code="sf_sis">Snowflake Streamlit App</button>
           <button class="btn code-tab" data-code="dbt_yaml">dbt sources.yml</button>
         </div>
@@ -456,10 +463,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     lakeflow_py: payload.lakeflow_py,
     dbx_dab: payload.dbx_dab,
     dbx_gold: payload.dbx_gold,
+    dbx_al: payload.dbx_al,
     sf_ddl: payload.sf_ddl,
     sf_dt: payload.sf_dt,
     sf_dmf: payload.sf_dmf,
     sf_gold: payload.sf_gold,
+    sf_fi: payload.sf_fi,
     sf_sis: payload.sf_sis,
     dbt_yaml: payload.dbt_yaml
   };
@@ -468,10 +477,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     lakeflow_py: "lakeflow_pipeline.py",
     dbx_dab: "databricks.yml",
     dbx_gold: "gold_hierarchies.sql",
+    dbx_al: "autoloader_ingest.sql",
     sf_ddl: "snowflake_ddl.sql",
     sf_dt: "snowflake_dynamic_tables.sql",
     sf_dmf: "snowflake_dmf.sql",
     sf_gold: "snowflake_gold_hierarchies.sql",
+    sf_fi: "snowflake_file_ingest.sql",
     sf_sis: "streamlit_app.py",
     dbt_yaml: "sources.yml"
   };
@@ -917,7 +928,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const govN = t.columns.filter(c => c.profile?.governance_findings?.length).length;
       return `
         <div class="tbl-item ${t.full_name === selectedTable ? 'selected' : ''}" data-jump="${esc(t.full_name)}">
-          <div class="name">${esc(t.name)} ${t.table_type !== 'table' ? '<span class="badge b-purple">VIEW</span>' : ''}</div>
+          <div class="name">${esc(t.name)} ${t.table_type !== 'table' ? '<span class="badge b-purple">VIEW</span>' : ''}${t.file_source ? `<span class="badge b-accent">${esc(t.file_source.file_format.toUpperCase())}</span>` : ''}</div>
           ${t.semantic_name ? `<div class="sem">${esc(t.semantic_name)}</div>` : ""}
           <div class="meta">
             <span>${esc(t.schema_name)} · ${fmtInt(t.row_count)} rows</span>
@@ -1046,6 +1057,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           ${tbl.primary_key.length ? `<span class="badge b-green">PK: ${esc(tbl.primary_key.join(', '))}</span>` : `<span class="badge b-red">NO PK</span>`}
           ${tbl.telemetry_profile ? `<span class="badge b-orange">OT: ${esc(tbl.telemetry_profile.pattern)}</span>` : ""}
           ${tbl.hierarchy ? `<span class="badge b-purple">HIERARCHY: ${esc(tbl.hierarchy.pattern)}</span>` : ""}
+          ${tbl.file_source ? `<span class="badge b-accent">FILE: ${esc(tbl.file_source.file_format.toUpperCase())} (${tbl.file_source.file_count} file${tbl.file_source.file_count === 1 ? '' : 's'} · ${fmtBytes(tbl.file_source.total_bytes)}${tbl.file_source.hive_partitioned && tbl.file_source.partition_columns?.length ? ` · Hive: ${esc(tbl.file_source.partition_columns.join(', '))}` : ''})</span>` : ""}
         </div>
         ${(tbl.business_description || tbl.comment) ? `<p style="color:var(--text-muted);margin:8px 0 0 0;">${esc(tbl.business_description || tbl.comment)}</p>` : ""}
         ${tbl.skipped_profiling_reason ? `<p style="color:var(--amber);margin:8px 0 0 0;">⚠ ${esc(tbl.skipped_profiling_reason)}</p>` : ""}
@@ -1174,6 +1186,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   renderQuality();
 
   // CODE & DDL TAB
+  if (!payload.has_file_sources) {
+    document.querySelectorAll(".file-only-tab").forEach(b => { b.style.display = "none"; });
+  }
   let activeCodeKey = targetPlatform === "snowflake" ? "sf_ddl" : "uc_ddl";
   function renderCodePreview() {
     document.getElementById("code-preview").textContent = codeAssets[activeCodeKey] || "";
@@ -1499,17 +1514,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 def render_html_report(result: DiscoveryResult) -> str:
     """Render a standalone, offline-capable interactive HTML discovery report."""
+    file_mode = has_file_sources(result)
     payload = {
         "result": result.model_dump(mode="json"),
+        "has_file_sources": file_mode,
         "dbt_yaml": render_dbt_sources_yaml(result),
         "uc_ddl": render_unity_catalog_ddl(result),
         "lakeflow_py": render_lakeflow_pipeline_py(result),
         "dbx_dab": render_databricks_bundle_yml(result),
         "dbx_gold": render_databricks_gold_hierarchies_sql(result),
+        "dbx_al": render_databricks_autoloader_sql(result) if file_mode else "",
         "sf_ddl": render_snowflake_ddl(result),
         "sf_dt": render_snowflake_dynamic_tables_sql(result),
         "sf_dmf": render_snowflake_dmf_sql(result),
         "sf_gold": render_snowflake_gold_hierarchies_sql(result),
+        "sf_fi": render_snowflake_file_ingest_sql(result) if file_mode else "",
         "sf_sis": render_snowflake_streamlit_app(result),
     }
     raw_json = json.dumps(payload).replace("</", "<\\/")

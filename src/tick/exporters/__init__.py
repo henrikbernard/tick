@@ -19,6 +19,10 @@ from tick.exporters.deploy_export import (
     render_snowflake_streamlit_app,
 )
 from tick.exporters.diff_html_export import export_diff_html, render_diff_html
+from tick.exporters.file_ingest_export import (
+    render_databricks_autoloader_sql,
+    render_snowflake_file_ingest_sql,
+)
 from tick.exporters.gold_sql import (
     render_databricks_gold_hierarchies_sql,
     render_snowflake_gold_hierarchies_sql,
@@ -59,6 +63,7 @@ __all__ = [
     "render_databricks_bundle_yml",
     "render_lakeview_dashboard_json",
     "render_databricks_gold_hierarchies_sql",
+    "render_databricks_autoloader_sql",
     "export_snowflake_bundle",
     "render_snowflake_ddl",
     "render_snowflake_dynamic_tables_sql",
@@ -67,6 +72,7 @@ __all__ = [
     "render_snowflake_project_yml",
     "render_snowflake_streamlit_app",
     "render_snowflake_gold_hierarchies_sql",
+    "render_snowflake_file_ingest_sql",
     "export_contracts_bundle",
     "render_dqx_yaml",
     "render_odcs_yaml",

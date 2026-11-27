@@ -678,3 +678,97 @@ def create_manufacturing_demo_database(
 
     engine.dispose()
     return path
+
+
+def create_files_demo_landing_zone(output_dir: str | Path) -> Path:
+    """Create a realistic multi-format Data Lake / SFTP landing zone (CSV, JSONL, Parquet, Hive partitions)."""
+    import csv
+    import json
+
+    from tick.dialects import _module_installed
+
+    root = Path(output_dir).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(303)
+    now = datetime.now(timezone.utc)
+
+    # 1. Flat CSV: work_orders.csv (with PII/governance & spaces in column names!)
+    wo_csv = root / "work_orders.csv"
+    with wo_csv.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Order #", "plant_code", "material_number", "unit_cost", "operator_email", "status", "updated_at"])
+        for i in range(1, 31):
+            w.writerow([
+                1000 + i,
+                "US01" if i % 2 == 0 else "DE02",
+                f"MAT-{((i - 1) % 10) + 1:05d}",
+                round(rng.uniform(12.5, 420.0), 2),
+                f"operator{i}@acme-factory.com",
+                rng.choice(["OPEN", "RELEASED", "COMPLETED"]),
+                (now - timedelta(hours=i * 3)).isoformat(sep=" ", timespec="seconds"),
+            ])
+
+    # 2. NDJSON / JSONL: historian_tags.jsonl (OT telemetry with numeric OPC quality codes)
+    hist_jsonl = root / "historian_tags.jsonl"
+    base_ts = now - timedelta(hours=2)
+    with hist_jsonl.open("w", encoding="utf-8") as fh:
+        for i in range(60):
+            rec = {
+                "tag_id": f"LINE1.TEMP_{(i % 3) + 1}",
+                "recorded_at": (base_ts + timedelta(seconds=i * 10)).isoformat(sep=" ", timespec="seconds"),
+                "value": round(rng.uniform(70.0, 95.0), 3),
+                "quality_code": 64 if i % 10 == 0 else 192,
+            }
+            fh.write(json.dumps(rec) + "\n")
+
+    # 3. Subdirectory schema `sap/MARA.csv` (SAP legacy dates & commercial cost)
+    sap_dir = root / "sap"
+    sap_dir.mkdir(parents=True, exist_ok=True)
+    with (sap_dir / "MARA.csv").open("w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["MANDT", "MATNR", "MTART", "MEINS", "STPRS", "ERDAT"])
+        for i in range(1, 16):
+            w.writerow(["100", f"MAT-{i:05d}", "FERT" if i <= 4 else "ROH", "EA", round(rng.uniform(5.0, 300.0), 2), 20260100 + i])
+
+    # 4. Parquet BOM + Hive-partitioned Parquet telemetry (when DuckDB is installed)
+    if _module_installed("duckdb"):
+        import duckdb
+
+        con = duckdb.connect(":memory:")
+        try:
+            bom_pq = root / "bill_of_materials.parquet"
+            con.execute(
+                """
+                CREATE TABLE bom_tmp AS
+                SELECT * FROM (VALUES
+                    (1, 'MAT-00001', 'MAT-00005', 2.0, 'US01'),
+                    (2, 'MAT-00001', 'MAT-00006', 4.0, 'US01'),
+                    (3, 'MAT-00005', 'MAT-00011', 3.5, 'US01'),
+                    (4, 'MAT-00002', 'MAT-00005', 1.0, 'DE02'),
+                    (5, 'MAT-00005', 'MAT-00012', 2.5, 'DE02')
+                ) AS t(bom_line_id, parent_part_id, child_part_id, qty_per, plant_id)
+                """
+            )
+            con.execute(f"COPY bom_tmp TO '{str(bom_pq).replace(chr(39), chr(39)*2)}' (FORMAT PARQUET)")
+
+            for plant_val in ("US01", "DE02"):
+                pdir = root / "telemetry" / f"plant={plant_val}"
+                pdir.mkdir(parents=True, exist_ok=True)
+                pfile = pdir / "part-0000.parquet"
+                con.execute(
+                    f"""
+                    COPY (
+                        SELECT
+                            'PRESS-' || ((i % 2) + 1) AS press_id,
+                            TIMESTAMP '2026-11-26 08:00:00' + INTERVAL (i * 15) SECOND AS recorded_at,
+                            70.0 + (i % 15) AS temp_c,
+                            120.0 + (i % 10) AS pressure_bar,
+                            1500 + (i * 5) AS spindle_rpm
+                        FROM range(1, 21) t(i)
+                    ) TO '{str(pfile).replace(chr(39), chr(39)*2)}' (FORMAT PARQUET)
+                    """
+                )
+        finally:
+            con.close()
+
+    return root

@@ -139,6 +139,17 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
 
     if tbl.skipped_profiling_reason:
         lines.append(f"- **Profiling skipped:** {tbl.skipped_profiling_reason}")
+    if tbl.file_source:
+        fs = tbl.file_source
+        hive_str = (
+            f" · Hive partitions: {', '.join(f'`{p}`' for p in fs.partition_columns)}"
+            if (fs.hive_partitioned and fs.partition_columns)
+            else ""
+        )
+        delim_str = f" · delimiter: `{repr(fs.delimiter)}`" if fs.delimiter else ""
+        lines.append(
+            f"- **File Source:** `{fs.file_format.upper()}` ({fs.file_count} file(s), {_fmt_bytes(fs.total_bytes)}{delim_str}{hive_str}) — `{_escape_md(fs.path)}`"
+        )
 
     if tbl.recommendations:
         rec = tbl.recommendations

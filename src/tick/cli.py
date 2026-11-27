@@ -13,7 +13,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from tick import __version__
-from tick.demo import create_demo_database, create_manufacturing_demo_database
+from tick.demo import (
+    create_demo_database,
+    create_files_demo_landing_zone,
+    create_manufacturing_demo_database,
+)
 from tick.dialects import DriverMissingError, get_driver_status
 from tick.diff import diff_snapshots, load_snapshot
 from tick.engine import discover_database
@@ -133,6 +137,8 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
             flags.append("[cyan]OT[/cyan]")
         if t.hierarchy:
             flags.append("[magenta]BOM/TREE[/magenta]")
+        if t.file_source:
+            flags.append(f"[cyan]{t.file_source.file_format.upper()}[/cyan]")
         if dc and dc.requires_column_mapping:
             flags.append("[red]COL_MAP[/red]")
         elif sfc and sfc.requires_quoted_identifiers:
@@ -272,7 +278,7 @@ def _render_harmonization_summary(report: HarmonizationReport) -> None:
 def discover(
     target: str = typer.Argument(
         ...,
-        help="SQLAlchemy URL (postgresql://..., mssql+pyodbc://..., databricks://..., duckdb:///...) or local .duckdb/.sqlite/.db path.",
+        help="SQLAlchemy URL, local .duckdb/.sqlite/.db DB, or flat file/directory/glob (.parquet, .csv, .tsv, .json, .jsonl, Delta).",
     ),
     out_dir: Optional[Path] = typer.Option(
         None,
@@ -537,13 +543,13 @@ def compare_sources(
 def demo(
     output_path: Path = typer.Argument(
         Path("demo_warehouse.duckdb"),
-        help="Path to generate a realistic demo database (.duckdb or .sqlite).",
+        help="Output file path (.duckdb/.sqlite) or directory path (for --domain files).",
     ),
-    domain: Literal["ecommerce", "manufacturing"] = typer.Option(
+    domain: Literal["ecommerce", "manufacturing", "files"] = typer.Option(
         "ecommerce",
         "--domain",
         "-d",
-        help="Demo domain schema: ecommerce | manufacturing (SAP/MES/Historian/BOM).",
+        help="Demo domain: ecommerce | manufacturing (SAP/MES/Historian/BOM) | files (CSV/JSONL/Parquet/Hive landing zone).",
     ),
     plant: str = typer.Option(
         "plant_ohio",
@@ -551,17 +557,20 @@ def demo(
         help="Plant variant when --domain manufacturing (plant_ohio | plant_munich).",
     ),
 ) -> None:
-    """Generate a realistic sample database (DuckDB or SQLite) to test tick discovery."""
+    """Generate a realistic sample database or multi-format file landing zone to test tick discovery."""
     try:
         if domain == "manufacturing":
             created = create_manufacturing_demo_database(output_path, plant_variant=plant)
+        elif domain == "files":
+            created = create_files_demo_landing_zone(output_path)
         else:
             created = create_demo_database(output_path)
     except Exception as exc:
-        console.print(f"[bold red]Failed to create demo database:[/bold red] {escape(str(exc))}")
+        console.print(f"[bold red]Failed to create demo target:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1)
 
-    console.print(f"[bold green]Created {domain} demo database:[/bold green] [cyan]{escape(str(created))}[/cyan]")
+    kind_label = "landing zone directory" if domain == "files" else "demo database"
+    console.print(f"[bold green]Created {domain} {kind_label}:[/bold green] [cyan]{escape(str(created))}[/cyan]")
     console.print(f"Run discovery with:\n  [bold]tick discover {escape(str(created))} -o ./discovery-output[/bold]")
 
 
