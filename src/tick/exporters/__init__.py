@@ -7,6 +7,11 @@ from tick.exporters.databricks_export import (
     render_unity_catalog_ddl,
 )
 from tick.exporters.dbt_export import export_dbt_project, render_dbt_sources_yaml
+from tick.exporters.diff_html_export import export_diff_html, render_diff_html
+from tick.exporters.harmonize_html_export import (
+    export_harmonization_html,
+    render_harmonization_html,
+)
 from tick.exporters.html_export import export_html, render_html_report
 from tick.exporters.json_export import export_diff_json, export_json
 from tick.exporters.markdown_export import (
@@ -31,4 +36,8 @@ __all__ = [
     "render_databricks_sizing_md",
     "export_html",
     "render_html_report",
+    "export_diff_html",
+    "render_diff_html",
+    "export_harmonization_html",
+    "render_harmonization_html",
 ]

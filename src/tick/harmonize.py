@@ -315,8 +315,13 @@ def export_harmonization(
     md_out: str | Path | None = None,
     json_out: str | Path | None = None,
     sql_out: str | Path | None = None,
+    html_out: str | Path | None = None,
 ) -> list[Path]:
     written: list[Path] = []
+    if html_out:
+        from tick.exporters.harmonize_html_export import export_harmonization_html
+
+        written.append(export_harmonization_html(report, html_out))
     if md_out:
         p = Path(md_out)
         p.parent.mkdir(parents=True, exist_ok=True)

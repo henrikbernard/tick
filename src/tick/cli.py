@@ -20,6 +20,7 @@ from tick.engine import discover_database
 from tick.exporters import (
     export_databricks_bundle,
     export_dbt_project,
+    export_diff_html,
     export_diff_json,
     export_diff_markdown,
     export_html,
@@ -375,6 +376,7 @@ def discover(
 def diff(
     before: Path = typer.Argument(..., exists=True, help="Baseline snapshot JSON file."),
     after: Path = typer.Argument(..., exists=True, help="New snapshot JSON file."),
+    html_out: Optional[Path] = typer.Option(None, "--html", help="Write interactive HTML drift report."),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write diff JSON."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write diff Markdown report."),
     fail_on_breaking: bool = typer.Option(
@@ -387,6 +389,9 @@ def diff(
     result = diff_snapshots(before_res, after_res)
     _render_diff_summary(result)
 
+    if html_out:
+        export_diff_html(result, html_out)
+        console.print(f"[green]Diff HTML written to[/green] {escape(str(html_out.resolve()))}")
     if json_out:
         export_diff_json(result, json_out)
         console.print(f"[green]Diff JSON written to[/green] {escape(str(json_out.resolve()))}")
@@ -401,6 +406,7 @@ def diff(
 @app.command(name="compare-sources")
 def compare_sources(
     snapshots: list[Path] = typer.Argument(..., exists=True, help="2 or more plant/site discovery snapshot JSON files."),
+    html_out: Optional[Path] = typer.Option(None, "--html", help="Write interactive multi-plant HTML harmonization dashboard."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write harmonization matrix Markdown report."),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write harmonization report JSON."),
     sql_out: Optional[Path] = typer.Option(None, "--sql", help="Write unified multi-plant Databricks UNION ALL SQL."),
@@ -430,7 +436,9 @@ def compare_sources(
     report = harmonize_snapshots(loaded, catalog=catalog, bronze_schema=bronze_schema)
     _render_harmonization_summary(report)
 
-    written = export_harmonization(report, md_out=md_out, json_out=json_out, sql_out=sql_out)
+    written = export_harmonization(
+        report, html_out=html_out, md_out=md_out, json_out=json_out, sql_out=sql_out
+    )
     if written:
         console.print("\n[bold green]Harmonization artifacts written:[/bold green]")
         for p in written:
