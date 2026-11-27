@@ -388,28 +388,42 @@ def render_lakeflow_pipeline_py(
             or bool(tbl.telemetry_profile)
         )
 
-        # Staging cleaned view (for flat-file / data-lake sources, generate Auto Loader cloudFiles Bronze first!)
+        # Staging cleaned view (for flat-file / data-lake sources, generate Auto Loader / Delta stream Bronze first!)
         stage_fn = f"clean_{safe_tbl}"
         if tbl.file_source is not None:
             fs = tbl.file_source
             bronze_fn = f"bronze_{safe_tbl}"
-            al_fmt = "parquet" if fs.file_format in {"parquet", "delta"} else ("csv" if fs.file_format in {"csv", "tsv"} else "json")
             vol_path = f"/Volumes/{cat}/{bsch}/landing_zone/{safe_tbl}/"
-            lines.append(f"@dlt.table(name={bronze_fn!r}, comment={f'Auto Loader Bronze ingestion ({fs.file_format}) for {tbl.full_name}'!r})")
-            lines.append(f"def {bronze_fn}():")
-            lines.append("    return (")
-            lines.append("        spark.readStream.format('cloudFiles')")
-            lines.append(f"        .option('cloudFiles.format', {al_fmt!r})")
-            if al_fmt in {"csv", "json"}:
-                lines.append("        .option('cloudFiles.inferColumnTypes', 'true')")
-            if al_fmt == "csv":
-                lines.append(f"        .option('header', {'true' if fs.has_header is not False else 'false'!r})")
-                delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
-                lines.append(f"        .option('sep', {delim!r})")
-            elif fs.file_format == "json":
-                lines.append("        .option('multiLine', 'true')")
-            lines.append(f"        .load({vol_path!r})")
-            lines.append("    )")
+            tp_arg = (
+                ", table_properties={'delta.columnMapping.mode': 'name'}"
+                if (dc and dc.requires_column_mapping)
+                else ""
+            )
+            if fs.file_format == "delta":
+                lines.append(
+                    f"@dlt.table(name={bronze_fn!r}, comment={f'Delta Lake Bronze stream for {tbl.full_name}'!r}{tp_arg})"
+                )
+                lines.append(f"def {bronze_fn}():")
+                lines.append(f"    return spark.readStream.format('delta').load({vol_path!r})")
+            else:
+                al_fmt = "parquet" if fs.file_format == "parquet" else ("csv" if fs.file_format in {"csv", "tsv"} else "json")
+                lines.append(
+                    f"@dlt.table(name={bronze_fn!r}, comment={f'Auto Loader Bronze ingestion ({fs.file_format}) for {tbl.full_name}'!r}{tp_arg})"
+                )
+                lines.append(f"def {bronze_fn}():")
+                lines.append("    return (")
+                lines.append("        spark.readStream.format('cloudFiles')")
+                lines.append(f"        .option('cloudFiles.format', {al_fmt!r})")
+                if al_fmt in {"csv", "json"}:
+                    lines.append("        .option('cloudFiles.inferColumnTypes', 'true')")
+                if al_fmt == "csv":
+                    lines.append(f"        .option('header', {'true' if fs.has_header is not False else 'false'!r})")
+                    delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
+                    lines.append(f"        .option('sep', {delim!r})")
+                elif fs.file_format == "json":
+                    lines.append("        .option('multiLine', 'true')")
+                lines.append(f"        .load({vol_path!r})")
+                lines.append("    )")
             lines.append("")
             use_streaming = True
 

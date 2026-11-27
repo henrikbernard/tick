@@ -63,15 +63,23 @@ def discover_database(
 
         # Attach file-source metadata, exact pre-limit row counts, and exact byte sizes
         if mounted_lake is not None:
+            fs_ci = {k.lower(): v for k, v in mounted_lake.file_sources.items()}
+            rc_ci = {k.lower(): v for k, v in mounted_lake.exact_row_counts.items()}
+            sz_ci = {k.lower(): v for k, v in mounted_lake.size_bytes_map.items()}
             for tbl in tables:
-                fs = mounted_lake.file_sources.get(tbl.full_name)
+                fs = mounted_lake.file_sources.get(tbl.full_name) or fs_ci.get(tbl.full_name.lower())
                 if fs is not None:
                     tbl.file_source = fs
                 if tbl.full_name in mounted_lake.exact_row_counts:
                     tbl.row_count = mounted_lake.exact_row_counts[tbl.full_name]
                     tbl.row_count_exact = True
+                elif tbl.full_name.lower() in rc_ci:
+                    tbl.row_count = rc_ci[tbl.full_name.lower()]
+                    tbl.row_count_exact = True
                 if tbl.full_name in mounted_lake.size_bytes_map:
                     tbl.size_bytes = mounted_lake.size_bytes_map[tbl.full_name]
+                elif tbl.full_name.lower() in sz_ci:
+                    tbl.size_bytes = sz_ci[tbl.full_name.lower()]
             # Recompute schema summaries using exact file row counts and file byte sizes
             for sch_sum in schemas:
                 sch_tbls = [t for t in tables if t.schema_name == sch_sum.name and t.table_type == "table"]

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from tick.databricks import deduplicate_table_names
-from tick.models import DiscoveryResult, FileSourceInfo, TableInfo
-from tick.snowflake import deduplicate_snowflake_tables, sanitize_snowflake_identifier
+from tick.models import DiscoveryResult, FileSourceInfo
+from tick.snowflake import (
+    deduplicate_snowflake_columns,
+    deduplicate_snowflake_tables,
+)
 
 
 def _bt(val: str) -> str:
@@ -73,7 +76,7 @@ def render_databricks_autoloader_sql(
             lines.extend(
                 [
                     f"CREATE TABLE IF NOT EXISTS {fqn}",
-                    f"SHALLOW CLONE delta.`{vol_path}`; -- Or replace path with s3:// / abfss:// Delta table root",
+                    f"SHALLOW CLONE delta.{_bt(vol_path)}; -- Or replace path with s3:// / abfss:// Delta table root",
                     "",
                 ]
             )
@@ -103,26 +106,46 @@ def render_databricks_autoloader_sql(
     return "\n".join(lines).rstrip() + "\n"
 
 
+_SF_DELIM_TOKENS: dict[str, str] = {
+    ",": "",
+    ";": "_SEMI",
+    "|": "_PIPE",
+    "\t": "_TAB",
+    ":": "_COLON",
+    " ": "_SPACE",
+}
+
+
+def _sf_delim_suffix(delim: str) -> str:
+    if delim in _SF_DELIM_TOKENS:
+        return _SF_DELIM_TOKENS[delim]
+    return f"_D{ord(delim[0]):X}" if delim else ""
+
+
 def _sf_format_key(fs: FileSourceInfo) -> tuple[str, str]:
     if fs.file_format in {"parquet", "delta"}:
         return "TICK_FMT_PARQUET", "TYPE = 'PARQUET'"
+    comp = "COMPRESSION = 'GZIP'" if fs.compression == "gzip" else "COMPRESSION = 'AUTO'"
+    gz_sfx = "_GZ" if fs.compression == "gzip" else ""
     if fs.file_format == "tsv":
         skip = 1 if fs.has_header is not False else 0
-        comp = "COMPRESSION = 'GZIP'" if fs.compression == "gzip" else "COMPRESSION = 'AUTO'"
-        return "TICK_FMT_TSV", f"TYPE = 'CSV' FIELD_DELIMITER = '\\t' SKIP_HEADER = {skip} FIELD_OPTIONALLY_ENCLOSED_BY = '\"' {comp}"
+        hdr_sfx = "" if skip == 1 else "_NOHDR"
+        return (
+            f"TICK_FMT_TSV{hdr_sfx}{gz_sfx}",
+            f"TYPE = 'CSV' FIELD_DELIMITER = '\\t' SKIP_HEADER = {skip} FIELD_OPTIONALLY_ENCLOSED_BY = '\"' {comp}",
+        )
     if fs.file_format == "csv":
         skip = 1 if fs.has_header is not False else 0
         delim = fs.delimiter or ","
         delim_sql = "\\t" if delim == "\t" else _sq(delim)
-        comp = "COMPRESSION = 'GZIP'" if fs.compression == "gzip" else "COMPRESSION = 'AUTO'"
-        suffix = "" if delim == "," else f"_{sanitize_snowflake_identifier(delim)}"
+        delim_sfx = _sf_delim_suffix(delim)
+        hdr_sfx = "" if skip == 1 else "_NOHDR"
         return (
-            f"TICK_FMT_CSV{suffix}",
+            f"TICK_FMT_CSV{delim_sfx}{hdr_sfx}{gz_sfx}",
             f"TYPE = 'CSV' FIELD_DELIMITER = '{delim_sql}' SKIP_HEADER = {skip} FIELD_OPTIONALLY_ENCLOSED_BY = '\"' {comp}",
         )
     strip = "TRUE" if fs.file_format == "json" else "FALSE"
-    comp = "COMPRESSION = 'GZIP'" if fs.compression == "gzip" else "COMPRESSION = 'AUTO'"
-    fname = "TICK_FMT_JSON_ARRAY" if fs.file_format == "json" else "TICK_FMT_JSONL"
+    fname = f"TICK_FMT_JSON_ARRAY{gz_sfx}" if fs.file_format == "json" else f"TICK_FMT_JSONL{gz_sfx}"
     return fname, f"TYPE = 'JSON' STRIP_OUTER_ARRAY = {strip} {comp}"
 
 
@@ -184,22 +207,34 @@ def render_snowflake_file_ingest_sql(
         pipe_fqn = f"{_dq(db)}.{_dq(sch)}.{_dq(f'PIPE_{safe_tbl}')}"
         stage_subpath = f"@{stage_fqn}/{safe_tbl.lower()}/"
 
-        match_clause = (
-            "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\n"
-            if fs.file_format in {"parquet", "delta", "json", "jsonl"}
-            else ""
-        )
+        use_match_by_name = fs.file_format in {"parquet", "delta", "json", "jsonl"}
+        match_clause = "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE\n" if use_match_by_name else ""
+
+        # Bronze tables include trailing _INGESTED_AT / _SOURCE_SYSTEM audit columns, so positional
+        # CSV/TSV COPY INTO must specify explicit target columns (excluding synthetic Hive partitions).
+        copy_target = fqn
+        if not use_match_by_name and tbl.columns:
+            col_map = deduplicate_snowflake_columns([c.name for c in tbl.columns])
+            part_set = {p.lower() for p in fs.partition_columns} if fs.hive_partitioned else set()
+            data_cols = [
+                _dq(col_map[c.name])
+                for c in tbl.columns
+                if c.name.lower() not in part_set
+            ]
+            if data_cols:
+                copy_target = f"{fqn} ({', '.join(data_cols)})"
+
         lines.extend(
             [
                 f"-- Source: {fs.path} ({fs.file_format.upper()}, {fs.file_count} file(s), {fs.total_bytes:,} bytes)",
-                f"COPY INTO {fqn}",
+                f"COPY INTO {copy_target}",
                 f"FROM {stage_subpath}",
                 f"FILE_FORMAT = (FORMAT_NAME = {fmt_fqn})",
                 f"{match_clause}ON_ERROR = 'CONTINUE';",
                 "",
                 f"-- Optional continuous Snowpipe (requires cloud event notification on external stage):",
                 f"-- CREATE PIPE IF NOT EXISTS {pipe_fqn} AUTO_INGEST = TRUE AS",
-                f"-- COPY INTO {fqn}",
+                f"-- COPY INTO {copy_target}",
                 f"-- FROM {stage_subpath}",
                 f"-- FILE_FORMAT = (FORMAT_NAME = {fmt_fqn})",
                 f"-- {'MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE ' if match_clause else ''}ON_ERROR = 'CONTINUE';",

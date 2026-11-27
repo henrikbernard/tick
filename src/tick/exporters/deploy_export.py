@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from tick.databricks import deduplicate_column_names, deduplicate_table_names, sanitize_delta_column_name
+from tick.exporters.file_ingest_export import has_file_sources
 from tick.exporters.gold_sql import _find_quantity_column, get_hierarchy_tables
 from tick.models import DiscoveryResult, TableInfo
 from tick.snowflake import deduplicate_snowflake_columns, deduplicate_snowflake_tables, sanitize_snowflake_identifier
@@ -453,9 +454,15 @@ def render_snowflake_project_yml(
 
     sql_scripts = [
         "snowflake_ddl.sql",
-        "snowflake_dynamic_tables.sql",
-        "snowflake_dmf.sql",
     ]
+    if has_file_sources(result):
+        sql_scripts.append("snowflake_file_ingest.sql")
+    sql_scripts.extend(
+        [
+            "snowflake_dynamic_tables.sql",
+            "snowflake_dmf.sql",
+        ]
+    )
     if has_hier:
         sql_scripts.append("snowflake_gold_hierarchies.sql")
 

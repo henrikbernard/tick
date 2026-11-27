@@ -541,9 +541,9 @@ def compare_sources(
 
 @app.command()
 def demo(
-    output_path: Path = typer.Argument(
-        Path("demo_warehouse.duckdb"),
-        help="Output file path (.duckdb/.sqlite) or directory path (for --domain files).",
+    output_path: Optional[Path] = typer.Argument(
+        None,
+        help="Output file path (.duckdb/.sqlite) or directory path (default: demo_files_landing for --domain files, demo_warehouse.duckdb otherwise).",
     ),
     domain: Literal["ecommerce", "manufacturing", "files"] = typer.Option(
         "ecommerce",
@@ -558,13 +558,16 @@ def demo(
     ),
 ) -> None:
     """Generate a realistic sample database or multi-format file landing zone to test tick discovery."""
+    resolved_out = output_path or (
+        Path("demo_files_landing") if domain == "files" else Path("demo_warehouse.duckdb")
+    )
     try:
         if domain == "manufacturing":
-            created = create_manufacturing_demo_database(output_path, plant_variant=plant)
+            created = create_manufacturing_demo_database(resolved_out, plant_variant=plant)
         elif domain == "files":
-            created = create_files_demo_landing_zone(output_path)
+            created = create_files_demo_landing_zone(resolved_out)
         else:
-            created = create_demo_database(output_path)
+            created = create_demo_database(resolved_out)
     except Exception as exc:
         console.print(f"[bold red]Failed to create demo target:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=1)

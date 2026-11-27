@@ -5,11 +5,13 @@ from __future__ import annotations
 import csv
 import glob
 import gzip
+import io
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -41,6 +43,9 @@ _SHARD_NAME_RE = re.compile(r"^(?:part[-_]\d+|data[-_]\d+|\d{4,}|.+[-_]\d{3,})$"
 _IGNORED_FILENAMES = {".ds_store", "_success", "_committed", "_started"}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_HEADER_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_ \-\/#\.%()]{0,63}$")
 
 
 def _detect_file_format(path: Path) -> tuple[FileFormat, str | None] | None:
@@ -90,12 +95,74 @@ def is_file_lake_target(target: str) -> bool:
     return False
 
 
+def _is_scalar_data_literal(val: str) -> bool:
+    s = val.strip()
+    if not s:
+        return False
+    if s.lower() in {"true", "false", "null", "none", "nan"}:
+        return True
+    if _DATE_RE.match(s) or _TS_RE.match(s) or _UUID_RE.match(s) or _EMAIL_RE.match(s):
+        return True
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_csv_has_header(sample: str, delim: str) -> bool:
+    """Reliably determine whether row 0 is a header row (avoids csv.Sniffer false-negatives on short/all-string CSVs)."""
+    rows: list[list[str]] = []
+    try:
+        for row in csv.reader(io.StringIO(sample), delimiter=delim):
+            if any(c.strip() for c in row):
+                rows.append([c.strip() for c in row])
+            if len(rows) >= 10:
+                break
+    except csv.Error:
+        return True
+
+    if not rows:
+        return True
+
+    r0 = rows[0]
+    non_empty_r0 = [c for c in r0 if c]
+    if not non_empty_r0:
+        return True
+
+    # Header rows never contain raw numeric literals, ISO dates/timestamps, UUIDs, emails, or booleans
+    if any(_is_scalar_data_literal(c) for c in non_empty_r0):
+        return False
+
+    if len(rows) == 1:
+        return True
+
+    # Strong positive signal: any column has string in row 0 and numeric/date/bool literal in data rows
+    data_rows = rows[1:]
+    for col_idx in range(len(r0)):
+        if any(
+            col_idx < len(r) and _is_scalar_data_literal(r[col_idx])
+            for r in data_rows
+        ):
+            return True
+
+    try:
+        if csv.Sniffer().has_header(sample):
+            return True
+    except csv.Error:
+        pass
+
+    # All-string / single-column fallback where Python's csv.Sniffer often misfires:
+    # treat row 0 as a header when all non-empty cells look like clean identifier/header labels.
+    return all(_HEADER_IDENT_RE.match(c) for c in non_empty_r0)
+
+
 def _sniff_csv_props(path: Path, is_tsv: bool, compression: str | None) -> tuple[str, bool]:
     """Inspect the first 8 KB of a CSV/TSV file to detect delimiter and header row."""
     default_delim = "\t" if is_tsv else ","
     try:
         opener = gzip.open if compression == "gzip" else open
-        with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        with opener(path, "rt", encoding="utf-8-sig", errors="replace") as fh:
             sample = fh.read(8192)
         if not sample.strip():
             return default_delim, True
@@ -106,11 +173,7 @@ def _sniff_csv_props(path: Path, is_tsv: bool, compression: str | None) -> tuple
                 delim = dialect.delimiter
             except csv.Error:
                 delim = ","
-        has_header = True
-        try:
-            has_header = csv.Sniffer().has_header(sample)
-        except csv.Error:
-            has_header = True
+        has_header = _detect_csv_has_header(sample, delim)
         return delim, has_header
     except Exception:
         return default_delim, True
@@ -122,7 +185,7 @@ def _detect_json_lines(path: Path, compression: str | None, fallback_fmt: FileFo
         return "jsonl"
     try:
         opener = gzip.open if compression == "gzip" else open
-        with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        with opener(path, "rt", encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
                 s = line.strip()
                 if not s:
@@ -176,6 +239,59 @@ def _list_data_files(directory: Path, *, ignore_delta_log: bool = True) -> list[
         if fmt_info is not None:
             found.append((child, fmt_info[0], fmt_info[1]))
     return found
+
+
+def _resolve_active_delta_parquet_files(delta_dir: Path) -> list[Path]:
+    """Resolve active Parquet data files for a Delta Lake table by replaying _delta_log JSON commits."""
+    fallback_files = [p for p, fmt, _ in _list_data_files(delta_dir, ignore_delta_log=True) if fmt == "parquet"]
+    log_dir = delta_dir / "_delta_log"
+    if not log_dir.is_dir():
+        return fallback_files
+
+    # If binary/parquet checkpoints exist, fall back to listing parquet files so checkpointed adds are not missed
+    if any(".checkpoint." in p.name for p in log_dir.iterdir() if p.is_file()):
+        return fallback_files
+
+    commit_files = sorted(p for p in log_dir.iterdir() if p.is_file() and p.suffix.lower() == ".json")
+    if not commit_files:
+        return fallback_files
+
+    root_resolved = delta_dir.resolve()
+    active: dict[str, Path] = {}
+    saw_file_action = False
+    try:
+        for cf in commit_files:
+            with cf.open("rt", encoding="utf-8-sig", errors="replace") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    obj = json.loads(s)
+                    if not isinstance(obj, dict):
+                        continue
+                    add_act = obj.get("add")
+                    rem_act = obj.get("remove")
+                    if isinstance(add_act, dict) and add_act.get("path"):
+                        raw_rel = str(add_act["path"])
+                        rel = unquote(raw_rel)
+                        saw_file_action = True
+                        cand = (root_resolved / rel).resolve()
+                        if not cand.is_file():
+                            cand = (root_resolved / raw_rel).resolve()
+                        if cand.is_relative_to(root_resolved):
+                            active[rel] = cand
+                    elif isinstance(rem_act, dict) and rem_act.get("path"):
+                        raw_rel = str(rem_act["path"])
+                        rel = unquote(raw_rel)
+                        saw_file_action = True
+                        active.pop(rel, None)
+                        active.pop(raw_rel, None)
+    except Exception:
+        return fallback_files
+
+    if not saw_file_action:
+        return fallback_files
+    return [p for p in active.values() if p.is_file()]
 
 
 def _extract_hive_partition_cols(root: Path, files: list[Path]) -> list[str]:
@@ -283,15 +399,18 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
             raise FileNotFoundError(f"No supported data files (.parquet, .csv, .tsv, .json, .jsonl) matched '{target}'.")
 
         base_dir = Path(expanded).parent
+        while _has_glob_magic(str(base_dir)) and base_dir != base_dir.parent:
+            base_dir = base_dir.parent
         db_name = _sanitize_sql_ident(base_dir.name or "file_glob", fallback="file_glob")
-        if _looks_like_sharded_table(valid):
-            files = [p for p, _, _ in valid]
+        all_files = [p for p, _, _ in valid]
+        part_cols = _extract_hive_partition_cols(base_dir.resolve(), all_files) if base_dir.exists() else []
+        single_format = len({fmt for _, fmt, _ in valid}) == 1
+        if _looks_like_sharded_table(valid) or (bool(part_cols) and single_format):
             fmt, comp = valid[0][1], valid[0][2]
-            part_cols = _extract_hive_partition_cols(base_dir.resolve(), files) if base_dir.exists() else []
             ds = _build_dataset(
                 "files",
                 db_name,
-                files,
+                all_files,
                 fmt,
                 comp,
                 display_path=str(Path(expanded)),
@@ -325,9 +444,9 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
     # 3. Directory (could be a single Delta/Hive/sharded table OR a landing zone with files + schema dirs)
     db_name = path.name or "landing_zone"
     if (path / "_delta_log").is_dir():
-        parquet_files = [p for p, fmt, _ in _list_data_files(path, ignore_delta_log=True) if fmt == "parquet"]
+        parquet_files = _resolve_active_delta_parquet_files(path)
         if not parquet_files:
-            raise FileNotFoundError(f"Delta directory '{path}' contains no readable Parquet data files.")
+            raise FileNotFoundError(f"Delta directory '{path}' contains no active readable Parquet data files.")
         part_cols = _extract_hive_partition_cols(path, parquet_files)
         ds = _build_dataset(
             "files",
@@ -389,7 +508,7 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
     # Subdirectories -> either Delta table, Hive-partitioned table, sharded table, or schema folder
     for subdir in direct_subdirs:
         if (subdir / "_delta_log").is_dir():
-            pfiles = [p for p, fmt, _ in _list_data_files(subdir, ignore_delta_log=True) if fmt == "parquet"]
+            pfiles = _resolve_active_delta_parquet_files(subdir)
             if pfiles:
                 part_cols = _extract_hive_partition_cols(subdir, pfiles)
                 datasets.append(
@@ -435,12 +554,12 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
             fmt, comp = sub_all[0][1], sub_all[0][2]
             datasets.append(_build_dataset("files", subdir.name, files, fmt, comp, display_path=str(subdir)))
         else:
-            # Identify nested Delta / Hive subdirs so we don't also emit their inner shard files
+            # Identify nested Delta / Hive / sharded subdirs so we don't also emit their inner shard files
             nested_special_dirs: set[Path] = set()
             for nested in sorted(sub_children_dirs):
                 if (nested / "_delta_log").is_dir():
                     nested_special_dirs.add(nested)
-                    pfiles = [p for p, fmt, _ in _list_data_files(nested, ignore_delta_log=True) if fmt == "parquet"]
+                    pfiles = _resolve_active_delta_parquet_files(nested)
                     if pfiles:
                         pcols = _extract_hive_partition_cols(nested, pfiles)
                         datasets.append(
@@ -473,6 +592,20 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
                                     display_path=str(nested),
                                     hive_partitioned=True,
                                     partition_columns=pcols,
+                                )
+                            )
+                    elif not ndirs:
+                        nfiles_all = _list_data_files(nested, ignore_delta_log=True)
+                        if _looks_like_sharded_table(nfiles_all):
+                            nested_special_dirs.add(nested)
+                            datasets.append(
+                                _build_dataset(
+                                    subdir.name,
+                                    nested.name,
+                                    [p for p, _, _ in nfiles_all],
+                                    nfiles_all[0][1],
+                                    nfiles_all[0][2],
+                                    display_path=str(nested),
                                 )
                             )
 
@@ -528,6 +661,24 @@ def _duckdb_read_expr(ds: DiscoveredFileDataset) -> str:
     return f"read_json_auto({paths_sql}, {', '.join(opts)})"
 
 
+def _is_effectively_empty_text_dataset(ds: DiscoveredFileDataset) -> bool:
+    fs = ds.file_source
+    if fs.total_bytes == 0:
+        return True
+    if fs.file_format in {"csv", "tsv", "json", "jsonl"}:
+        if fs.compression == "gzip" or fs.total_bytes < 64:
+            opener = gzip.open if fs.compression == "gzip" else open
+            for p in ds.source_paths:
+                try:
+                    with opener(p, "rt", encoding="utf-8-sig", errors="replace") as fh:
+                        if fh.read(64).strip():
+                            return False
+                except Exception:
+                    return False
+            return True
+    return False
+
+
 def _mount_via_duckdb(
     db_name: str,
     resolved_url: str,
@@ -549,20 +700,24 @@ def _mount_via_duckdb(
             sch_q = '"' + ds.schema_name.replace('"', '""') + '"'
             tbl_q = '"' + ds.table_name.replace('"', '""') + '"'
             conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {sch_q}"))
-            read_expr = _duckdb_read_expr(ds)
 
-            try:
-                exact_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {read_expr}")).scalar() or 0)
-            except Exception:
-                # Retry CSV with ignore_errors=true if dirty rows exist
-                if ds.file_source.file_format in {"csv", "tsv"}:
-                    read_expr = read_expr.replace("ignore_errors = false", "ignore_errors = true")
+            if _is_effectively_empty_text_dataset(ds):
+                conn.execute(text(f'CREATE TABLE {sch_q}.{tbl_q} ("value" VARCHAR)'))
+                exact_rows = 0
+            else:
+                read_expr = _duckdb_read_expr(ds)
+                try:
                     exact_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {read_expr}")).scalar() or 0)
-                else:
-                    raise
+                except Exception:
+                    # Retry CSV with ignore_errors=true if dirty rows exist
+                    if ds.file_source.file_format in {"csv", "tsv"}:
+                        read_expr = read_expr.replace("ignore_errors = false", "ignore_errors = true")
+                        exact_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {read_expr}")).scalar() or 0)
+                    else:
+                        raise
 
-            limit_clause = f" LIMIT {max_materialize}" if exact_rows > max_materialize else ""
-            conn.execute(text(f"CREATE TABLE {sch_q}.{tbl_q} AS SELECT * FROM {read_expr}{limit_clause}"))
+                limit_clause = f" LIMIT {max_materialize}" if exact_rows > max_materialize else ""
+                conn.execute(text(f"CREATE TABLE {sch_q}.{tbl_q} AS SELECT * FROM {read_expr}{limit_clause}"))
 
             full_name = f"{ds.schema_name}.{ds.table_name}"
             mounted.file_sources[full_name] = ds.file_source
@@ -609,12 +764,38 @@ def _infer_sqlite_type(values: list[Any]) -> str:
     return "VARCHAR"
 
 
+def _dedupe_header_names(raw_headers: list[str]) -> list[str]:
+    """Deduplicate CSV headers case-insensitively so SQLite CREATE TABLE and dicts never collide."""
+    seen_lower: set[str] = set()
+    result: list[str] = []
+    for i, raw in enumerate(raw_headers):
+        base = raw.strip() or f"column{i}"
+        cand = base
+        suffix = 2
+        while cand.lower() in seen_lower:
+            cand = f"{base}_{suffix}"
+            suffix += 1
+        seen_lower.add(cand.lower())
+        result.append(cand)
+    return result
+
+
 def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[str], list[dict[str, Any]], int]:
     """Pure-Python CSV/TSV/JSON/JSONL reader for zero-dependency SQLite fallback."""
     fs = ds.file_source
     rows: list[dict[str, Any]] = []
     columns: list[str] = []
+    col_canon_by_lower: dict[str, str] = {}
     total_rows = 0
+
+    def _register_col(name: str) -> str:
+        low = name.lower()
+        existing = col_canon_by_lower.get(low)
+        if existing is not None:
+            return existing
+        col_canon_by_lower[low] = name
+        columns.append(name)
+        return name
 
     for fpath in ds.source_paths:
         # Extract Hive partition key=val pairs from parent directories when hive_partitioned
@@ -623,35 +804,27 @@ def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[st
             for part in fpath.parts[:-1]:
                 m = _HIVE_PART_RE.match(part)
                 if m and (not fs.partition_columns or m.group(1) in fs.partition_columns):
-                    part_vals[m.group(1)] = m.group(2)
-            for pk in part_vals:
-                if pk not in columns:
-                    columns.append(pk)
+                    canon_pk = _register_col(m.group(1))
+                    part_vals[canon_pk] = m.group(2)
 
         opener = gzip.open if fs.compression == "gzip" else open
         if fs.file_format in {"csv", "tsv"}:
             delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
-            with opener(fpath, "rt", encoding="utf-8", errors="replace", newline="") as fh:
+            with opener(fpath, "rt", encoding="utf-8-sig", errors="replace", newline="") as fh:
                 reader = csv.reader(fh, delimiter=delim)
                 header = next(reader, None)
                 if header is None:
                     continue
                 if fs.has_header is False:
-                    col_names = [f"column{i}" for i in range(len(header))]
+                    col_names = [_register_col(f"column{i}") for i in range(len(header))]
                     first_row = header
-                    for c in col_names:
-                        if c not in columns:
-                            columns.append(c)
                     total_rows += 1
                     if len(rows) < max_rows:
                         row_dict = {col_names[i]: (first_row[i] if i < len(first_row) else None) for i in range(len(col_names))}
                         row_dict.update(part_vals)
                         rows.append(row_dict)
                 else:
-                    col_names = [h.strip() or f"column{i}" for i, h in enumerate(header)]
-                    for c in col_names:
-                        if c not in columns:
-                            columns.append(c)
+                    col_names = [_register_col(c) for c in _dedupe_header_names(header)]
                 for rec in reader:
                     if not rec:
                         continue
@@ -661,10 +834,14 @@ def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[st
                         row_dict.update(part_vals)
                         rows.append(row_dict)
         else:
-            with opener(fpath, "rt", encoding="utf-8", errors="replace") as fh:
+            with opener(fpath, "rt", encoding="utf-8-sig", errors="replace") as fh:
                 if fs.file_format == "json":
-                    data = json.load(fh)
-                    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+                    raw_text = fh.read().strip()
+                    if not raw_text:
+                        items = []
+                    else:
+                        data = json.loads(raw_text)
+                        items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
                 else:
                     items = []
                     for line in fh:
@@ -675,12 +852,10 @@ def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[st
                     if not isinstance(obj, dict):
                         continue
                     total_rows += 1
-                    for k in obj:
-                        if str(k) not in columns:
-                            columns.append(str(k))
+                    canon_map = {str(k): _register_col(str(k)) for k in obj}
                     if len(rows) < max_rows:
                         row_dict = {
-                            str(k): (json.dumps(v) if isinstance(v, (dict, list)) else v)
+                            canon_map[str(k)]: (json.dumps(v) if isinstance(v, (dict, list)) else v)
                             for k, v in obj.items()
                         }
                         row_dict.update(part_vals)
