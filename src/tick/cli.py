@@ -18,6 +18,7 @@ from tick.dialects import DriverMissingError, get_driver_status
 from tick.diff import diff_snapshots, load_snapshot
 from tick.engine import discover_database
 from tick.exporters import (
+    export_contracts_bundle,
     export_databricks_bundle,
     export_dbt_project,
     export_diff_html,
@@ -254,10 +255,16 @@ def discover(
     databricks_dir: Optional[Path] = typer.Option(
         None, "--databricks-dir", help="Write Unity Catalog DDL, Lakeflow DLT pipeline, and sizing guide."
     ),
+    contracts_dir: Optional[Path] = typer.Option(
+        None, "--contracts-dir", help="Write Databricks DQX quality YAML and ODCS v3.0.0 data contract YAML."
+    ),
     databricks_catalog: str = typer.Option("manufacturing", "--databricks-catalog", help="Target Unity Catalog name."),
     databricks_schema: str = typer.Option("bronze", "--databricks-schema", help="Target Unity Catalog bronze schema."),
     profile: ProfileMode = typer.Option("full", "--profile", "-p", help="Profiling depth: none | fast | full."),
     sample_size: int = typer.Option(5000, "--sample-size", help="Max rows sampled per table for profiling."),
+    workers: int = typer.Option(
+        1, "--workers", "-w", min=1, max=32, help="Parallel profiling worker threads (bounded for large ERP databases)."
+    ),
     include_schema: list[str] = typer.Option([], "--include-schema", help="Include schema glob(s) (repeatable)."),
     exclude_schema: list[str] = typer.Option([], "--exclude-schema", help="Exclude schema glob(s) (repeatable)."),
     include_table: list[str] = typer.Option([], "--include-table", help="Include table glob(s) (repeatable)."),
@@ -314,6 +321,7 @@ def discover(
         skip_empty_tables=skip_empty_tables,
         skip_tables_over_mb=skip_tables_over_mb,
         use_tablesample=use_tablesample,
+        workers=workers,
         glossary_path=str(glossary) if glossary else None,
         detect_manufacturing=not no_manufacturing,
         detect_databricks_compat=not no_databricks_compat,
@@ -352,6 +360,8 @@ def discover(
         written.append((f"dbt scaffolding ({len(dbt_files)} files)", out_dir / "dbt"))
         dbx_files = export_databricks_bundle(result, out_dir / "databricks")
         written.append((f"Databricks bundle ({len(dbx_files)} files)", out_dir / "databricks"))
+        contract_files = export_contracts_bundle(result, out_dir / "contracts")
+        written.append((f"Data contracts ({len(contract_files)} files)", out_dir / "contracts"))
 
     if html_out is not None:
         written.append(("HTML report", export_html(result, html_out)))
@@ -365,6 +375,9 @@ def discover(
     if databricks_dir is not None:
         dbx_files = export_databricks_bundle(result, databricks_dir)
         written.append((f"Databricks bundle ({len(dbx_files)} files)", databricks_dir))
+    if contracts_dir is not None:
+        contract_files = export_contracts_bundle(result, contracts_dir)
+        written.append((f"Data contracts ({len(contract_files)} files)", contracts_dir))
 
     if written and not quiet:
         console.print("\n[bold green]Artifacts written:[/bold green]")

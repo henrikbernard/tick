@@ -34,7 +34,7 @@ def discover_database(
             progress_cb(msg)
 
     _emit("Connecting to database...")
-    engine, resolved_url = create_db_engine(target, read_only=True)
+    engine, resolved_url = create_db_engine(target, read_only=True, workers=cfg.workers)
     adapter = get_dialect_adapter(engine.dialect.name)
 
     try:
@@ -61,7 +61,7 @@ def discover_database(
             )
 
         _emit(
-            f"Profiling {len(tables)} object(s) (mode={cfg.profile_mode}, sample={cfg.sample_size})..."
+            f"Profiling {len(tables)} object(s) (mode={cfg.profile_mode}, sample={cfg.sample_size}, workers={cfg.workers})..."
         )
         artifacts = profile_tables(engine, adapter, tables, default_schema, cfg)
 

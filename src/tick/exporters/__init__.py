@@ -1,5 +1,10 @@
 """Export modules for JSON, Markdown, dbt scaffolding, Databricks Lakeflow/UC, and HTML reports."""
 
+from tick.exporters.contracts_export import (
+    export_contracts_bundle,
+    render_dqx_yaml,
+    render_odcs_yaml,
+)
 from tick.exporters.databricks_export import (
     export_databricks_bundle,
     render_databricks_sizing_md,
@@ -34,6 +39,9 @@ __all__ = [
     "render_unity_catalog_ddl",
     "render_lakeflow_pipeline_py",
     "render_databricks_sizing_md",
+    "export_contracts_bundle",
+    "render_dqx_yaml",
+    "render_odcs_yaml",
     "export_html",
     "render_html_report",
     "export_diff_html",

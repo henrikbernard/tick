@@ -207,18 +207,24 @@ def sanitize_url(url: str) -> str:
         return _ODBC_SECRET_RE.sub(r"\1***", masked)
 
 
-def create_db_engine(target: str, read_only: bool = True) -> tuple[Engine, str]:
+def create_db_engine(
+    target: str, read_only: bool = True, workers: int = 1
+) -> tuple[Engine, str]:
     """Create a SQLAlchemy engine from a URL or file path, returning (engine, resolved_url)."""
     resolved = resolve_connection_url(target)
     url_obj = make_url(resolved)
     backend = url_obj.get_backend_name()
 
     connect_args: dict[str, Any] = {}
+    engine_kwargs: dict[str, Any] = {"future": True}
     if backend == "duckdb" and read_only and url_obj.database and url_obj.database != ":memory:":
         connect_args["read_only"] = True
+    if workers > 5 and backend not in {"sqlite", "duckdb"}:
+        engine_kwargs["pool_size"] = min(workers, 32)
+        engine_kwargs["max_overflow"] = min(workers, 16)
 
     try:
-        engine = create_engine(resolved, connect_args=connect_args, future=True)
+        engine = create_engine(resolved, connect_args=connect_args, **engine_kwargs)
         return engine, resolved
     except ModuleNotFoundError as exc:
         _, hint = DRIVER_INSTALL_HINTS.get(

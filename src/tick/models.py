@@ -338,6 +338,7 @@ class DiscoveryConfig(BaseModel):
     skip_empty_tables: bool = False
     skip_tables_over_mb: float | None = None
     use_tablesample: bool = False
+    workers: int = Field(default=1, ge=1, le=32)
     # Manufacturing & Databricks extensions
     detect_manufacturing: bool = True
     detect_databricks_compat: bool = True

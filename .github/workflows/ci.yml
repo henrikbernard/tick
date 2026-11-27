@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: pytest -v
+
+      - name: CLI end-to-end smoke test
+        run: |
+          mkdir -p /tmp/tick-ci
+          tick drivers
+          tick demo /tmp/tick-ci/ohio.duckdb --domain manufacturing --plant plant_ohio
+          tick demo /tmp/tick-ci/munich.duckdb --domain manufacturing --plant plant_munich
+          tick discover /tmp/tick-ci/ohio.duckdb -o /tmp/tick-ci/ohio_out --workers 4 --skip-empty-tables --quiet
+          tick discover /tmp/tick-ci/munich.duckdb -o /tmp/tick-ci/munich_out --workers 4 --quiet
+          tick compare-sources /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \
+            --html /tmp/tick-ci/harmonization.html \
+            --md /tmp/tick-ci/harmonization.md \
+            --sql /tmp/tick-ci/unified.sql
+          tick diff /tmp/tick-ci/ohio_out/snapshot.json /tmp/tick-ci/munich_out/snapshot.json \
+            --html /tmp/tick-ci/diff.html \
+            --md /tmp/tick-ci/diff.md
+
+  dashboard-js-check:
+    name: Validate Dashboard JS Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Extract and syntax-check embedded dashboard scripts
+        run: |
+          python - <<'PY'
+          import pathlib, re
+          from tick.exporters.html_export import HTML_TEMPLATE
+          from tick.exporters.harmonize_html_export import HARMONIZE_HTML_TEMPLATE
+          from tick.exporters.diff_html_export import DIFF_HTML_TEMPLATE
+
+          out = pathlib.Path("/tmp/tick_js_check")
+          out.mkdir(exist_ok=True)
+          for name, tpl in [
+              ("discovery.js", HTML_TEMPLATE),
+              ("harmonize.js", HARMONIZE_HTML_TEMPLATE),
+              ("diff.js", DIFF_HTML_TEMPLATE),
+          ]:
+              scripts = re.findall(r"<script>(.*?)</script>", tpl, flags=re.DOTALL)
+              assert len(scripts) == 1, f"{name}: expected 1 script block"
+              (out / name).write_text(scripts[0], encoding="utf-8")
+          PY
+          node --check /tmp/tick_js_check/discovery.js
+          node --check /tmp/tick_js_check/harmonize.js
+          node --check /tmp/tick_js_check/diff.js
