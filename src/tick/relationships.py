@@ -115,6 +115,7 @@ def discover_relationships(
     lineage_edges: list[LineageEdge] = []
 
     table_by_full = {t.full_name: t for t in tables}
+    table_by_full_lower = {t.full_name.lower(): t.full_name for t in tables}
     table_by_name: dict[str, list[TableInfo]] = {}
     for t in tables:
         table_by_name.setdefault(t.name.lower(), []).append(t)
@@ -127,9 +128,13 @@ def discover_relationships(
             ref_schema = fk.referred_schema or tbl.schema_name
             target_full = f"{ref_schema}.{fk.referred_table}"
             if target_full not in table_by_full:
-                candidates = table_by_name.get(fk.referred_table.lower(), [])
-                if len(candidates) == 1:
-                    target_full = candidates[0].full_name
+                ci_match = table_by_full_lower.get(target_full.lower())
+                if ci_match:
+                    target_full = ci_match
+                else:
+                    candidates = table_by_name.get(fk.referred_table.lower(), [])
+                    if len(candidates) == 1:
+                        target_full = candidates[0].full_name
 
             for src_col, tgt_col in zip(fk.constrained_columns, fk.referred_columns):
                 pair = (tbl.full_name, src_col, target_full, tgt_col)
@@ -340,16 +345,15 @@ def discover_view_lineage(
         for ref_schema, ref_name in sorted(raw_refs):
             target: str | None = None
             if ref_schema:
+                # Explicitly schema-qualified references must only resolve within that schema
                 target = full_lookup.get(f"{ref_schema}.{ref_name}")
-            if target is None:
+            else:
                 same_schema_key = f"{tbl.schema_name.lower()}.{ref_name}"
                 if same_schema_key in full_lookup:
                     target = full_lookup[same_schema_key]
                 else:
                     matches = name_lookup.get(ref_name, [])
                     if len(matches) == 1:
-                        target = matches[0]
-                    elif matches:
                         target = matches[0]
             if target is None:
                 target = f"{ref_schema}.{ref_name}" if ref_schema else ref_name

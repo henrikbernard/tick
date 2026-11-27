@@ -89,6 +89,7 @@ def render_databricks_gold_hierarchies_sql(
         qty_col = col_map[qty_col_obj.name] if qty_col_obj else None
         plant_col = col_map[plant_col_obj.name] if plant_col_obj else None
 
+        safe_max_depth = max(1, int(max_depth))
         silver_fqn = f"{_bt(cat)}.{_bt(silver_schema)}.{_bt(f'silver_{safe_tbl}')}"
         gold_fqn = f"{_bt(cat)}.{_bt(gold_schema)}.{_bt(f'gold_{safe_tbl}_exploded')}"
 
@@ -112,13 +113,13 @@ def render_databricks_gold_hierarchies_sql(
                 "AS",
                 "WITH RECURSIVE hierarchy_edges AS (",
                 "  SELECT",
-                f"{plant_sel_e}    e.{_bt(parent_col)} AS `root_node_id`,",
+                f"{plant_sel_e}    COALESCE(e.{_bt(parent_col)}, e.{_bt(child_col)}) AS `root_node_id`,",
                 f"    e.{_bt(parent_col)} AS `parent_node_id`,",
                 f"    e.{_bt(child_col)} AS `child_node_id`,",
                 f"{qty_root_sel}    1 AS `depth`,",
-                f"    ARRAY(CAST(e.{_bt(parent_col)} AS STRING), CAST(e.{_bt(child_col)} AS STRING)) AS `path_nodes`",
+                f"    CASE WHEN e.{_bt(parent_col)} IS NULL THEN ARRAY(CAST(e.{_bt(child_col)} AS STRING)) ELSE ARRAY(CAST(e.{_bt(parent_col)} AS STRING), CAST(e.{_bt(child_col)} AS STRING)) END AS `path_nodes`",
                 f"  FROM {silver_fqn} AS e",
-                "  WHERE NOT EXISTS (",
+                f"  WHERE e.{_bt(parent_col)} IS NULL OR NOT EXISTS (",
                 f"    SELECT 1 FROM {silver_fqn} AS c",
                 f"    WHERE c.{_bt(child_col)} = e.{_bt(parent_col)}{plant_anti_join}",
                 "  )",
@@ -132,7 +133,8 @@ def render_databricks_gold_hierarchies_sql(
                 "  FROM hierarchy_edges AS r",
                 f"  JOIN {silver_fqn} AS e",
                 f"    ON e.{_bt(parent_col)} = r.`child_node_id`{plant_rec_join}",
-                f"  WHERE r.`depth` < {int(max_depth)}",
+                f"  WHERE e.{_bt(parent_col)} IS NOT NULL",
+                f"    AND r.`depth` < {safe_max_depth}",
                 f"    AND NOT ARRAY_CONTAINS(r.`path_nodes`, CAST(e.{_bt(child_col)} AS STRING))",
                 ")",
                 "SELECT",
@@ -188,6 +190,7 @@ def render_snowflake_gold_hierarchies_sql(
         qty_col = col_map[qty_col_obj.name] if qty_col_obj else None
         plant_col = col_map[plant_col_obj.name] if plant_col_obj else None
 
+        safe_max_depth = max(1, int(max_depth))
         silver_fqn = f"{_dq(db)}.{_dq(silver_schema)}.{_dq(f'SILVER_{safe_tbl}')}"
         gold_fqn = f"{_dq(db)}.{_dq(gold_schema)}.{_dq(f'GOLD_{safe_tbl}_EXPLODED')}"
 
@@ -210,13 +213,13 @@ def render_snowflake_gold_hierarchies_sql(
                 "AS",
                 "WITH RECURSIVE HIERARCHY_EDGES AS (",
                 "  SELECT",
-                f"{plant_sel_e}    e.{_dq(parent_col)} AS \"ROOT_NODE_ID\",",
+                f"{plant_sel_e}    COALESCE(e.{_dq(parent_col)}, e.{_dq(child_col)}) AS \"ROOT_NODE_ID\",",
                 f"    e.{_dq(parent_col)} AS \"PARENT_NODE_ID\",",
                 f"    e.{_dq(child_col)} AS \"CHILD_NODE_ID\",",
                 f"{qty_root_sel}    1 AS \"DEPTH\",",
-                f"    ARRAY_CONSTRUCT(TO_VARCHAR(e.{_dq(parent_col)}), TO_VARCHAR(e.{_dq(child_col)})) AS \"PATH_NODES\"",
+                f"    IFF(e.{_dq(parent_col)} IS NULL, ARRAY_CONSTRUCT(TO_VARCHAR(e.{_dq(child_col)})), ARRAY_CONSTRUCT(TO_VARCHAR(e.{_dq(parent_col)}), TO_VARCHAR(e.{_dq(child_col)}))) AS \"PATH_NODES\"",
                 f"  FROM {silver_fqn} AS e",
-                "  WHERE NOT EXISTS (",
+                f"  WHERE e.{_dq(parent_col)} IS NULL OR NOT EXISTS (",
                 f"    SELECT 1 FROM {silver_fqn} AS c",
                 f"    WHERE c.{_dq(child_col)} = e.{_dq(parent_col)}{plant_anti_join}",
                 "  )",
@@ -230,7 +233,8 @@ def render_snowflake_gold_hierarchies_sql(
                 "  FROM HIERARCHY_EDGES AS r",
                 f"  JOIN {silver_fqn} AS e",
                 f"    ON e.{_dq(parent_col)} = r.\"CHILD_NODE_ID\"{plant_rec_join}",
-                f"  WHERE r.\"DEPTH\" < {int(max_depth)}",
+                f"  WHERE e.{_dq(parent_col)} IS NOT NULL",
+                f"    AND r.\"DEPTH\" < {safe_max_depth}",
                 f"    AND NOT ARRAY_CONTAINS(TO_VARCHAR(e.{_dq(child_col)})::VARIANT, r.\"PATH_NODES\")",
                 ")",
                 "SELECT",

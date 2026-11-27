@@ -1480,7 +1480,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   document.getElementById("erd-zoom-out").addEventListener("click", () => { erdView.scale = Math.max(0.25, erdView.scale / 1.15); renderERD(); });
   document.getElementById("erd-fit").addEventListener("click", fitERD);
   document.getElementById("erd-reset").addEventListener("click", () => { erdView = { x: 20, y: 20, scale: 1 }; erdInitialized = false; renderERD(); });
-  document.getElementById("erd-download-svg").addEventListener("click", () => exportSvgElement(document.getElementById("erd-svg"), `${ov.database_name}_erd.svg`));
+  const safeDbFile = String(ov.database_name || "tick").replace(/[^a-zA-Z0-9._-]+/g, "_");
+  document.getElementById("erd-download-svg").addEventListener("click", () => exportSvgElement(document.getElementById("erd-svg"), `${safeDbFile}_erd.svg`));
 
   document.getElementById("lin-include-fk").addEventListener("change", renderLineage);
   document.getElementById("lin-search").addEventListener("input", renderLineage);
@@ -1488,7 +1489,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   document.getElementById("lin-zoom-out").addEventListener("click", () => { linView.scale = Math.max(0.25, linView.scale / 1.15); renderLineage(); });
   document.getElementById("lin-fit").addEventListener("click", fitLineage);
   document.getElementById("lin-reset").addEventListener("click", () => { linView = { x: 16, y: 16, scale: 1 }; renderLineage(); });
-  document.getElementById("lin-download-svg").addEventListener("click", () => exportSvgElement(document.getElementById("lin-svg"), `${ov.database_name}_lineage.svg`));
+  document.getElementById("lin-download-svg").addEventListener("click", () => exportSvgElement(document.getElementById("lin-svg"), `${safeDbFile}_lineage.svg`));
 })();
 </script>
 </body>

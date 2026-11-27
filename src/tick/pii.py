@@ -95,6 +95,10 @@ def detect_pii(
     sample_values: Sequence[str],
 ) -> list[PiiFinding]:
     """Detect potential PII categories on a column using name + sampled value heuristics."""
+    # Boolean flags (e.g. email_opt_in, is_phone_verified, has_dob) cannot contain actual PII payloads
+    if canonical_type == "boolean":
+        return []
+
     findings: list[PiiFinding] = []
     non_empty = [s.strip() for s in sample_values if s is not None and str(s).strip() != ""]
     sample_subset = non_empty[:200]

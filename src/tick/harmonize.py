@@ -137,34 +137,36 @@ def harmonize_snapshots(
     their canonical glossary semantic names while still projecting each plant's native Bronze names in SQL.
     """
     use_glossary = bool(match_by_glossary or glossary_path)
-    tbl_glossary: dict[str, tuple[str, str]] = {}
-    col_glossary: dict[str, tuple[str, str]] = {}
-    if use_glossary:
-        tbl_glossary = dict(BUILTIN_TABLE_GLOSSARY)
-        col_glossary = dict(BUILTIN_COLUMN_GLOSSARY)
-        if glossary_path:
-            user_t, user_c = load_custom_glossary(glossary_path)
-            tbl_glossary.update(user_t)
-            col_glossary.update(user_c)
+    user_tbl_glossary: dict[str, tuple[str, str]] = {}
+    user_col_glossary: dict[str, tuple[str, str]] = {}
+    if glossary_path:
+        user_tbl_glossary, user_col_glossary = load_custom_glossary(glossary_path)
 
     def _canon_table_name(tbl: TableInfo) -> str:
         if not use_glossary:
             return tbl.name.lower()
-        hit = tbl_glossary.get(tbl.name.upper())
-        if hit and hit[0]:
-            return hit[0].lower()
+        # Precedence: explicit --glossary override > snapshot semantic_name > built-in glossary > raw name
+        u_hit = user_tbl_glossary.get(tbl.name.upper())
+        if u_hit and u_hit[0]:
+            return u_hit[0].lower()
         if tbl.semantic_name:
             return tbl.semantic_name.lower()
+        b_hit = BUILTIN_TABLE_GLOSSARY.get(tbl.name.upper())
+        if b_hit and b_hit[0]:
+            return b_hit[0].lower()
         return tbl.name.lower()
 
     def _canon_col_name(raw_col_name: str, existing_semantic: str | None) -> str:
         if not use_glossary:
             return raw_col_name
-        hit = col_glossary.get(raw_col_name.upper())
-        if hit and hit[0]:
-            return hit[0]
+        u_hit = user_col_glossary.get(raw_col_name.upper())
+        if u_hit and u_hit[0]:
+            return u_hit[0]
         if existing_semantic:
             return existing_semantic
+        b_hit = BUILTIN_COLUMN_GLOSSARY.get(raw_col_name.upper())
+        if b_hit and b_hit[0]:
+            return b_hit[0]
         return raw_col_name
 
     source_names = list(sources.keys())
@@ -176,6 +178,7 @@ def harmonize_snapshots(
     sf_bsch = bronze_schema.upper() if bronze_schema == "bronze" else bronze_schema
 
     # Index base tables across sites; qualify with schema if a single site has duplicate table keys across schemas
+    # and disambiguate same-schema collisions so no table is ever silently dropped.
     dup_names_within_source: set[str] = set()
     for res in sources.values():
         seen_in_src: set[str] = set()
@@ -198,6 +201,13 @@ def harmonize_snapshots(
                 if canon in dup_names_within_source
                 else canon
             )
+            if src_name in tables_by_name.get(key, {}):
+                base_collision = f"{key}__{tbl.name.lower()}"
+                key = base_collision
+                sfx = 2
+                while src_name in tables_by_name.get(key, {}):
+                    key = f"{base_collision}_{sfx}"
+                    sfx += 1
             tables_by_name.setdefault(key, {})[src_name] = tbl
 
     harmonized_tables: list[HarmonizedTable] = []

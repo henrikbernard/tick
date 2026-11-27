@@ -136,6 +136,10 @@ def render_databricks_bundle_yml(
                     "target": "${var.silver_schema}",
                     "serverless": True,
                     "channel": "CURRENT",
+                    "configuration": {
+                        "bronze_catalog": "${var.catalog}",
+                        "bronze_schema": "${var.bronze_schema}",
+                    },
                     "libraries": [
                         {"file": {"path": "./lakeflow_pipeline.py"}},
                     ],
@@ -196,10 +200,14 @@ def render_lakeview_dashboard_json(
     layout: list[dict[str, Any]] = []
     y_cursor = 0
 
-    # 1. Catalog inventory dataset (always present)
+    # 1. Catalog inventory dataset (always present; includes gold_schema when Gold hierarchies exist)
     cat_lit = cat.replace("'", "''")
     bsch_lit = bsch.replace("'", "''")
     ssch_lit = silver_schema.replace("'", "''")
+    gsch_lit = gold_schema.replace("'", "''")
+    hier_tables = get_hierarchy_tables(result)
+    inv_schemas = [bsch_lit, ssch_lit] + ([gsch_lit] if hier_tables else [])
+    inv_in_clause = ", ".join(f"'{s}'" for s in inv_schemas)
     datasets.append(
         {
             "name": "uc_catalog_inventory",
@@ -207,7 +215,7 @@ def render_lakeview_dashboard_json(
             "query": (
                 f"SELECT table_schema, table_name, table_type, created, last_altered, comment\n"
                 f"FROM {_bt(cat)}.information_schema.tables\n"
-                f"WHERE table_schema IN ('{bsch_lit}', '{ssch_lit}')\n"
+                f"WHERE table_schema IN ({inv_in_clause})\n"
                 f"ORDER BY table_schema, table_name"
             ),
         }
@@ -219,7 +227,7 @@ def render_lakeview_dashboard_json(
             "query": (
                 f"SELECT COUNT(*) AS total_tables\n"
                 f"FROM {_bt(cat)}.information_schema.tables\n"
-                f"WHERE table_schema IN ('{bsch_lit}', '{ssch_lit}')"
+                f"WHERE table_schema IN ({inv_in_clause})"
             ),
         }
     )
@@ -328,7 +336,6 @@ def render_lakeview_dashboard_json(
         )
 
     # 3. Gold BOM / Hierarchy Rollup (if detected)
-    hier_tables = get_hierarchy_tables(result)
     if hier_tables:
         htbl = hier_tables[0]
         safe_h = tbl_name_map[htbl.full_name]
@@ -387,7 +394,7 @@ def render_lakeview_dashboard_json(
                 "query": (
                     f"SELECT DATE_TRUNC('day', {_bt(ts_c)}) AS activity_day,\n"
                     f"       COUNT(*) AS row_count,\n"
-                    f"       SUM({_bt(num_c)}) AS total_{num_c}\n"
+                    f"       SUM({_bt(num_c)}) AS {_bt(f'total_{num_c}')}\n"
                     f"FROM {_bt(cat)}.{_bt(silver_schema)}.{_bt(f'silver_{safe_f}')}\n"
                     f"GROUP BY 1\n"
                     f"ORDER BY 1"
@@ -584,7 +591,7 @@ def render_snowflake_streamlit_app(
             "with tabs[tab_idx]:",
             "    dt_df = _run_df(f'''",
             "        SELECT NAME, SCHEMA_NAME, STATE, REFRESH_ACTION, DATA_TIMESTAMP, REFRESH_START_TIME, REFRESH_END_TIME",
-            "        FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(RESULT_LIMIT => 50))",
+            '        FROM TABLE("{_DB_DQ}".INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY(RESULT_LIMIT => 50))',
             "        ORDER BY REFRESH_START_TIME DESC",
             "    ''')",
             "    if dt_df is not None:",
@@ -617,17 +624,18 @@ def render_snowflake_streamlit_app(
             )
         )
         avg_sel = f", AVG({_dq(ot_val)}) AS AVG_READING" if ot_val else ""
+        ot_sql = (
+            f"SELECT DATE_TRUNC('HOUR', {_dq(ot_ts)}) AS READING_HOUR,\n"
+            f"       COUNT(*) AS TOTAL_READINGS,\n"
+            f"       SUM({bad_cond}) AS BAD_READINGS{avg_sel}\n"
+            f"FROM {ot_fqn}\n"
+            f"GROUP BY 1\n"
+            f"ORDER BY 1"
+        )
         lines.extend(
             [
                 "with tabs[tab_idx]:",
-                "    ot_df = _run_df('''",
-                f"        SELECT DATE_TRUNC('HOUR', {_dq(ot_ts)}) AS READING_HOUR,",
-                "               COUNT(*) AS TOTAL_READINGS,",
-                f"               SUM({bad_cond}) AS BAD_READINGS{avg_sel}",
-                f"        FROM {ot_fqn}",
-                "        GROUP BY 1",
-                "        ORDER BY 1",
-                "    ''')",
+                f"    ot_df = _run_df({ot_sql!r})",
                 "    if ot_df is not None and not ot_df.empty:",
                 "        st.bar_chart(ot_df.set_index('READING_HOUR')[['TOTAL_READINGS', 'BAD_READINGS']])",
                 "        st.dataframe(ot_df, use_container_width=True)",
@@ -637,16 +645,17 @@ def render_snowflake_streamlit_app(
         )
 
     if gold_bom_fqn:
+        bom_sql = (
+            f"SELECT ROOT_NODE_ID, MAX(DEPTH) AS MAX_DEPTH, COUNT(*) AS COMPONENT_LINKS\n"
+            f"FROM {gold_bom_fqn}\n"
+            f"GROUP BY ROOT_NODE_ID\n"
+            f"ORDER BY COMPONENT_LINKS DESC\n"
+            f"LIMIT 50"
+        )
         lines.extend(
             [
                 "with tabs[tab_idx]:",
-                "    bom_df = _run_df('''",
-                "        SELECT ROOT_NODE_ID, MAX(DEPTH) AS MAX_DEPTH, COUNT(*) AS COMPONENT_LINKS",
-                f"        FROM {gold_bom_fqn}",
-                "        GROUP BY ROOT_NODE_ID",
-                "        ORDER BY COMPONENT_LINKS DESC",
-                "        LIMIT 50",
-                "    ''')",
+                f"    bom_df = _run_df({bom_sql!r})",
                 "    if bom_df is not None and not bom_df.empty:",
                 "        st.bar_chart(bom_df.set_index('ROOT_NODE_ID')['COMPONENT_LINKS'])",
                 "        st.dataframe(bom_df, use_container_width=True)",

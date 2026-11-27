@@ -195,6 +195,7 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="pill-btn" data-filter="site_cols">Site-Only Cols</button>
       <button class="pill-btn" data-filter="pk">PK Divergent</button>
       <button class="pill-btn" data-filter="missing">Missing Tables</button>
+      <button class="pill-btn" data-filter="glossary">Glossary Matched</button>
     </div>
     <div style="overflow-x:auto"><table id="matrix-table"></table></div>
   </div>
@@ -345,9 +346,14 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (activeFilter === "site_cols" && t.site_specific_column_count === 0) return false;
       if (activeFilter === "pk" && !t.pk_divergent) return false;
       if (activeFilter === "missing" && t.missing_in_sources.length === 0) return false;
+      if (activeFilter === "glossary" && !(t.matched_via_glossary || t.columns.some(c => c.matched_via_glossary))) return false;
       if (q) {
-        const hitT = t.table_name.toLowerCase().includes(q);
-        const hitC = t.columns.some(c => c.name.toLowerCase().includes(q) || c.sanitized_name.toLowerCase().includes(q));
+        const srcTbls = Object.values(t.source_table_names || {}).join(" ").toLowerCase();
+        const hitT = t.table_name.toLowerCase().includes(q) || srcTbls.includes(q);
+        const hitC = t.columns.some(c => {
+          const srcCols = Object.values(c.source_column_names || {}).join(" ").toLowerCase();
+          return c.name.toLowerCase().includes(q) || c.sanitized_name.toLowerCase().includes(q) || srcCols.includes(q);
+        });
         if (!hitT && !hitC) return false;
       }
       return true;
