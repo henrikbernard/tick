@@ -117,9 +117,12 @@ def test_dqx_and_odcs_data_contract_exporters_and_cli(tmp_path):
     assert ("is_in_list", "contact_email") not in fn_by_col
     assert "ceo@factory.internal" not in dqx_file.read_text(encoding="utf-8")
 
-    # Historian table includes OT sensor quality check
+    # Historian table uses numeric OPC Classic quality_code (192=GOOD, 64=BAD) -> is_not_less_than 192
     hist_checks = dqx["tables"]["mfg_prod.bronze_ohio.historian_tags"]
-    assert any(c["check"]["function"] == "is_not_in_list" for c in hist_checks)
+    assert any(
+        c["check"]["function"] == "is_not_less_than" and c["check"]["arguments"].get("limit") == 192
+        for c in hist_checks
+    )
 
     # Validate ODCS v3.0.0 YAML
     odcs = yaml.safe_load(odcs_file.read_text(encoding="utf-8"))

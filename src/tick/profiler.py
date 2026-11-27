@@ -457,8 +457,8 @@ def _profile_single_table(
 def _can_parallelize(engine: Engine, workers: int, table_count: int) -> bool:
     if workers <= 1 or table_count <= 1:
         return False
-    # SQLite in-memory connections are single-connection/thread-bound
-    if engine.dialect.name == "sqlite" and engine.url.database in {None, "", ":memory:"}:
+    # In-memory SQLite and DuckDB engines share a single in-memory instance not safe for multi-thread checkout
+    if engine.dialect.name in {"sqlite", "duckdb"} and engine.url.database in {None, "", ":memory:"}:
         return False
     return True
 
@@ -484,15 +484,21 @@ def profile_tables(
         max_workers = min(config.workers, len(tables))
 
         def _worker(tbl: TableInfo) -> ProfileArtifacts:
-            with engine.connect() as conn:
-                adapter.configure_safe_session(
-                    conn,
-                    read_uncommitted=config.read_uncommitted,
-                    query_timeout_seconds=config.query_timeout_seconds,
-                )
-                return _profile_single_table(
-                    conn, adapter, tbl, default_schema, config, effective_sample, now_utc
-                )
+            try:
+                with engine.connect() as conn:
+                    adapter.configure_safe_session(
+                        conn,
+                        read_uncommitted=config.read_uncommitted,
+                        query_timeout_seconds=config.query_timeout_seconds,
+                    )
+                    return _profile_single_table(
+                        conn, adapter, tbl, default_schema, config, effective_sample, now_utc
+                    )
+            except Exception as exc:
+                err_msg = f"Worker profiling failed: {type(exc).__name__}: {str(exc)[:180]}"
+                for col in tbl.columns:
+                    col.profile = ColumnProfile(profile_error=err_msg)
+                return ProfileArtifacts()
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_worker, tbl) for tbl in tables]

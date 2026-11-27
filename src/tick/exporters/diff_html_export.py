@@ -317,8 +317,12 @@ DIFF_HTML_TEMPLATE = r"""<!DOCTYPE html>
       const aPct = Math.min(100, Math.max(0, ((Number(m.after) || 0) / maxScale) * 100));
       const fmtVal = (v) => isNull ? `${Number(v).toFixed(1)}%` : Number(v).toLocaleString();
       const deltaSign = Number(m.delta) > 0 ? "+" : "";
-      const deltaLabel = isNull ? `${deltaSign}${Number(m.delta).toFixed(1)}pp` : `${deltaSign}${Number(m.delta).toLocaleString()}`;
+      const pctSuffix = (!isNull && m.pct_change != null) ? ` (${Number(m.pct_change) > 0 ? "+" : ""}${Number(m.pct_change).toFixed(1)}%)` : "";
+      const deltaLabel = isNull
+        ? `${deltaSign}${Number(m.delta).toFixed(1)}pp`
+        : `${deltaSign}${Number(m.delta).toLocaleString()} rows${pctSuffix}`;
       const afterColor = m.severity === "high" ? "var(--red)" : "var(--amber)";
+      const afterValLabel = (!isNull && Number(m.after) === 0) ? "0 (EMPTY)" : fmtVal(m.after);
       return `<div class="drift-item">
         <div class="drift-head">
           <div>
@@ -336,7 +340,7 @@ DIFF_HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="cmp-bar-row">
           <span style="color:var(--text-muted)">After</span>
           <div class="cmp-track"><div class="cmp-fill" style="width:${aPct.toFixed(1)}%;background:${afterColor};"></div></div>
-          <span style="text-align:right;font-weight:700;">${esc(fmtVal(m.after))}</span>
+          <span style="text-align:right;font-weight:700;">${esc(afterValLabel)}</span>
         </div>
       </div>`;
     }).join("");

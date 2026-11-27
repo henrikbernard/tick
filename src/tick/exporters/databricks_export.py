@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from tick.databricks import (
@@ -11,6 +12,14 @@ from tick.databricks import (
     sanitize_delta_column_name,
 )
 from tick.models import DiscoveryResult, TableInfo
+
+_SIMPLE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _spark_table_ref(catalog: str, schema: str, table: str) -> str:
+    """Format a 3-part Unity Catalog table reference, backtick-quoting non-simple identifiers."""
+    parts = [p if _SIMPLE_IDENT_RE.match(p) else _bt(p) for p in (catalog, schema, table)]
+    return ".".join(parts)
 
 
 def _sql_str(val: str) -> str:
@@ -260,7 +269,7 @@ def render_lakeflow_pipeline_py(
     for tbl in base_tables:
         safe_tbl = tbl_name_map[tbl.full_name]
         col_map = deduplicate_column_names([c.name for c in tbl.columns])
-        bronze_src = f"{cat}.{bsch}.{safe_tbl}"
+        bronze_src = _spark_table_ref(cat, bsch, safe_tbl)
         rec = tbl.recommendations
         dc = tbl.delta_compatibility
         strategy = rec.ingestion_strategy if rec else "full_refresh"
@@ -278,32 +287,48 @@ def render_lakeflow_pipeline_py(
                 and col.canonical_type == "string"
                 and 2 <= (col.profile.distinct_count or 0) <= 10
                 and col.profile.null_rate < 0.05
+                and len(col.profile.top_values) >= (col.profile.distinct_count or 0)
                 and not col.profile.pii_findings
                 and not col.profile.governance_findings
             ):
                 vals = ", ".join(
                     "'" + _spark_sql_str(v.value) + "'"
-                    for v in col.profile.top_values[:10]
+                    for v in col.profile.top_values[: col.profile.distinct_count]
                 )
                 if vals:
                     expectations[f"valid_{cname}_domain"] = f"`{cname}` IN ({vals})"
 
         if tbl.telemetry_profile and tbl.telemetry_profile.quality_column:
-            qcol = col_map.get(
-                tbl.telemetry_profile.quality_column,
-                sanitize_delta_column_name(tbl.telemetry_profile.quality_column),
-            )
-            expectations["good_sensor_quality"] = f"CAST(`{qcol}` AS STRING) NOT IN ('BAD', '0', 'FAULT')"
+            raw_qcol = tbl.telemetry_profile.quality_column
+            qcol = col_map.get(raw_qcol, sanitize_delta_column_name(raw_qcol))
+            qcol_obj = next((c for c in tbl.columns if c.name == raw_qcol), None)
+            if qcol_obj and qcol_obj.canonical_type in {"integer", "decimal", "float"}:
+                expectations["good_sensor_quality"] = f"`{qcol}` >= 192"
+            else:
+                expectations["good_sensor_quality"] = (
+                    f"UPPER(CAST(`{qcol}` AS STRING)) NOT IN ('BAD', 'UNCERTAIN', '0', 'FAULT', 'ERROR')"
+                )
 
-        # Build Silver transform expressions
+        # Build Silver transform expressions (use atomic .select() when rename targets collide with raw column names)
         transforms: list[str] = []
         rename_pairs = [
             (col.name, col_map[col.name])
             for col in tbl.columns
             if col.name != col_map[col.name]
         ]
-        for orig, safe in rename_pairs:
-            transforms.append(f"        .withColumnRenamed({orig!r}, {safe!r})")
+        raw_names_set = {col.name for col in tbl.columns}
+        has_rename_collision = any(safe in raw_names_set for _, safe in rename_pairs)
+        if has_rename_collision:
+            select_items = ", ".join(
+                f"F.col({col.name!r}).alias({col_map[col.name]!r})"
+                if col.name != col_map[col.name]
+                else f"F.col({col.name!r})"
+                for col in tbl.columns
+            )
+            transforms.append(f"        .select({select_items})")
+        else:
+            for orig, safe in rename_pairs:
+                transforms.append(f"        .withColumnRenamed({orig!r}, {safe!r})")
 
         # Legacy date/time parsing transforms (rename both primary and paired column references!)
         seen_stitched: set[str] = set()
@@ -349,8 +374,14 @@ def render_lakeflow_pipeline_py(
             lines.append("# Build a downstream Gold BOM/genealogy explosion model using recursive CTEs.")
 
         # Full-refresh tables must use batch reads (Materialized Views) so Bronze overwrites do not break streaming
+        cdc_ready_streaming = (
+            strategy == "cdc_or_snapshot"
+            and tbl.cdc_readiness is not None
+            and tbl.cdc_readiness.status == "ready"
+        )
         use_streaming = (
-            strategy in {"incremental_merge", "incremental_append", "cdc"}
+            strategy in {"incremental_merge", "incremental_append"}
+            or cdc_ready_streaming
             or bool(tbl.telemetry_profile)
         )
 

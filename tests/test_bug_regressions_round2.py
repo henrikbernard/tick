@@ -305,8 +305,9 @@ def test_round2_bug4_lakeflow_spark_sql_escaping_and_full_refresh_batch():
     assert tree is not None
 
     # Full-refresh table uses batch reads (Materialized View), NOT readStream/read_stream
+    # And non-simple catalog name 'cat"""1' is properly backtick-quoted
     ref_section = py_code.split("# --- main.events")[0]
-    assert "spark.read.table('cat\"\"\"1.bronze.ref_codes')" in ref_section
+    assert "spark.read.table('`cat\"\"\"1`.bronze.ref_codes')" in ref_section
     assert "return dlt.read('clean_ref_codes')" in ref_section
     assert "readStream" not in ref_section
     assert "read_stream" not in ref_section

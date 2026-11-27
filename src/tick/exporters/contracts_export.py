@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,20 @@ _ODCS_LOGICAL_TYPES: dict[CanonicalType, str] = {
     "other": "string",
 }
 
+_CLASSIFICATION_PRIORITY: dict[str, int] = {
+    "ip_or_export_controlled": 0,
+    "restricted_pii": 1,
+    "commercial_sensitive": 2,
+    "plant_isolation_key": 3,
+}
+
 
 def _try_float(val: str | None) -> float | None:
     if val is None:
         return None
     try:
-        return float(val)
+        f = float(val)
+        return f if math.isfinite(f) else None
     except (ValueError, TypeError):
         return None
 
@@ -121,15 +130,15 @@ def render_dqx_yaml(
             if prof is None or prof.profile_error or is_sensitive:
                 continue
 
-            # 3. Categorical domain allowlist for clean low-cardinality non-sensitive string columns
+            # 3. Categorical domain allowlist only when top_values covers ALL observed distinct values
             if (
                 col.canonical_type == "string"
                 and prof.cardinality_class == "low"
                 and 2 <= (prof.distinct_count or 0) <= 10
                 and prof.null_rate < 0.05
-                and prof.top_values
+                and len(prof.top_values) >= (prof.distinct_count or 0)
             ):
-                allowed = [v.value for v in prof.top_values[:10]]
+                allowed = [v.value for v in prof.top_values[: prof.distinct_count]]
                 checks.append(
                     {
                         "name": f"{cname}_allowed_values",
@@ -168,27 +177,49 @@ def render_dqx_yaml(
                         }
                     )
 
-        # 5. OT Telemetry quality code check
+        # 5. OT Telemetry quality code check (numeric OPC Classic >= 192 vs string status codes)
         if tbl.telemetry_profile and tbl.telemetry_profile.quality_column:
-            qcol = col_map.get(
-                tbl.telemetry_profile.quality_column,
-                sanitize_delta_column_name(tbl.telemetry_profile.quality_column),
-            )
-            checks.append(
-                {
-                    "name": f"{qcol}_good_sensor_quality",
-                    "criticality": "error",
-                    "check": {
-                        "function": "is_not_in_list",
-                        "arguments": {
-                            "column": qcol,
-                            "forbidden": ["BAD", "FAULT", "ERROR", "0"],
+            raw_qcol = tbl.telemetry_profile.quality_column
+            qcol = col_map.get(raw_qcol, sanitize_delta_column_name(raw_qcol))
+            qcol_obj = next((c for c in tbl.columns if c.name == raw_qcol), None)
+            if qcol_obj and qcol_obj.canonical_type in {"integer", "decimal", "float"}:
+                checks.append(
+                    {
+                        "name": f"{qcol}_good_sensor_quality",
+                        "criticality": "error",
+                        "check": {
+                            "function": "is_not_less_than",
+                            "arguments": {"column": qcol, "limit": 192},
                         },
-                    },
-                }
-            )
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "name": f"{qcol}_good_sensor_quality",
+                        "criticality": "error",
+                        "check": {
+                            "function": "is_not_in_list",
+                            "arguments": {
+                                "column": qcol,
+                                "forbidden": ["BAD", "UNCERTAIN", "FAULT", "ERROR", "0"],
+                            },
+                        },
+                    }
+                )
 
         if checks:
+            # Ensure unique check names within each table
+            seen_names: set[str] = set()
+            for chk in checks:
+                base_name = chk["name"]
+                cand = base_name
+                suffix = 2
+                while cand in seen_names:
+                    cand = f"{base_name}_{suffix}"
+                    suffix += 1
+                seen_names.add(cand)
+                chk["name"] = cand
             tables_checks[fqn] = checks
 
     payload = {
@@ -259,7 +290,10 @@ def render_odcs_yaml(
                     tags.append(f"legacy_date:{prof.legacy_date.encoding}")
 
             if classifications:
-                prop["classification"] = sorted(set(classifications))[0]
+                prop["classification"] = min(
+                    set(classifications),
+                    key=lambda c: (_CLASSIFICATION_PRIORITY.get(c, 99), c),
+                )
             if tags:
                 prop["tags"] = sorted(set(tags))
 
