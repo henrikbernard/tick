@@ -18,7 +18,7 @@ from tick.models import (
 ILLEGAL_DELTA_COL_RE = re.compile(r"[ ,;{}()\n\t=]")
 DECIMAL_PREC_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
 UNSUPPORTED_SPARK_TYPES = {"SQL_VARIANT", "HIERARCHYID", "GEOGRAPHY", "GEOMETRY", "XML", "ROWVERSION", "IMAGE", "BFILE"}
-TZ_AWARE_HINTS = ("TIMESTAMPTZ", "WITH TIME ZONE", "DATETIMEOFFSET", "TIMESTAMP_LTZ")
+TZ_AWARE_HINTS = ("TIMESTAMPTZ", "WITH TIME ZONE", "DATETIMEOFFSET", "TIMESTAMP_LTZ", "TIMESTAMP_TZ")
 
 
 def sanitize_delta_column_name(name: str) -> str:

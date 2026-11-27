@@ -151,6 +151,11 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         if tbl.delta_compatibility and tbl.delta_compatibility.liquid_clustering_keys:
             lck = ", ".join(f"`{k}`" for k in tbl.delta_compatibility.liquid_clustering_keys)
             lines.append(f"- **Databricks Liquid Clustering:** `CLUSTER BY ({lck})`")
+        if tbl.snowflake_compatibility and tbl.snowflake_compatibility.clustering_keys:
+            sck = ", ".join(f"`{k}`" for k in tbl.snowflake_compatibility.clustering_keys)
+            lines.append(
+                f"- **Snowflake Clustering & Warehouse:** `CLUSTER BY ({sck})` · Warehouse: `{tbl.snowflake_compatibility.recommended_warehouse_size}`"
+            )
         if rec.primary_key_candidates:
             lines.append(
                 f"- **Candidate PKs:** {', '.join(f'`{c}`' for c in rec.primary_key_candidates)}"
@@ -170,7 +175,7 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
     lines.append("")
 
     lines.append(
-        "| Column | Semantic Name | Type (Spark) | Keys | Nullable | Null % | Distinct | Min / Max | PII / Gov / Legacy |"
+        "| Column | Semantic Name | Type (Target) | Keys | Nullable | Null % | Distinct | Min / Max | PII / Gov / Legacy |"
     )
     lines.append("|---|---|---|---|---|---:|---:|---|---|")
     for col in tbl.columns:
@@ -202,9 +207,14 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         else:
             null_pct = distinct = minmax = "—"
 
-        spark_note = f" → {_md_code(col.spark_type)}" if col.spark_type else ""
+        target_types: list[str] = []
+        if col.spark_type:
+            target_types.append(f"DBX:{_md_code(col.spark_type)}")
+        if col.snowflake_type:
+            target_types.append(f"SF:{_md_code(col.snowflake_type)}")
+        type_note = f" → {' / '.join(target_types)}" if target_types else ""
         lines.append(
-            f"| {_md_code(col.name)} | {_escape_md(col.semantic_name)} | {_md_code(col.raw_type)}{spark_note} | {key_str} | "
+            f"| {_md_code(col.name)} | {_escape_md(col.semantic_name)} | {_md_code(col.raw_type)}{type_note} | {key_str} | "
             f"{'YES' if col.nullable else 'NO'} | {null_pct} | {distinct} | {minmax} | {_escape_md(', '.join(flags)) if flags else '—'} |"
         )
 
@@ -245,22 +255,34 @@ def render_markdown_report(result: DiscoveryResult) -> str:
         f"| Explicit / Inferred Relationships | {ov.explicit_fk_count} / {ov.inferred_relationship_count} |",
         f"| PII / Governance Columns | {ov.pii_column_count} / {ov.governance_column_count} |",
         f"| CDC Ready / Blocked Tables | {ov.cdc_ready_table_count} / {ov.cdc_blocked_table_count} |",
-        f"| Delta Compatibility Warnings | {ov.delta_warning_count} |",
+        f"| Delta / Snowflake Compatibility Warnings | {ov.delta_warning_count} / {ov.snowflake_warning_count} |",
         f"| Average Health Score | {ov.avg_quality_score}/100 |",
         "",
     ]
 
-    # Data Engineering & Databricks Blueprint
-    lines.append("## Data Engineering & Databricks Ingestion Blueprint")
+    # Data Engineering & Cloud Ingestion Blueprint
+    target_plat = result.config.target_platform
+    cluster_col_hdr = "Snowflake Clustering (`CLUSTER BY`)" if target_plat == "snowflake" else "Clustering (`CLUSTER BY`)"
+    lines.append("## Data Engineering & Cloud Ingestion Blueprint")
     lines.append("")
-    lines.append("| Table | Semantic | Role | Rows | Est. MB | Strategy | CDC Status | Liquid Clustering (`CLUSTER BY`) | Cadence |")
+    lines.append(f"| Table | Semantic | Role | Rows | Est. MB | Strategy | CDC Status | {cluster_col_hdr} | Cadence |")
     lines.append("|---|---|---|---:|---:|---|---|---|---|")
     for tbl in result.tables:
         rec = tbl.recommendations
         cdc = tbl.cdc_readiness
         dc = tbl.delta_compatibility
+        sfc = tbl.snowflake_compatibility
         sz = tbl.ingestion_sizing
-        lck = ", ".join(_md_code(k) for k in dc.liquid_clustering_keys) if (dc and dc.liquid_clustering_keys) else "—"
+        ckeys = (
+            sfc.clustering_keys
+            if (target_plat == "snowflake" and sfc and sfc.clustering_keys)
+            else (
+                dc.liquid_clustering_keys
+                if (dc and dc.liquid_clustering_keys)
+                else (sfc.clustering_keys if (sfc and sfc.clustering_keys) else [])
+            )
+        )
+        lck = ", ".join(_md_code(k) for k in ckeys) if ckeys else "—"
         lines.append(
             f"| {_md_code(tbl.full_name)} | {_md_code(tbl.semantic_name)} | `{rec.entity_role if rec else 'unknown'}` | "
             f"{_fmt_int(tbl.row_count)} | {f'{sz.estimated_size_mb:.2f}' if sz else '—'} | "

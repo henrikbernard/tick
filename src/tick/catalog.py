@@ -190,6 +190,7 @@ def introspect_catalog(
             if config.max_tables is not None and len(tables) >= config.max_tables:
                 break
             stats_map: dict[str, TableStats] = adapter.get_table_stats(conn, schema_name)
+            stats_map_lower: dict[str, TableStats] = {k.lower(): v for k, v in stats_map.items()}
 
             try:
                 table_names = adapter.get_table_names(conn, inspector, schema_name)
@@ -245,7 +246,7 @@ def introspect_catalog(
                     default_schema=default_schema,
                     obj_name=obj_name,
                     obj_type=obj_type,
-                    stats=stats_map.get(obj_name),
+                    stats=stats_map.get(obj_name) or stats_map_lower.get(obj_name.lower()),
                     config=config,
                 )
                 tables.append(tbl_info)

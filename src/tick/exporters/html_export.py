@@ -634,12 +634,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const sizeHint = ov.total_size_bytes != null
     ? fmtBytes(ov.total_size_bytes)
     : (hasSizing ? `est. ${fmtMb(totalEstMb)}` : "size n/a");
+  const targetPlatform = data.config?.target_platform || "both";
+  const lintSummaryHint = targetPlatform === "snowflake"
+    ? `${ov.cdc_blocked_table_count} blocked · ${ov.snowflake_warning_count || 0} Snowflake warns`
+    : (targetPlatform === "databricks"
+      ? `${ov.cdc_blocked_table_count} blocked · ${ov.delta_warning_count} Delta warns`
+      : `${ov.cdc_blocked_table_count} blocked · ${ov.delta_warning_count} Delta / ${ov.snowflake_warning_count || 0} SF warns`);
   const kpis = [
     { label: "Base Tables", val: fmtInt(ov.table_count), hint: `${ov.view_count} views · ${ov.empty_table_count} empty` },
     { label: "Total Rows", val: fmtInt(ov.total_rows), hint: `${fmtInt(ov.column_count)} cols · ${sizeHint}` },
     { label: "Relationships", val: fmtInt(ov.explicit_fk_count + ov.inferred_relationship_count), hint: `${ov.explicit_fk_count} explicit · ${ov.inferred_relationship_count} inferred` },
-    { label: "CDC Readiness", val: `${ov.cdc_ready_table_count} / ${ov.table_count}`, hint: `${ov.cdc_blocked_table_count} blocked · ${ov.delta_warning_count} Delta warns` },
-    { label: "PII & UC Gov", val: `${ov.pii_column_count} / ${ov.governance_column_count}`, hint: "PII cols / UC policy cols" },
+    { label: "CDC Readiness", val: `${ov.cdc_ready_table_count} / ${ov.table_count}`, hint: lintSummaryHint },
+    { label: "PII & Governance", val: `${ov.pii_column_count} / ${ov.governance_column_count}`, hint: "PII cols / policy cols" },
     { label: "Avg Health", val: `${ov.avg_quality_score}/100`, hint: `${data.quality_issues.length} total findings` },
   ];
   document.getElementById("kpi-grid").innerHTML = kpis.map(k =>
@@ -685,12 +691,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     roleEntries.slice(0, 5).map(([r, c], idx) => ({ label: r, value: c, color: rolePalette[idx % rolePalette.length] }))
   );
 
-  // Migration Wave Planner
+  // Migration Wave Planner (evaluates both Delta & Snowflake high-severity compatibility blockers)
   const wave1 = [], wave2 = [], wave3 = [];
   baseTables.forEach(t => {
     const st = t.cdc_readiness?.status;
     const hasHighDelta = (t.delta_compatibility?.issues || []).some(i => i.severity === "high");
-    if (st === "blocked" || hasHighDelta) wave3.push(t);
+    const hasHighSf = (t.snowflake_compatibility?.issues || []).some(i => i.severity === "high");
+    if (st === "blocked" || hasHighDelta || hasHighSf) wave3.push(t);
     else if (st === "ready") wave1.push(t);
     else wave2.push(t);
   });
@@ -708,10 +715,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>`;
   }
+  const w1Title = targetPlatform === "snowflake" ? "Wave 1 · Fast-Track Snowflake" : "Wave 1 · Fast-Track Lakeflow";
+  const w3Sub = targetPlatform === "snowflake"
+    ? "Blocked CDC or High Snowflake Lint"
+    : (targetPlatform === "databricks" ? "Blocked CDC or High Delta Lint" : "Blocked CDC or High Platform Lint");
   document.getElementById("migration-waves").innerHTML =
-    renderWaveCard("w1", "Wave 1 · Fast-Track Lakeflow", "CDC / Watermark Ready", wave1) +
+    renderWaveCard("w1", w1Title, "CDC / Watermark Ready", wave1) +
     renderWaveCard("w2", "Wave 2 · Needs Config", "Enable CT/CDC or PK", wave2) +
-    renderWaveCard("w3", "Wave 3 · Remediation Required", "Blocked CDC or High Delta Lint", wave3);
+    renderWaveCard("w3", "Wave 3 · Remediation Required", w3Sub, wave3);
 
   const sortedTables = [...data.tables].sort((a,b) => (b.row_count || 0) - (a.row_count || 0));
   document.getElementById("overview-health-list").innerHTML = `
@@ -752,14 +763,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   document.getElementById("overview-roles").innerHTML = roleEntries
     .map(([r, c]) => `<span class="badge b-purple" style="font-size:12px;padding:4px 10px;">${esc(r)}: ${c}</span>`).join("");
 
-  // DATABRICKS & MANUFACTURING TAB
+  // DATABRICKS, SNOWFLAKE & MANUFACTURING TAB
   const audit = ov.cdc_audit;
   document.getElementById("cdc-audit-card").innerHTML = `
-    <h2>Source CDC &amp; Lakeflow Connect Readiness (${esc(ov.dialect)})</h2>
+    <h2>Source CDC &amp; Cloud Ingestion Readiness (${esc(ov.dialect)})</h2>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
       <span class="badge b-green">CDC Ready: ${ov.cdc_ready_table_count}</span>
       <span class="badge b-red">CDC Blocked: ${ov.cdc_blocked_table_count}</span>
-      <span class="badge b-amber">Delta Lint Warnings: ${ov.delta_warning_count}</span>
+      ${targetPlatform !== "snowflake" ? `<span class="badge b-amber">Delta Lint Warnings: ${ov.delta_warning_count}</span>` : ""}
+      ${targetPlatform !== "databricks" ? `<span class="badge b-purple">Snowflake Lint Warnings: ${ov.snowflake_warning_count || 0}</span>` : ""}
       ${audit?.wal_level ? `<span class="badge b-accent">wal_level: ${esc(audit.wal_level)}</span>` : ""}
       ${audit?.db_change_tracking_enabled != null ? `<span class="badge b-accent">MSSQL CT: ${audit.db_change_tracking_enabled}</span>` : ""}
     </div>
@@ -767,12 +779,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   `;
 
   document.getElementById("dbx-table").innerHTML = `
-    <thead><tr><th>Table</th><th>Rows / Est. MB</th><th>Daily Rows</th><th>CDC</th><th>Connector</th><th>Liquid Clustering</th><th>Cadence / Tier</th></tr></thead>
+    <thead><tr><th>Table</th><th>Rows / Est. MB</th><th>Daily Rows</th><th>CDC</th><th>Connector</th><th>${targetPlatform === "snowflake" ? "Snowflake Clustering / WH" : "Clustering Keys"}</th><th>Cadence / Tier</th></tr></thead>
     <tbody>
       ${baseTables.map(t => {
         const sz = t.ingestion_sizing || {};
         const cdc = t.cdc_readiness || {};
         const dc = t.delta_compatibility || {};
+        const sfc = t.snowflake_compatibility || {};
+        const clusterCell = targetPlatform === "snowflake"
+          ? `${esc((sfc.clustering_keys || []).join(", ")) || "—"}${sfc.recommended_warehouse_size ? `<div style="font-size:11px;color:var(--purple)">WH: ${esc(sfc.recommended_warehouse_size)}</div>` : ""}`
+          : `${esc((dc.liquid_clustering_keys || []).join(", ")) || "—"}${sfc.clustering_keys?.length && targetPlatform === "both" ? `<div style="font-size:11px;color:var(--purple)">SF (${esc(sfc.recommended_warehouse_size || 'XSMALL')}): ${esc(sfc.clustering_keys.join(", "))}</div>` : ""}`;
         return `
           <tr>
             <td>
@@ -783,7 +799,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <td class="mono">${sz.estimated_daily_rows != null ? Math.round(sz.estimated_daily_rows).toLocaleString() : '—'}</td>
             <td>${cdcBadge(cdc.status)}</td>
             <td class="mono">${esc(cdc.connector_recommendation || '—')}</td>
-            <td class="mono">${esc((dc.liquid_clustering_keys || []).join(", ")) || "—"}</td>
+            <td class="mono">${clusterCell}</td>
             <td><span class="badge b-accent">${esc(sz.recommended_cadence || '—')}</span><div style="font-size:11px;color:var(--text-muted)">${esc(sz.recommended_databricks_tier || '')}</div></td>
           </tr>`;
       }).join("")}
@@ -901,7 +917,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const p = c.profile;
       if (piiOnly && !(p?.pii_findings?.length || p?.governance_findings?.length)) return false;
       if (highNullOnly && !(p && !p.profile_error && p.null_rate >= 0.10)) return false;
-      if (q && !`${c.name} ${c.semantic_name || ""} ${c.raw_type} ${c.spark_type || ""}`.toLowerCase().includes(q)) return false;
+      if (q && !`${c.name} ${c.semantic_name || ""} ${c.raw_type} ${c.spark_type || ""} ${c.snowflake_type || ""}`.toLowerCase().includes(q)) return false;
       return true;
     });
 
@@ -992,6 +1008,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     const rec = tbl.recommendations;
     const cdc = tbl.cdc_readiness;
     const dc = tbl.delta_compatibility;
+    const sfc = tbl.snowflake_compatibility;
     const sz = tbl.ingestion_sizing;
     const rels = data.relationships.filter(r => r.source_table === tbl.full_name || r.target_table === tbl.full_name);
 
@@ -1025,6 +1042,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="k">Databricks Liquid Clustering</div>
             <div class="v mono">${dc.liquid_clustering_keys?.length ? `CLUSTER BY (${esc(dc.liquid_clustering_keys.join(', '))})` : "None suggested"}</div>
             <div class="d">${dc.requires_column_mapping ? "⚠ Requires delta.columnMapping.mode='name' or column rename" : "Delta column names compliant"}</div>
+          </div>` : ""}
+          ${sfc ? `
+          <div class="rec-box">
+            <div class="k">Snowflake Clustering &amp; Warehouse</div>
+            <div class="v mono">${sfc.clustering_keys?.length ? `CLUSTER BY (${esc(sfc.clustering_keys.join(', '))})` : "None suggested"} · WH: ${esc(sfc.recommended_warehouse_size || "XSMALL")}</div>
+            <div class="d">${sfc.requires_quoted_identifiers ? "⚠ Contains columns requiring double-quoting in Bronze" : "Snowflake identifiers compliant"}</div>
           </div>` : ""}
           ${sz ? `
           <div class="rec-box">
@@ -1070,8 +1093,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <table>
             <thead>
               <tr>
-                <th>Column</th><th>Source → Spark Type</th><th>Null %</th><th>Distinct</th>
-                <th>Range / Quantiles</th><th>PII / UC Governance / Signals</th><th>Top Values</th>
+                <th>Column</th><th>Source → Target Type(s)</th><th>Null %</th><th>Distinct</th>
+                <th>Range / Quantiles</th><th>PII / Governance / Signals</th><th>Top Values</th>
               </tr>
             </thead>
             <tbody id="col-tbody"></tbody>
@@ -1131,7 +1154,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   renderQuality();
 
   // CODE & DDL TAB
-  let activeCodeKey = "uc_ddl";
+  let activeCodeKey = targetPlatform === "snowflake" ? "sf_ddl" : "uc_ddl";
   function renderCodePreview() {
     document.getElementById("code-preview").textContent = codeAssets[activeCodeKey] || "";
     document.querySelectorAll(".code-tab").forEach(b => {

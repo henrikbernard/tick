@@ -233,12 +233,15 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     try { localStorage.setItem("tick-theme", next); } catch (_) {}
   });
   document.getElementById("print-btn").addEventListener("click", () => window.print());
-  document.getElementById("download-all-sql").addEventListener("click", () => {
-    downloadBlob("unified_multi_plant_views.sql", allSql, "text/sql;charset=utf-8");
-  });
-
   const isSf = report.target_platform === "snowflake";
   const platName = isSf ? "Snowflake" : "Databricks";
+  document.getElementById("download-all-sql").addEventListener("click", () => {
+    downloadBlob(
+      isSf ? "unified_snowflake_views.sql" : "unified_databricks_views.sql",
+      allSql,
+      "text/sql;charset=utf-8"
+    );
+  });
   document.getElementById("hdr-sub").textContent =
     `Target: ${platName} · Comparing ${report.sources.length} plants/sources: ${report.sources.join(" · ")}`;
 
@@ -254,7 +257,7 @@ HARMONIZE_HTML_TEMPLATE = r"""<!DOCTYPE html>
     { label: "Plants Compared", val: report.sources.length, hint: report.sources.slice(0, 3).join(", ") + (report.sources.length > 3 ? "…" : "") },
     { label: "Unique Tables", val: report.total_unique_tables, hint: `${report.fully_aligned_tables} fully aligned (${alignPct}%)` },
     { label: "Tables w/ Drift", val: report.tables_with_drift, hint: `${missingTableCount} missing in ≥1 plant` },
-    { label: "Type Conflicts", val: totalConflicts, hint: "Auto-widened in Spark SQL" },
+    { label: "Type Conflicts", val: totalConflicts, hint: isSf ? "Auto-widened in Snowflake SQL" : "Auto-widened in Spark SQL" },
     { label: "Site-Only Cols", val: totalSiteCols, hint: "CAST(NULL) padded in UNION" },
     { label: "PK Divergences", val: pkDivergentCount, hint: "Review Silver MERGE keys" },
   ];

@@ -105,7 +105,9 @@ def _widen_snowflake_types(types: list[str]) -> tuple[str, bool]:
             return "BIGINT", True
         return "INTEGER", True
 
-    if set(bases) <= {"DATE", "TIMESTAMP_LTZ", "TIMESTAMP_NTZ"}:
+    if set(bases) <= {"DATE", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIMESTAMP_NTZ"}:
+        if "TIMESTAMP_TZ" in bases:
+            return "TIMESTAMP_TZ", True
         return ("TIMESTAMP_LTZ" if "TIMESTAMP_LTZ" in bases else "TIMESTAMP_NTZ"), True
 
     return "VARCHAR", True
@@ -156,8 +158,11 @@ def harmonize_snapshots(
 
     harmonized_tables: list[HarmonizedTable] = []
     fully_aligned = 0
+    sorted_tbl_keys = sorted(tables_by_name.keys())
+    view_dbx_map = deduplicate_column_names(sorted_tbl_keys)
+    view_sf_map = deduplicate_snowflake_columns(sorted_tbl_keys)
 
-    for tbl_key in sorted(tables_by_name.keys()):
+    for tbl_key in sorted_tbl_keys:
         site_map = tables_by_name[tbl_key]
         present = [s for s in source_names if s in site_map]
         missing = [s for s in source_names if s not in site_map]
@@ -228,12 +233,22 @@ def harmonize_snapshots(
         union_branches: list[str] = []
         if target_platform == "snowflake":
             sf_tbl = sanitize_snowflake_identifier(tbl_key)
+            sf_view_stem = view_sf_map[tbl_key]
+            sf_col_aliases = deduplicate_snowflake_columns([hc.sanitized_name for hc in h_cols])
+            existing_sf_aliases = set(sf_col_aliases.values())
+            plant_col = "SOURCE_PLANT"
+            if plant_col in existing_sf_aliases:
+                plant_col = "_TICK_SOURCE_PLANT"
+                sfx = 2
+                while plant_col in existing_sf_aliases:
+                    plant_col = f"_TICK_SOURCE_PLANT_{sfx}"
+                    sfx += 1
             for s in present:
                 sf_site = sf_site_map[s]
                 escaped_site_lit = s.replace("'", "''")
-                selects = [f"    '{escaped_site_lit}' AS \"SOURCE_PLANT\""]
+                selects = [f"    '{escaped_site_lit}' AS {_dq(plant_col)}"]
                 for hc in h_cols:
-                    sf_col_alias = sanitize_snowflake_identifier(hc.sanitized_name)
+                    sf_col_alias = sf_col_aliases[hc.sanitized_name]
                     tgt_t = hc.target_snowflake_type or "VARCHAR"
                     if s in hc.present_in_sources:
                         orig_col = col_sites[hc.sanitized_name][s][0]
@@ -251,16 +266,25 @@ def harmonize_snapshots(
                 union_branches.append(branch)
 
             unified_sql = (
-                f"CREATE OR REPLACE VIEW {_dq(sf_db)}.\"SILVER\".{_dq(f'UNIFIED_{sf_tbl}')} AS\n"
+                f"CREATE OR REPLACE VIEW {_dq(sf_db)}.\"SILVER\".{_dq(f'UNIFIED_{sf_view_stem}')} AS\n"
                 + "\nUNION ALL\n".join(union_branches)
                 + ";\n"
             )
         else:
             safe_tbl = sanitize_delta_column_name(tbl_key)
+            dbx_view_stem = view_dbx_map[tbl_key]
+            existing_dbx_aliases = {hc.sanitized_name for hc in h_cols}
+            plant_col_dbx = "source_plant"
+            if plant_col_dbx in existing_dbx_aliases:
+                plant_col_dbx = "_tick_source_plant"
+                sfx = 2
+                while plant_col_dbx in existing_dbx_aliases:
+                    plant_col_dbx = f"_tick_source_plant_{sfx}"
+                    sfx += 1
             for s in present:
                 safe_site = safe_site_map[s]
                 escaped_site_lit = s.replace("'", "''")
-                selects = [f"    '{escaped_site_lit}' AS `source_plant`"]
+                selects = [f"    '{escaped_site_lit}' AS `{plant_col_dbx}`"]
                 for hc in h_cols:
                     if s in hc.present_in_sources:
                         orig_col = col_sites[hc.sanitized_name][s][0].replace("`", "``")
@@ -278,7 +302,7 @@ def harmonize_snapshots(
                 union_branches.append(branch)
 
             unified_sql = (
-                f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{safe_tbl}` AS\n"
+                f"CREATE OR REPLACE VIEW `{cat_esc}`.`silver`.`unified_{dbx_view_stem}` AS\n"
                 + "\nUNION ALL\n".join(union_branches)
                 + ";\n"
             )

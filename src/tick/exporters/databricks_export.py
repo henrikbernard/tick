@@ -91,6 +91,7 @@ def render_unity_catalog_ddl(
     for tbl in base_tables:
         safe_tbl = tbl_name_map[tbl.full_name]
         col_map = deduplicate_column_names([c.name for c in tbl.columns])
+        existing_dbx_cols = set(col_map.values())
         fqn = f"{_bt(cat)}.{_bt(sch)}.{_bt(safe_tbl)}"
         dc = tbl.delta_compatibility
 
@@ -108,9 +109,11 @@ def render_unity_catalog_ddl(
             comment_sql = f" COMMENT '{_sql_str(comment_text)}'" if comment_text else ""
             col_defs.append(f"  {_bt(cname)} {stype}{nn}{comment_sql}")
 
-        # Standard Bronze/Silver audit metadata columns
-        col_defs.append("  `_ingested_at` TIMESTAMP COMMENT 'Databricks ingestion timestamp (UTC)'")
-        col_defs.append("  `_source_system` STRING COMMENT 'Originating plant / source system identifier'")
+        # Standard Bronze/Silver audit metadata columns (skip if source table already carries them)
+        if "_ingested_at" not in existing_dbx_cols:
+            col_defs.append("  `_ingested_at` TIMESTAMP COMMENT 'Databricks ingestion timestamp (UTC)'")
+        if "_source_system" not in existing_dbx_cols:
+            col_defs.append("  `_source_system` STRING COMMENT 'Originating plant / source system identifier'")
         lines.append(",\n".join(col_defs))
         lines.append(")")
         lines.append("USING DELTA")
@@ -154,7 +157,7 @@ def render_unity_catalog_ddl(
                         entry[1].append(reason)
                 for gov in col.profile.governance_findings:
                     lines.append(
-                        f"ALTER TABLE {fqn} ALTER COLUMN {_bt(cname)} SET TAGS ('{gov.uc_tag_key}' = '{gov.uc_tag_value}');"
+                        f"ALTER TABLE {fqn} ALTER COLUMN {_bt(cname)} SET TAGS ('{_sql_str(gov.uc_tag_key)}' = '{_sql_str(gov.uc_tag_value)}');"
                     )
                     if gov.uc_policy == "row_filter":
                         if fqn not in row_filter_tables:
@@ -208,7 +211,7 @@ def render_unity_catalog_ddl(
             lines.append("")
 
         if mask_columns:
-            mask_items = list(mask_columns.items())[:25]
+            mask_items = list(mask_columns.items())
             seen_mask_types: list[str] = []
             for _, (stype, _) in mask_items:
                 if stype not in seen_mask_types:
@@ -441,14 +444,20 @@ def render_lakeflow_pipeline_py(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_databricks_sizing_md(result: DiscoveryResult) -> str:
+def render_databricks_sizing_md(
+    result: DiscoveryResult,
+    catalog: str | None = None,
+    schema: str | None = None,
+) -> str:
     """Render a Databricks Lakeflow Connect CDC readiness & backfill sizing guide."""
     ov = result.overview
+    cat = catalog or result.config.databricks_catalog
+    sch = schema or result.config.databricks_schema
     lines: list[str] = [
         f"# Databricks Ingestion & CDC Readiness Plan: `{ov.database_name}`",
         "",
         f"- **Source:** `{ov.dialect}` ({ov.server_version or ov.driver})",
-        f"- **Target Unity Catalog:** `{result.config.databricks_catalog}.{result.config.databricks_schema}`",
+        f"- **Target Unity Catalog:** `{cat}.{sch}`",
         f"- **CDC Ready / Blocked Tables:** `{ov.cdc_ready_table_count}` ready · `{ov.cdc_blocked_table_count}` blocked",
         f"- **Delta Compatibility Warnings:** `{ov.delta_warning_count}`",
         "",
@@ -542,7 +551,10 @@ def export_databricks_bundle(
     written.append(dlt_path)
 
     sizing_path = root / "ingestion_sizing.md"
-    sizing_path.write_text(render_databricks_sizing_md(result), encoding="utf-8")
+    sizing_path.write_text(
+        render_databricks_sizing_md(result, catalog=catalog, schema=bronze_schema),
+        encoding="utf-8",
+    )
     written.append(sizing_path)
 
     return written

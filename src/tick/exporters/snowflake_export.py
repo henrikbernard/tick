@@ -265,7 +265,7 @@ def render_snowflake_ddl(
             lines.append("")
 
         if mask_columns:
-            mask_items = list(mask_columns.items())[:25]
+            mask_items = list(mask_columns.items())
             seen_mp_types: list[str] = []
             for _, (stype, _) in mask_items:
                 if stype not in seen_mp_types:

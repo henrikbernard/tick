@@ -153,15 +153,17 @@ def _fetch_full_table_aggregates(
     if not row:
         return {}
 
-    total = int(row["__total__"] or 0)
+    # Normalize keys case-insensitively (Snowflake/Oracle/DB2 fold unquoted aliases to UPPERCASE)
+    row_ci = {str(k).lower(): v for k, v in row.items()}
+    total = int(row_ci.get("__total__") or 0)
     out: dict[str, dict[str, Any]] = {}
     for idx, col in enumerate(columns):
-        nn = int(row[f"__nn_{idx}__"] or 0)
+        nn = int(row_ci.get(f"__nn_{idx}__") or 0)
         out[col.name] = {
             "total": total,
             "non_null": nn,
-            "min": row.get(f"__min_{idx}__"),
-            "max": row.get(f"__max_{idx}__"),
+            "min": row_ci.get(f"__min_{idx}__"),
+            "max": row_ci.get(f"__max_{idx}__"),
         }
     return out
 

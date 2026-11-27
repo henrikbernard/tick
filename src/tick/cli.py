@@ -41,7 +41,7 @@ from tick.models import (
 
 app = typer.Typer(
     name="tick",
-    help="Universal automatic database discovery, Databricks Lakeflow readiness, and manufacturing DE tool.",
+    help="Universal automatic database discovery for Data Engineering, Databricks, Snowflake & Manufacturing.",
     no_args_is_help=True,
 )
 console = Console()
@@ -67,6 +67,7 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
     )
     console.print(Panel(header, title="tick Discovery Complete", border_style="cyan"))
 
+    target_plat = result.config.target_platform
     kpi = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
     kpi.add_column("Schemas", justify="right")
     kpi.add_column("Tables (Empty)", justify="right")
@@ -75,7 +76,13 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
     kpi.add_column("FKs (E/I)", justify="right")
     kpi.add_column("PII/Gov", justify="right")
     kpi.add_column("CDC (R/B)", justify="right")
-    kpi.add_column("Delta Warns", justify="right")
+    warn_hdr = "SF Warns" if target_plat == "snowflake" else ("Delta Warns" if target_plat == "databricks" else "Delta/SF Warns")
+    warn_val = (
+        str(ov.snowflake_warning_count)
+        if target_plat == "snowflake"
+        else (str(ov.delta_warning_count) if target_plat == "databricks" else f"{ov.delta_warning_count}/{ov.snowflake_warning_count}")
+    )
+    kpi.add_column(warn_hdr, justify="right")
     kpi.add_column("Health", justify="right")
     health_style = "green" if ov.avg_quality_score >= 85 else ("yellow" if ov.avg_quality_score >= 65 else "red")
     kpi.add_row(
@@ -86,18 +93,24 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
         f"{ov.explicit_fk_count}/{ov.inferred_relationship_count}",
         f"{ov.pii_column_count}/{ov.governance_column_count}",
         f"[green]{ov.cdc_ready_table_count}[/green]/[red]{ov.cdc_blocked_table_count}[/red]",
-        str(ov.delta_warning_count),
+        warn_val,
         f"[{health_style}]{ov.avg_quality_score}/100[/{health_style}]",
     )
     console.print(kpi)
 
-    tbl_view = Table(title="Discovered Objects & Databricks Blueprint", box=box.ROUNDED, show_lines=False)
+    bp_title = (
+        "Discovered Objects & Snowflake Blueprint"
+        if target_plat == "snowflake"
+        else ("Discovered Objects & Databricks Blueprint" if target_plat == "databricks" else "Discovered Objects & Cloud Blueprint")
+    )
+    cluster_col = "SF Cluster / WH" if target_plat == "snowflake" else "Clustering"
+    tbl_view = Table(title=bp_title, box=box.ROUNDED, show_lines=False)
     tbl_view.add_column("Object", style="bold")
     tbl_view.add_column("Semantic", style="cyan")
     tbl_view.add_column("Role", style="magenta")
     tbl_view.add_column("Rows", justify="right")
     tbl_view.add_column("CDC")
-    tbl_view.add_column("Liquid Cluster")
+    tbl_view.add_column(cluster_col)
     tbl_view.add_column("Health", justify="right")
     tbl_view.add_column("Flags")
 
@@ -105,6 +118,7 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
         rec = t.recommendations
         cdc = t.cdc_readiness
         dc = t.delta_compatibility
+        sfc = t.snowflake_compatibility
         pii_cnt = sum(1 for c in t.columns if c.profile and c.profile.pii_findings)
         gov_cnt = sum(1 for c in t.columns if c.profile and c.profile.governance_findings)
         flags: list[str] = []
@@ -113,19 +127,26 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
         if pii_cnt:
             flags.append(f"[yellow]PII:{pii_cnt}[/yellow]")
         if gov_cnt:
-            flags.append(f"[orange1]UC:{gov_cnt}[/orange1]")
+            gov_lbl = "GOV" if target_plat == "snowflake" else "UC"
+            flags.append(f"[orange1]{gov_lbl}:{gov_cnt}[/orange1]")
         if t.telemetry_profile:
             flags.append("[cyan]OT[/cyan]")
         if t.hierarchy:
             flags.append("[magenta]BOM/TREE[/magenta]")
         if dc and dc.requires_column_mapping:
             flags.append("[red]COL_MAP[/red]")
+        elif sfc and sfc.requires_quoted_identifiers:
+            flags.append("[yellow]SF_QUOTE[/yellow]")
         if t.row_count == 0 and t.table_type == "table":
             flags.append("[dim]EMPTY[/dim]")
         h_color = "green" if t.quality_score >= 85 else ("yellow" if t.quality_score >= 65 else "red")
         cdc_st = cdc.status if cdc else "—"
         cdc_col = "green" if cdc_st == "ready" else ("red" if cdc_st == "blocked" else "yellow")
-        lck = ", ".join(dc.liquid_clustering_keys[:2]) if (dc and dc.liquid_clustering_keys) else "—"
+        if target_plat == "snowflake":
+            sf_keys = ", ".join(sfc.clustering_keys[:2]) if (sfc and sfc.clustering_keys) else "—"
+            lck = f"{sf_keys} ({sfc.recommended_warehouse_size})" if sfc else "—"
+        else:
+            lck = ", ".join(dc.liquid_clustering_keys[:2]) if (dc and dc.liquid_clustering_keys) else "—"
         tbl_view.add_row(
             escape(t.full_name),
             escape(t.semantic_name or "—"),
@@ -140,7 +161,7 @@ def _render_terminal_summary(result: DiscoveryResult) -> None:
 
     high_med = [i for i in result.quality_issues if i.severity in {"high", "medium"}]
     if high_med:
-        iss_tbl = Table(title=f"Top Quality, Governance & Delta Alerts ({len(high_med)} high/medium)", box=box.SIMPLE)
+        iss_tbl = Table(title=f"Top Quality, Governance & Platform Alerts ({len(high_med)} high/medium)", box=box.SIMPLE)
         iss_tbl.add_column("Sev")
         iss_tbl.add_column("Category", style="cyan")
         iss_tbl.add_column("Target", style="bold")
@@ -215,8 +236,10 @@ def _render_diff_summary(diff: SnapshotDiff) -> None:
 
 
 def _render_harmonization_summary(report: HarmonizationReport) -> None:
+    plat = "Snowflake" if report.target_platform == "snowflake" else "Databricks"
     console.print(
         Panel(
+            f"Target: [bold magenta]{plat}[/bold magenta] · "
             f"Plants / Sources: [bold cyan]{escape(', '.join(report.sources))}[/bold cyan]\n"
             f"Unique tables: {report.total_unique_tables} · "
             f"[green]Fully aligned: {report.fully_aligned_tables}[/green] · "
@@ -254,7 +277,7 @@ def discover(
         None,
         "--out-dir",
         "-o",
-        help="Write full bundle (report.html, report.md, snapshot.json, dbt/, databricks/) to this directory.",
+        help="Write full bundle (report.html, report.md, snapshot.json, dbt/, databricks/, snowflake/, contracts/) to this directory.",
     ),
     html_out: Optional[Path] = typer.Option(None, "--html", help="Write standalone interactive HTML report."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write Markdown data dictionary & Mermaid diagrams."),

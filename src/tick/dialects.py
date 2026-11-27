@@ -169,17 +169,23 @@ _SENSITIVE_QUERY_KEYS = {
     "password",
     "pwd",
     "pass",
+    "passcode",
     "token",
     "access_token",
     "auth_token",
+    "oauth_token",
+    "authenticator_token",
     "secret",
     "client_secret",
     "api_key",
     "apikey",
     "sas_token",
     "sig",
+    "private_key",
+    "private_key_pwd",
+    "private_key_file_pwd",
 }
-_ODBC_SECRET_RE = re.compile(r"(?i)((?:PWD|Password|AccessToken|Token)\s*=\s*)([^;]+)")
+_ODBC_SECRET_RE = re.compile(r"(?i)((?:^|[;&?])(?:PWD|Password|AccessToken|Token)\s*=\s*)([^;&]+)")
 
 
 def sanitize_url(url: str) -> str:
@@ -200,7 +206,7 @@ def sanitize_url(url: str) -> str:
     except Exception:
         masked = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", url)
         masked = re.sub(
-            r"(?i)([?&](?:password|pwd|pass|token|access_token|auth_token|secret|client_secret|api_key|apikey|sas_token)=)([^&]+)",
+            r"(?i)([?&](?:password|pwd|pass|passcode|token|access_token|auth_token|oauth_token|authenticator_token|secret|client_secret|api_key|apikey|sas_token|sig|private_key|private_key_pwd|private_key_file_pwd)=)([^&]+)",
             r"\1***",
             masked,
         )
@@ -1290,6 +1296,18 @@ class SnowflakeAdapter(DialectAdapter):
     sqlglot_dialect = "snowflake"
     system_schemas = {"INFORMATION_SCHEMA", "information_schema"}
 
+    def get_database_name(self, engine: Engine) -> str:
+        # Snowflake URLs encode DB/SCHEMA in url.database (e.g. snowflake://user@acct/MY_DB/PUBLIC)
+        db = engine.url.database
+        if db:
+            first = db.strip("/").split("/", 1)[0]
+            if first:
+                return first
+        qdb = engine.url.query.get("database")
+        if qdb:
+            return str(qdb)
+        return super().get_database_name(engine)
+
     def get_server_version(self, conn: Connection) -> str | None:
         try:
             val = conn.execute(text("SELECT CURRENT_VERSION()")).scalar()
@@ -1330,18 +1348,23 @@ class SnowflakeAdapter(DialectAdapter):
                     """
                     SELECT TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES, COMMENT
                     FROM INFORMATION_SCHEMA.TABLES
-                    WHERE TABLE_SCHEMA = :schema
+                    WHERE UPPER(TABLE_SCHEMA) = UPPER(:schema)
                     """
                 ),
                 {"schema": schema_name},
             ).mappings()
-            for row in rows:
-                ttype = str(row.get("TABLE_TYPE") or "").upper()
-                stats[row["TABLE_NAME"]] = TableStats(
-                    row_count=int(row["ROW_COUNT"]) if row.get("ROW_COUNT") is not None else None,
+            for raw_row in rows:
+                # snowflake-sqlalchemy may return lowercase or uppercase RowMapping keys depending on version
+                row = {str(k).lower(): v for k, v in raw_row.items()}
+                tname = row.get("table_name")
+                if not tname:
+                    continue
+                ttype = str(row.get("table_type") or "").upper()
+                stats[str(tname)] = TableStats(
+                    row_count=int(row["row_count"]) if row.get("row_count") is not None else None,
                     row_count_exact=True,
-                    size_bytes=int(row["BYTES"]) if row.get("BYTES") is not None else None,
-                    comment=row.get("COMMENT") or None,
+                    size_bytes=int(row["bytes"]) if row.get("bytes") is not None else None,
+                    comment=row.get("comment") or None,
                     is_materialized_view=(ttype == "MATERIALIZED VIEW"),
                 )
         except Exception:
@@ -1367,6 +1390,12 @@ class BigQueryAdapter(DialectAdapter):
     name = "bigquery"
     sqlglot_dialect = "bigquery"
     system_schemas = {"INFORMATION_SCHEMA", "information_schema"}
+
+    def get_database_name(self, engine: Engine) -> str:
+        # BigQuery URLs use bigquery://project/dataset (host=project, database=dataset)
+        if engine.url.host and engine.url.database:
+            return f"{engine.url.host}.{engine.url.database.strip('/')}"
+        return super().get_database_name(engine)
 
 
 def get_dialect_adapter(dialect_name: str) -> DialectAdapter:

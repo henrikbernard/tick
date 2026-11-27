@@ -15,6 +15,7 @@ from tick.databricks import (
     sanitize_delta_column_name,
 )
 from tick.models import CanonicalType, DiscoveryResult
+from tick.snowflake import map_to_snowflake_type
 
 _ODCS_LOGICAL_TYPES: dict[CanonicalType, str] = {
     "integer": "integer",
@@ -240,8 +241,9 @@ def render_odcs_yaml(
     schema: str | None = None,
 ) -> str:
     """Render an Open Data Contract Standard (ODCS v3.0.0) YAML contract from discovered metadata."""
-    cat = catalog or result.config.databricks_catalog
-    sch = schema or result.config.databricks_schema
+    is_sf_only = result.config.target_platform == "snowflake"
+    cat = catalog or (result.config.snowflake_database if is_sf_only else result.config.databricks_catalog)
+    sch = schema or (result.config.snowflake_schema if is_sf_only else result.config.databricks_schema)
     ov = result.overview
 
     base_tables = [t for t in result.tables if t.table_type == "table"]
@@ -258,14 +260,17 @@ def render_odcs_yaml(
 
         for col in tbl.columns:
             cname = col_map[col.name]
-            stype = col.spark_type or map_to_spark_type(col.raw_type, col.canonical_type)
+            if is_sf_only:
+                phys_type = col.snowflake_type or map_to_snowflake_type(col.raw_type, col.canonical_type)
+            else:
+                phys_type = col.spark_type or map_to_spark_type(col.raw_type, col.canonical_type)
             prof = col.profile
 
             prop: dict[str, Any] = {
                 "name": cname,
                 "physicalName": col.name,
                 "logicalType": _ODCS_LOGICAL_TYPES.get(col.canonical_type, "string"),
-                "physicalType": stype,
+                "physicalType": phys_type,
                 "required": not col.nullable or col.is_primary_key,
                 "unique": col.is_unique or (col.is_primary_key and len(tbl.primary_key) == 1),
             }
@@ -417,9 +422,10 @@ def export_contracts_bundle(
     root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
-    dqx_path = root / "dqx_checks.yml"
-    dqx_path.write_text(render_dqx_yaml(result, catalog=catalog, schema=schema), encoding="utf-8")
-    written.append(dqx_path)
+    if result.config.target_platform in {"databricks", "both"}:
+        dqx_path = root / "dqx_checks.yml"
+        dqx_path.write_text(render_dqx_yaml(result, catalog=catalog, schema=schema), encoding="utf-8")
+        written.append(dqx_path)
 
     odcs_path = root / "data_contract.odcs.yml"
     odcs_path.write_text(render_odcs_yaml(result, catalog=catalog, schema=schema), encoding="utf-8")
