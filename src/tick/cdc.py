@@ -46,6 +46,10 @@ def audit_cdc_readiness(
                 for tbl_name, probe in adapter.audit_table_cdc(conn, schema).items():
                     table_probes[(schema, tbl_name)] = probe
 
+    table_probes_ci = {
+        (k[0].lower(), k[1].lower()): v for k, v in table_probes.items()
+    }
+
     for tbl in tables:
         if tbl.table_type != "table":
             tbl.cdc_readiness = CdcReadiness(
@@ -77,7 +81,9 @@ def audit_cdc_readiness(
             )
             continue
 
-        probe = table_probes.get((tbl.schema_name, tbl.name))
+        probe = table_probes.get((tbl.schema_name, tbl.name)) or table_probes_ci.get(
+            (tbl.schema_name.lower(), tbl.name.lower())
+        )
         has_pk = len(tbl.primary_key) > 0
         blockers: list[str] = []
         warnings: list[str] = []
@@ -109,10 +115,19 @@ def audit_cdc_readiness(
                 )
             if db_audit.db_change_tracking_enabled is False and db_audit.db_cdc_enabled is False:
                 blockers.append("Neither SQL Server Change Tracking nor CDC is enabled at the database level.")
+            elif not has_pk and db_audit.db_cdc_enabled is False:
+                blockers.append(
+                    "No primary key and SQL Server CDC is disabled at the database level (Change Tracking requires a PK)."
+                )
             elif ct_on is False and cdc_on is False:
                 warnings.append("Table does not yet have Change Tracking or CDC enabled.")
 
-            connector = "lakeflow_connect_mssql_ct" if has_pk else "lakeflow_connect_mssql_cdc"
+            use_cdc_connector = (
+                (not has_pk)
+                or (bool(cdc_on) and not bool(ct_on))
+                or (db_audit.db_cdc_enabled is True and db_audit.db_change_tracking_enabled is False)
+            )
+            connector = "lakeflow_connect_mssql_cdc" if use_cdc_connector else "lakeflow_connect_mssql_ct"
             if blockers:
                 status = "blocked"
             elif (has_pk and ct_on) or cdc_on:
@@ -124,12 +139,14 @@ def audit_cdc_readiness(
             ri = probe.replica_identity if probe else None
             if db_audit.wal_level and db_audit.wal_level != "logical":
                 blockers.append(f"PostgreSQL wal_level is '{db_audit.wal_level}'; must be 'logical' for CDC.")
-            if not has_pk and ri != "full":
-                blockers.append("Table has no primary key and REPLICA IDENTITY is not FULL (required for UPDATE/DELETE replication).")
+            if ri == "nothing":
+                blockers.append("PostgreSQL REPLICA IDENTITY is NOTHING (blocks UPDATE/DELETE logical replication).")
+            elif not has_pk and ri not in {"full", "index"}:
+                blockers.append("Table has no primary key and REPLICA IDENTITY is not FULL or USING INDEX (required for UPDATE/DELETE replication).")
             connector = "lakeflow_connect_postgres_logical"
             if blockers:
                 status = "blocked"
-            elif db_audit.db_cdc_enabled and (has_pk or ri == "full"):
+            elif db_audit.db_cdc_enabled and ri != "nothing" and (has_pk or ri in {"full", "index"}):
                 status = "ready"
             else:
                 status = "needs_config"
@@ -184,8 +201,16 @@ def audit_cdc_readiness(
         tbl.cdc_readiness = CdcReadiness(
             status=status,  # type: ignore[arg-type]
             connector_recommendation=connector,
-            source_cdc_enabled=probe.cdc_enabled if probe else db_audit.db_cdc_enabled,
-            source_change_tracking_enabled=probe.change_tracking_enabled if probe else db_audit.db_change_tracking_enabled,
+            source_cdc_enabled=(
+                probe.cdc_enabled
+                if (probe and probe.cdc_enabled is not None)
+                else db_audit.db_cdc_enabled
+            ),
+            source_change_tracking_enabled=(
+                probe.change_tracking_enabled
+                if (probe and probe.change_tracking_enabled is not None)
+                else db_audit.db_change_tracking_enabled
+            ),
             has_primary_key=has_pk,
             blockers=blockers,
             warnings=warnings,

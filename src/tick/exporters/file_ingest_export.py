@@ -19,7 +19,18 @@ def _dq(val: str) -> str:
 
 
 def _sq(val: str) -> str:
-    return val.replace("\\", "\\\\").replace("'", "''")
+    """Escape a Snowflake single-quoted SQL string literal."""
+    return val.replace("\\", "\\\\").replace("'", "''").replace("\n", " ").replace("\r", " ")
+
+
+def _spark_sq(val: str) -> str:
+    """Escape a Databricks Spark SQL single-quoted string literal."""
+    return (
+        val.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
 
 
 def has_file_sources(result: DiscoveryResult) -> bool:
@@ -87,7 +98,7 @@ def render_databricks_autoloader_sql(
         if fmt == "csv":
             fmt_opts.append(f"'header' = '{'true' if fs.has_header is not False else 'false'}'")
             delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
-            delim_sql = "\\t" if delim == "\t" else _sq(delim)
+            delim_sql = "\\t" if delim == "\t" else _spark_sq(delim)
             fmt_opts.append(f"'sep' = '{delim_sql}'")
             fmt_opts.append("'inferSchema' = 'true'")
         elif fmt == "json":
@@ -96,7 +107,7 @@ def render_databricks_autoloader_sql(
             fmt_opts.append("'inferSchema' = 'true'")
 
         lines.append(f"COPY INTO {fqn}")
-        lines.append(f"FROM '{_sq(vol_path)}'")
+        lines.append(f"FROM '{_spark_sq(vol_path)}'")
         lines.append(f"FILEFORMAT = {fmt.upper()}")
         if fmt_opts:
             lines.append(f"FORMAT_OPTIONS ({', '.join(fmt_opts)})")
@@ -224,20 +235,36 @@ def render_snowflake_file_ingest_sql(
             if data_cols:
                 copy_target = f"{fqn} ({', '.join(data_cols)})"
 
+        pattern_line = (
+            "PATTERN = '^(?!.*_delta_log/).*\\\\.parquet$'\n"
+            if fs.file_format == "delta"
+            else ""
+        )
+        pipe_pattern = (
+            "PATTERN = '^(?!.*_delta_log/).*\\\\.parquet$' "
+            if fs.file_format == "delta"
+            else ""
+        )
+        fmt_lit = f"'{_sq(fmt_fqn)}'"
+
+        if fs.file_format == "delta":
+            lines.append(
+                "-- NOTE: Delta Lake source — stage only VACUUMed/active Parquet files or use Snowflake Iceberg/Delta Direct (CATALOG_INTEGRATION) to avoid loading tombstoned rows."
+            )
         lines.extend(
             [
                 f"-- Source: {fs.path} ({fs.file_format.upper()}, {fs.file_count} file(s), {fs.total_bytes:,} bytes)",
                 f"COPY INTO {copy_target}",
                 f"FROM {stage_subpath}",
-                f"FILE_FORMAT = (FORMAT_NAME = {fmt_fqn})",
-                f"{match_clause}ON_ERROR = 'CONTINUE';",
+                f"FILE_FORMAT = (FORMAT_NAME = {fmt_lit})",
+                f"{pattern_line}{match_clause}ON_ERROR = 'CONTINUE';",
                 "",
                 f"-- Optional continuous Snowpipe (requires cloud event notification on external stage):",
                 f"-- CREATE PIPE IF NOT EXISTS {pipe_fqn} AUTO_INGEST = TRUE AS",
                 f"-- COPY INTO {copy_target}",
                 f"-- FROM {stage_subpath}",
-                f"-- FILE_FORMAT = (FORMAT_NAME = {fmt_fqn})",
-                f"-- {'MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE ' if match_clause else ''}ON_ERROR = 'CONTINUE';",
+                f"-- FILE_FORMAT = (FORMAT_NAME = {fmt_lit})",
+                f"-- {pipe_pattern}{'MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE ' if match_clause else ''}ON_ERROR = 'CONTINUE';",
                 "",
             ]
         )

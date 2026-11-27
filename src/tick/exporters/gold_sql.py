@@ -96,8 +96,8 @@ def render_databricks_gold_hierarchies_sql(
         cluster_cols = ([_bt(plant_col)] if plant_col else []) + ["`root_node_id`", "`depth`"]
         plant_sel_e = f"    e.{_bt(plant_col)},\n" if plant_col else ""
         plant_sel_r = f"    r.{_bt(plant_col)},\n" if plant_col else ""
-        plant_anti_join = f" AND c.{_bt(plant_col)} = e.{_bt(plant_col)}" if plant_col else ""
-        plant_rec_join = f" AND e.{_bt(plant_col)} = r.{_bt(plant_col)}" if plant_col else ""
+        plant_anti_join = f" AND c.{_bt(plant_col)} <=> e.{_bt(plant_col)}" if plant_col else ""
+        plant_rec_join = f" AND e.{_bt(plant_col)} <=> r.{_bt(plant_col)}" if plant_col else ""
         plant_final_sel = f"  {_bt(plant_col)},\n" if plant_col else ""
 
         qty_root_sel = f"    CAST(e.{_bt(qty_col)} AS DOUBLE) AS `edge_qty`,\n    CAST(e.{_bt(qty_col)} AS DOUBLE) AS `extended_qty`,\n" if qty_col else ""
@@ -196,13 +196,20 @@ def render_snowflake_gold_hierarchies_sql(
 
         plant_sel_e = f"    e.{_dq(plant_col)},\n" if plant_col else ""
         plant_sel_r = f"    r.{_dq(plant_col)},\n" if plant_col else ""
-        plant_anti_join = f" AND c.{_dq(plant_col)} = e.{_dq(plant_col)}" if plant_col else ""
-        plant_rec_join = f" AND e.{_dq(plant_col)} = r.{_dq(plant_col)}" if plant_col else ""
+        plant_anti_join = f" AND c.{_dq(plant_col)} IS NOT DISTINCT FROM e.{_dq(plant_col)}" if plant_col else ""
+        plant_rec_join = f" AND e.{_dq(plant_col)} IS NOT DISTINCT FROM r.{_dq(plant_col)}" if plant_col else ""
         plant_final_sel = f"  {_dq(plant_col)},\n" if plant_col else ""
 
         qty_root_sel = f"    CAST(e.{_dq(qty_col)} AS FLOAT) AS \"EDGE_QTY\",\n    CAST(e.{_dq(qty_col)} AS FLOAT) AS \"EXTENDED_QTY\",\n" if qty_col else ""
         qty_rec_sel = f"    CAST(e.{_dq(qty_col)} AS FLOAT) AS \"EDGE_QTY\",\n    CAST(r.\"EXTENDED_QTY\" * e.{_dq(qty_col)} AS FLOAT) AS \"EXTENDED_QTY\",\n" if qty_col else ""
         qty_final_sel = "  \"EDGE_QTY\",\n  \"EXTENDED_QTY\",\n" if qty_col else ""
+
+        cte_cols = (
+            ([_dq(plant_col)] if plant_col else [])
+            + ['"ROOT_NODE_ID"', '"PARENT_NODE_ID"', '"CHILD_NODE_ID"']
+            + (['"EDGE_QTY"', '"EXTENDED_QTY"'] if qty_col else [])
+            + ['"DEPTH"', '"PATH_NODES"']
+        )
 
         lines.extend(
             [
@@ -211,7 +218,7 @@ def render_snowflake_gold_hierarchies_sql(
                 "  TARGET_LAG = '1 hour'",
                 f"  WAREHOUSE = {_dq(wh)}",
                 "AS",
-                "WITH RECURSIVE HIERARCHY_EDGES AS (",
+                f"WITH RECURSIVE HIERARCHY_EDGES ({', '.join(cte_cols)}) AS (",
                 "  SELECT",
                 f"{plant_sel_e}    COALESCE(e.{_dq(parent_col)}, e.{_dq(child_col)}) AS \"ROOT_NODE_ID\",",
                 f"    e.{_dq(parent_col)} AS \"PARENT_NODE_ID\",",

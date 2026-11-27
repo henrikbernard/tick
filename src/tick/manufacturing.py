@@ -22,10 +22,13 @@ JULIAN_CYYDDD_RE = re.compile(r"^[01]\d{2}(00[1-9]|0[1-9]\d|[12]\d{2}|3[0-5]\d|3
 JULIAN_YYYYDDD_RE = re.compile(r"^(19\d{2}|20\d{2})(00[1-9]|0[1-9]\d|[12]\d{2}|3[0-5]\d|36[0-6])$")
 HHMMSS_RE = re.compile(r"^([01]\d|2[0-3])[0-5]\d[0-5]\d$")
 
-DATE_NAME_RE = re.compile(r"(?:^|_)(?:date|dt|erdat|aedat|budat|bldat|day|mfg_dt|shift_dt|start_dt|end_dt)(?:$|_)", re.I)
-TIME_NAME_RE = re.compile(r"(?:^|_)(?:time|tm|erzet|aezeit|hr|hhmmss|shift_tm|start_tm|end_tm)(?:$|_)", re.I)
+DATE_NAME_RE = re.compile(r"(?:^|_)(?:date|dt|erdat|aedat|cpudt|budat|bldat|day|mfg_dt|shift_dt|start_dt|end_dt)(?:$|_)", re.I)
+TIME_NAME_RE = re.compile(r"(?:^|_)(?:time|tm|erzet|aezeit|cputm|hr|hhmmss|shift_tm|start_tm|end_tm)(?:$|_)", re.I)
 
-TAG_COL_RE = re.compile(r"(?:^|_)(?:tag|tag_id|tag_name|sensor|sensor_id|point_id|point_name|signal_id|channel_id|opc_tag)(?:$|_)", re.I)
+TAG_COL_RE = re.compile(
+    r"^(?:tag|sensor)$|(?:^|_)(?:tag_id|tag_name|tag_code|sensor_id|sensor_name|sensor_code|point_id|point_name|signal_id|channel_id|opc_tag)(?:$|_)",
+    re.I,
+)
 VALUE_COL_RE = re.compile(r"(?:^|_)(?:val|value|reading|numeric_val|float_val|measurement|pv|sensor_value)(?:$|_)", re.I)
 QUALITY_COL_RE = re.compile(r"(?:^|_)(?:quality|quality_code|opc_quality|qc|signal_quality|status_code)(?:$|_)", re.I)
 SENSOR_METRIC_RE = re.compile(
@@ -72,18 +75,23 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
     for col in table.columns:
         if col.profile is None or col.canonical_type not in {"integer", "string", "decimal"}:
             continue
-        samples = [
-            s.strip()
-            for s in artifacts.raw_str_samples.get((table.full_name, col.name), [])
-            if s.strip() and s.strip() not in {"0", "00000000", "000000", "99991231"}
+        # Normalize decimal-formatted ints like "20261126.0" BEFORE filtering sentinels like 0.0 / 99991231.0
+        norm_samples = [
+            cleaned
+            for s in artifacts.raw_str_samples.get((table.full_name, col.name), [])[:200]
+            if (cleaned := re.sub(r"\.0+$", "", s.strip()))
+            and cleaned not in {"0", "00000000", "000000", "99991231"}
         ]
-        if len(samples) < 3:
+        if len(norm_samples) < 3:
             continue
 
-        # Normalize decimal-formatted ints like "20261126.0" or "20261126.00"
-        norm_samples = [re.sub(r"\.0+$", "", s) for s in samples[:200]]
         n = len(norm_samples)
         col_lit = repr(col.name)
+        str_expr = (
+            f"F.col({col_lit}).cast('long').cast('string')"
+            if col.canonical_type == "decimal"
+            else f"F.col({col_lit}).cast('string')"
+        )
         norm_col = re.sub(r"[\s\-]+", "_", col.name.strip())
 
         # 1. YYYYMMDD
@@ -94,7 +102,7 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                 encoding=enc,  # type: ignore[arg-type]
                 confidence="high" if (ymd_hits / n >= 0.95 or DATE_NAME_RE.search(norm_col)) else "medium",
                 sample_match_rate=round(ymd_hits / n, 4),
-                spark_expression=f"F.to_date(F.col({col_lit}).cast('string'), 'yyyyMMdd')",
+                spark_expression=f"F.to_date({str_expr}, 'yyyyMMdd')",
                 note=f"Legacy {enc} date encoding detected in '{col.name}'; parse to Delta DATE in Silver.",
             )
             date_cols[col.name] = col
@@ -109,7 +117,7 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     encoding="hhmmss",
                     confidence="high",
                     sample_match_rate=round(hms_hits / n, 4),
-                    spark_expression=f"F.lpad(F.col({col_lit}).cast('string'), 6, '0')",
+                    spark_expression=f"F.lpad({str_expr}, 6, '0')",
                     note=f"Legacy HHMMSS time encoding detected in '{col.name}'; stitch with companion date column.",
                 )
                 time_cols[col.name] = col
@@ -124,9 +132,9 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     confidence="high",
                     sample_match_rate=round(cyy_hits / n, 4),
                     spark_expression=(
-                        f"F.to_date(F.concat((F.substring(F.col({col_lit}).cast('string'), 1, 1).cast('int') * 100 + 1900 "
-                        f"+ F.substring(F.col({col_lit}).cast('string'), 2, 2).cast('int')).cast('string'), "
-                        f"F.substring(F.col({col_lit}).cast('string'), 4, 3)), 'yyyyDDD')"
+                        f"F.to_date(F.concat((F.substring({str_expr}, 1, 1).cast('int') * 100 + 1900 "
+                        f"+ F.substring({str_expr}, 2, 2).cast('int')).cast('string'), "
+                        f"F.substring({str_expr}, 4, 3)), 'yyyyDDD')"
                     ),
                     note=f"Legacy JDE/ERP CYYDDD Julian date detected in '{col.name}'.",
                 )
@@ -139,7 +147,7 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     encoding="julian_yyyyddd",
                     confidence="high",
                     sample_match_rate=round(yyyyddd_hits / n, 4),
-                    spark_expression=f"F.to_date(F.col({col_lit}).cast('string'), 'yyyyDDD')",
+                    spark_expression=f"F.to_date({str_expr}, 'yyyyDDD')",
                     note=f"Legacy YYYYDDD Julian date detected in '{col.name}'.",
                 )
                 date_cols[col.name] = col
@@ -177,22 +185,32 @@ def _detect_legacy_dates_for_table(table: TableInfo, artifacts: ProfileArtifacts
                     matched_time = tname
                     break
         if matched_time and dcol.profile and dcol.profile.legacy_date:
+            tcol = time_cols[matched_time]
+            d_str_expr = (
+                f"F.col({dname!r}).cast('long').cast('string')"
+                if dcol.canonical_type == "decimal"
+                else f"F.col({dname!r}).cast('string')"
+            )
+            t_str_expr = (
+                f"F.col({matched_time!r}).cast('long').cast('string')"
+                if tcol.canonical_type == "decimal"
+                else f"F.col({matched_time!r}).cast('string')"
+            )
             dcol.profile.legacy_date.paired_column = matched_time
             if dcol.profile.legacy_date.encoding in {"yyyymmdd_int", "yyyymmdd_str"}:
                 dcol.profile.legacy_date.spark_expression = (
-                    f"F.to_timestamp(F.concat(F.col({dname!r}).cast('string'), "
-                    f"F.lpad(F.col({matched_time!r}).cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
+                    f"F.to_timestamp(F.concat({d_str_expr}, "
+                    f"F.lpad({t_str_expr}, 6, '0')), 'yyyyMMddHHmmss')"
                 )
             else:
                 date_expr = dcol.profile.legacy_date.spark_expression
                 dcol.profile.legacy_date.spark_expression = (
                     f"F.to_timestamp(F.concat(F.date_format({date_expr}, 'yyyyMMdd'), "
-                    f"F.lpad(F.col({matched_time!r}).cast('string'), 6, '0')), 'yyyyMMddHHmmss')"
+                    f"F.lpad({t_str_expr}, 6, '0')), 'yyyyMMddHHmmss')"
                 )
             dcol.profile.legacy_date.note = (
                 f"Split legacy DATE ('{dname}') + TIME ('{matched_time}') pair; stitch into TIMESTAMP in Silver."
             )
-            tcol = time_cols[matched_time]
             if tcol.profile and tcol.profile.legacy_date:
                 tcol.profile.legacy_date.paired_column = dname
 
@@ -212,16 +230,30 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     # Prefer sensor/event timestamp names over ETL/audit timestamps like ingested_at or created_at
     ts_col = next((c for c in ts_cols if TELEMETRY_TS_RE.search(_norm_col(c.name))), ts_cols[0])
 
-    tag_col = next((c for c in table.columns if TAG_COL_RE.search(_norm_col(c.name))), None)
+    qual_col = next((c for c in table.columns if QUALITY_COL_RE.search(_norm_col(c.name))), None)
     val_col = next(
         (
             c
             for c in table.columns
-            if VALUE_COL_RE.search(_norm_col(c.name)) and c.canonical_type in {"float", "decimal", "integer"}
+            if c.name != ts_col.name
+            and (qual_col is None or c.name != qual_col.name)
+            and VALUE_COL_RE.search(_norm_col(c.name))
+            and c.canonical_type in {"float", "decimal", "integer"}
         ),
         None,
     )
-    qual_col = next((c for c in table.columns if QUALITY_COL_RE.search(_norm_col(c.name))), None)
+    tag_col = next(
+        (
+            c
+            for c in table.columns
+            if c.name != ts_col.name
+            and (val_col is None or c.name != val_col.name)
+            and (qual_col is None or c.name != qual_col.name)
+            and c.canonical_type in {"string", "integer", "uuid"}
+            and TAG_COL_RE.search(_norm_col(c.name))
+        ),
+        None,
+    )
     sensor_num_cols = [
         c
         for c in table.columns
@@ -275,7 +307,7 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
     flatlines: list[str] = []
     for cname in value_cols:
         c = next((col for col in table.columns if col.name == cname), None)
-        if c and c.profile and c.profile.sample_size >= 10:
+        if c and c.profile and c.profile.non_null_count >= 10:
             if c.profile.cardinality_class == "constant" or (c.profile.stddev is not None and c.profile.stddev == 0.0):
                 flatlines.append(cname)
 
@@ -295,7 +327,7 @@ def _detect_telemetry_for_table(table: TableInfo, artifacts: ProfileArtifacts) -
             bad_qual_rate = round(bad / len(q_samples), 4)
 
     watermark_delay = "5 minutes" if (median_interval is not None and median_interval <= 60) else "15 minutes"
-    cluster_keys = [tag_col.name, ts_col.name] if tag_col else [ts_col.name]
+    cluster_keys = [tag_col.name, ts_col.name] if (tag_col and tag_col.name != ts_col.name) else [ts_col.name]
     notes = [
         f"Detected {pattern.replace('_', ' ')} OT telemetry pattern.",
         f"Recommended Databricks Liquid Clustering: CLUSTER BY ({', '.join(cluster_keys)}).",
@@ -460,7 +492,16 @@ def _estimate_sizing_for_table(table: TableInfo, artifacts: ProfileArtifacts) ->
                 span_days = span_seconds / 86400.0
             else:
                 span_days = max(1.0, span_seconds / 86400.0)
-            daily_rows = round(row_count / span_days, 1)
+            # Match numerator to the span denominator: if full-table aggregates didn't run and we took a
+            # contiguous LIMIT slice (not random TABLESAMPLE), divide sample_size by the slice's span.
+            is_contiguous_sub_sample = (
+                table.full_name not in artifacts.tablesampled_tables
+                and ts_col_obj is not None
+                and ts_col_obj.profile is not None
+                and 0 < ts_col_obj.profile.sample_size < row_count
+            )
+            numerator_rows = ts_col_obj.profile.sample_size if is_contiguous_sub_sample else row_count
+            daily_rows = round(numerator_rows / span_days, 1)
             daily_mb = round((daily_rows * row_width) / (1024 * 1024), 4)
 
     notes: list[str] = []
@@ -472,7 +513,7 @@ def _estimate_sizing_for_table(table: TableInfo, artifacts: ProfileArtifacts) ->
         cadence = "hourly_batch"
         tier = "Lakeflow Connect Managed CDC + Serverless Lakeflow Pipeline"
         notes.append("High volume table; prefer log-based CDC / Lakeflow Connect with Liquid Clustering.")
-    elif row_count <= 2000:
+    elif table.row_count is not None and row_count <= 2000:
         cadence = "weekly_full_refresh" if (daily_rows is not None and daily_rows < 2) else "daily_batch"
         tier = "Serverless Databricks Workflow / Lakeflow Batch"
         notes.append("Small table; lightweight Serverless batch full refresh or merge.")

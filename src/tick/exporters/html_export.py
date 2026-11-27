@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 
 from tick.exporters.databricks_export import (
@@ -1531,10 +1532,20 @@ def render_html_report(result: DiscoveryResult) -> str:
         "sf_fi": render_snowflake_file_ingest_sql(result) if file_mode else "",
         "sf_sis": render_snowflake_streamlit_app(result),
     }
-    raw_json = json.dumps(payload).replace("</", "<\\/")
-    return (
-        HTML_TEMPLATE.replace("__TITLE__", html.escape(result.overview.database_name))
-        .replace("__PAYLOAD_JSON__", raw_json)
+    raw_json = (
+        json.dumps(payload)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    replacements = {
+        "__TITLE__": html.escape(result.overview.database_name),
+        "__PAYLOAD_JSON__": raw_json,
+    }
+    return re.sub(
+        r"__TITLE__|__PAYLOAD_JSON__",
+        lambda m: replacements[m.group(0)],
+        HTML_TEMPLATE,
     )
 
 

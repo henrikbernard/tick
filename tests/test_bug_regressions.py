@@ -395,4 +395,4 @@ def test_regression_12_harmonize_multi_schema_and_sql_escaping():
     assert "erp.orders" in names
     assert "mes.orders" in names
     erp_tbl = next(t for t in report.tables if t.table_name == "erp.orders")
-    assert "'plant''s_one' AS `source_plant`" in erp_tbl.unified_sql
+    assert r"'plant\'s_one' AS `source_plant`" in erp_tbl.unified_sql

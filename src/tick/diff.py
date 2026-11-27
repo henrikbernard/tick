@@ -8,15 +8,20 @@ from pathlib import Path
 
 from tick.models import ColumnChange, DiscoveryResult, MetricDrift, SnapshotDiff
 
-_TYPE_ARGS_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)")
+_TYPE_ARGS_RE = re.compile(r"\(\s*(\d+)\s*(?:,\s*(\d+)\s*|(?:CHAR|BYTE)\s*)?\)")
 _INT_RANK = {
     "TINYINT": 1,
     "BYTEINT": 1,
     "UTINYINT": 1,
+    "UINT8": 1,
+    "INT8_U": 1,
     "SMALLINT": 2,
     "INT2": 2,
+    "INT16": 2,
     "SHORT": 2,
     "USMALLINT": 2,
+    "UINT16": 2,
+    "SMALLSERIAL": 2,
     "MEDIUMINT": 3,
     "INT": 4,
     "INTEGER": 4,
@@ -32,8 +37,34 @@ _INT_RANK = {
     "UINT64": 5,
     "BIGSERIAL": 5,
     "HUGEINT": 6,
+    "UHUGEINT": 6,
     "INT128": 6,
 }
+_INT_DIGIT_WIDTH = {
+    1: 3,
+    2: 5,
+    3: 7,
+    4: 10,
+    5: 19,
+    6: 38,
+}
+_UNSIGNED_INT_BASES = {"UTINYINT", "UINT8", "USMALLINT", "UINT16", "UINTEGER", "UINT32", "UBIGINT", "UINT64", "UHUGEINT"}
+_UNBOUNDED_STRING_BASES = {
+    "TEXT",
+    "STRING",
+    "CLOB",
+    "NCLOB",
+    "DBCLOB",
+    "NTEXT",
+    "LONGTEXT",
+    "MEDIUMTEXT",
+    "VARCHAR",
+    "NVARCHAR",
+    "VARCHAR2",
+    "NVARCHAR2",
+    "CHARACTER",
+}
+_TZ_AWARE_MARKERS = ("TIMESTAMPTZ", "WITH TIME ZONE", "DATETIMEOFFSET", "TIMESTAMP_LTZ", "TIMESTAMP_TZ")
 
 
 def _is_breaking_type_change(
@@ -54,30 +85,72 @@ def _is_breaking_type_change(
     if before_canon == "integer":
         b_rank = _INT_RANK.get(b_base)
         a_rank = _INT_RANK.get(a_base)
-        if b_rank is not None and a_rank is not None and a_rank < b_rank:
-            return True
+        b_unsigned = b_base in _UNSIGNED_INT_BASES or "UNSIGNED" in bu
+        a_unsigned = a_base in _UNSIGNED_INT_BASES or "UNSIGNED" in au
+        if b_rank is not None and a_rank is not None:
+            if a_rank < b_rank:
+                return True
+            if b_unsigned and not a_unsigned and a_rank == b_rank:
+                return True
         bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
-        if bm and am and int(am.group(1)) < int(bm.group(1)):
+        b_digits = int(bm.group(1)) if bm else (_INT_DIGIT_WIDTH.get(b_rank) if b_rank else None)
+        a_digits = int(am.group(1)) if am else (_INT_DIGIT_WIDTH.get(a_rank) if a_rank else None)
+        if b_digits is not None and a_digits is not None and a_digits < b_digits:
             return True
 
     if before_canon == "decimal":
         bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
-        if bm and am:
-            bp, bs = int(bm.group(1)), int(bm.group(2) or 0)
-            ap, as_ = int(am.group(1)), int(am.group(2) or 0)
+        b_ps: tuple[int, int] | None = (
+            (int(bm.group(1)), int(bm.group(2) or 0))
+            if bm
+            else ((19, 4) if b_base == "MONEY" else ((10, 4) if b_base == "SMALLMONEY" else None))
+        )
+        a_ps: tuple[int, int] | None = (
+            (int(am.group(1)), int(am.group(2) or 0))
+            if am
+            else ((19, 4) if a_base == "MONEY" else ((10, 4) if a_base == "SMALLMONEY" else None))
+        )
+        # Unbounded NUMERIC/DECIMAL/NUMBER narrowed to bounded DECIMAL(p, s)
+        if b_ps is None and a_ps is not None:
+            return True
+        if b_ps is not None and a_ps is not None:
+            bp, bs = b_ps
+            ap, as_ = a_ps
             if ap < bp or as_ < bs or (ap - as_) < (bp - bs):
                 return True
 
     if before_canon == "string":
         bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
-        # Unbounded TEXT/STRING narrowed to bounded VARCHAR(n), or VARCHAR(255) -> VARCHAR(50)
-        if not bm and am and b_base in {"TEXT", "STRING", "CLOB", "NTEXT", "LONGTEXT", "MEDIUMTEXT"}:
+        b_unbounded = (not bm) and (
+            "(MAX)" in bu or b_base in _UNBOUNDED_STRING_BASES
+        )
+        # Unbounded string/TEXT/VARCHAR/VARCHAR(MAX) narrowed to bounded VARCHAR(n), or VARCHAR(255) -> VARCHAR(50)
+        if b_unbounded and am:
             return True
         if bm and am and int(am.group(1)) < int(bm.group(1)):
             return True
 
     if before_canon == "float":
         if b_base in {"DOUBLE", "FLOAT8", "BINARY_DOUBLE"} and a_base in {"FLOAT", "FLOAT4", "REAL", "BINARY_FLOAT"}:
+            return True
+        bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
+        if bm and am and int(am.group(1)) < int(bm.group(1)):
+            return True
+
+    if before_canon == "timestamp":
+        b_tz = any(m in bu for m in _TZ_AWARE_MARKERS)
+        a_tz = any(m in au for m in _TZ_AWARE_MARKERS)
+        if b_tz and not a_tz:
+            return True
+
+    if before_canon == "binary":
+        bm, am = _TYPE_ARGS_RE.search(bu), _TYPE_ARGS_RE.search(au)
+        b_unbounded = (not bm) and (
+            "(MAX)" in bu or b_base in {"BLOB", "LONGBLOB", "MEDIUMBLOB", "BYTEA", "BINARY", "VARBINARY", "IMAGE"}
+        )
+        if b_unbounded and am:
+            return True
+        if bm and am and int(am.group(1)) < int(bm.group(1)):
             return True
 
     return False

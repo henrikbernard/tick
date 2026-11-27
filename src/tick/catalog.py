@@ -47,6 +47,19 @@ def _matches_table_patterns(
     return True
 
 
+_SQL_IDENT_TOKEN_RE = re.compile(r'"((?:[^"]|"")+)"|([^\s,()."]+)')
+
+
+def _parse_sql_ident_list(raw: str) -> list[str]:
+    out: list[str] = []
+    for m in _SQL_IDENT_TOKEN_RE.finditer(raw):
+        if m.group(1) is not None:
+            out.append(m.group(1).replace('""', '"'))
+        elif m.group(2) is not None:
+            out.append(m.group(2))
+    return out
+
+
 def _duckdb_foreign_keys(conn: Connection, schema_name: str, table_name: str) -> list[ForeignKeyInfo]:
     """Extract foreign keys from duckdb_constraints() as fallback for duckdb-engine."""
     fks: list[ForeignKeyInfo] = []
@@ -64,18 +77,38 @@ def _duckdb_foreign_keys(conn: Connection, schema_name: str, table_name: str) ->
             ),
             {"schema": schema_name, "table": table_name},
         ).mappings()
+        fk_re = re.compile(
+            r"FOREIGN\s+KEY\s*\((.+?)\)\s+REFERENCES\s+"
+            r"(?:(?:\"(?:[^\"]|\"\")+\"|[^\s().,\"]+)\.)?"
+            r"(?:(?:\"(?:[^\"]|\"\")+\"|[^\s().,\"]+)\.)?"
+            r"(\"(?:[^\"]|\"\")+\"|[^\s().,\"]+)\s*\((.+?)\)\s*$",
+            flags=re.IGNORECASE,
+        )
+        ref_re = re.compile(
+            r"REFERENCES\s+(.+?)\s*\((.+?)\)\s*$",
+            flags=re.IGNORECASE,
+        )
         for row in rows:
-            ctext = str(row["constraint_text"] or "")
-            m = re.search(
-                r"FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+(?:(?:\"?(\w+)\"?)\.)?\"?(\w+)\"?\s*\(([^)]+)\)",
-                ctext,
-                flags=re.IGNORECASE,
-            )
-            if m:
-                src_cols = [c.strip().strip('"') for c in m.group(1).split(",")]
-                ref_schema = m.group(2) or schema_name
-                ref_table = m.group(3)
-                ref_cols = [c.strip().strip('"') for c in m.group(4).split(",")]
+            ctext = str(row["constraint_text"] or "").strip()
+            m_ref = ref_re.search(ctext)
+            if not m_ref:
+                continue
+            ref_target_raw = m_ref.group(1).strip()
+            ref_cols = _parse_sql_ident_list(m_ref.group(2))
+            ref_parts = _parse_sql_ident_list(ref_target_raw)
+            if not ref_parts or not ref_cols:
+                continue
+            ref_table = ref_parts[-1]
+            ref_schema = ref_parts[-2] if len(ref_parts) >= 2 else schema_name
+
+            raw_src = row.get("constraint_column_names")
+            if raw_src:
+                src_cols = [str(c) for c in raw_src]
+            else:
+                m_fk = fk_re.search(ctext)
+                src_cols = _parse_sql_ident_list(m_fk.group(1)) if m_fk else []
+
+            if src_cols:
                 fks.append(
                     ForeignKeyInfo(
                         name=None,
@@ -150,20 +183,29 @@ def _discover_schemas(
     for s in raw_schemas:
         if not s:
             continue
-        if s in adapter.system_schemas and s not in config.include_schemas:
+        explicitly_included = bool(config.include_schemas) and _matches_patterns(
+            s, config.include_schemas, []
+        )
+        if s in adapter.system_schemas and not explicitly_included:
             continue
         if not _matches_patterns(s, config.include_schemas, config.exclude_schemas):
             continue
         filtered.append(s)
 
-    if not filtered and default_schema and not config.include_schemas:
+    if (
+        not filtered
+        and not raw_schemas
+        and default_schema
+        and not config.include_schemas
+        and _matches_patterns(default_schema, config.include_schemas, config.exclude_schemas)
+    ):
         filtered = [default_schema]
     return filtered, default_schema
 
 
 def _count_rows_exact(conn: Connection, quoted_table: str) -> int | None:
     try:
-        val = conn.execute(text(f"SELECT COUNT(*) FROM {quoted_table}")).scalar()
+        val = conn.exec_driver_sql(f"SELECT COUNT(*) FROM {quoted_table}").scalar()
         return int(val) if val is not None else None
     except Exception:
         safe_rollback(conn)
@@ -208,10 +250,20 @@ def introspect_catalog(
                     view_names = []
                 matview_names = adapter.get_materialized_views(conn, schema_name)
 
+            # Materialized views may also be reported via TableStats.is_materialized_view (e.g. Snowflake/Databricks)
+            stats_matview_names = [k for k, st in stats_map.items() if st.is_materialized_view]
+            stats_matview_lower = {k.lower() for k in stats_matview_names}
+            if config.include_views:
+                matview_names = list(dict.fromkeys(list(matview_names) + stats_matview_names))
+
             # Avoid duplicate entries when dialects list matviews inside tables or views
             matview_set = set(matview_names)
-            view_set = set(view_names) - matview_set
-            table_set = [t for t in table_names if t not in matview_set and t not in view_set]
+            matview_lower = {m.lower() for m in matview_set} | stats_matview_lower
+            view_set = {v for v in view_names if v.lower() not in matview_lower}
+            view_lower = {v.lower() for v in view_set}
+            table_set = [
+                t for t in table_names if t.lower() not in matview_lower and t.lower() not in view_lower
+            ]
 
             objects: list[tuple[str, str]] = (
                 [(t, "table") for t in sorted(table_set)]
@@ -373,7 +425,9 @@ def _introspect_object(
                 unique_cols.add(cols[0])
 
         if adapter.name == "duckdb":
-            unique_cols.update(_duckdb_unique_columns(conn, schema_name, obj_name))
+            dk_uniques = _duckdb_unique_columns(conn, schema_name, obj_name)
+            unique_cols.update(dk_uniques)
+            indexed_cols.update(dk_uniques)
         else:
             try:
                 raw_uniques = inspector.get_unique_constraints(obj_name, schema=schema_name)

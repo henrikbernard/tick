@@ -12,8 +12,8 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from tick.dialects import DialectAdapter, safe_rollback
 from tick.models import ColumnInfo, ColumnProfile, DiscoveryConfig, TableInfo, ValueFrequency
@@ -21,9 +21,22 @@ from tick.pii import detect_governance, detect_pii, redact_value
 
 VALUE_SAMPLE_LIMIT = 2000
 _TAG_HINT_RE = re.compile(
-    r"(?:^|_)(?:tag|tag_id|tag_name|sensor|sensor_id|point_id|point_name|signal_id|channel_id|opc_tag)(?:$|_)",
+    r"^(?:tag|sensor)$|(?:^|_)(?:tag_id|tag_name|tag_code|sensor_id|sensor_name|sensor_code|point_id|point_name|signal_id|channel_id|opc_tag)(?:$|_)",
     re.I,
 )
+_NON_ORDERABLE_RAW_BASES = {
+    "CLOB",
+    "NCLOB",
+    "DBCLOB",
+    "LONG",
+    "XML",
+    "XMLTYPE",
+    "NTEXT",
+    "INET",
+    "CIDR",
+    "MACADDR",
+    "MACADDR8",
+}
 
 
 @dataclass
@@ -38,6 +51,7 @@ class ProfileArtifacts:
     timestamp_by_tag_samples: dict[tuple[str, str, str], dict[str, list[datetime]]] = field(
         default_factory=dict
     )
+    tablesampled_tables: set[str] = field(default_factory=set)
 
     def merge(self, other: ProfileArtifacts) -> None:
         self.value_samples.update(other.value_samples)
@@ -45,6 +59,7 @@ class ProfileArtifacts:
         self.raw_str_samples.update(other.raw_str_samples)
         self.timestamp_samples.update(other.timestamp_samples)
         self.timestamp_by_tag_samples.update(other.timestamp_by_tag_samples)
+        self.tablesampled_tables.update(other.tablesampled_tables)
 
 
 def _to_float(val: Any) -> float | None:
@@ -60,11 +75,22 @@ def _to_float(val: Any) -> float | None:
         return None
 
 
+def _safe_astimezone_utc(dt: datetime) -> datetime:
+    if not dt.tzinfo:
+        return dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.astimezone(timezone.utc)
+    except OverflowError:
+        if dt.year >= 9999:
+            return datetime.max.replace(tzinfo=timezone.utc)
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _to_datetime_utc(val: Any) -> datetime | None:
     if val is None:
         return None
     if isinstance(val, datetime):
-        return val.astimezone(timezone.utc) if val.tzinfo else val.replace(tzinfo=timezone.utc)
+        return _safe_astimezone_utc(val)
     if isinstance(val, date):
         return datetime(val.year, val.month, val.day, tzinfo=timezone.utc)
     s = str(val).strip()
@@ -75,8 +101,8 @@ def _to_datetime_utc(val: Any) -> datetime | None:
     for candidate in (s, s.replace(" ", "T")):
         try:
             dt = datetime.fromisoformat(candidate)
-            return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
+            return _safe_astimezone_utc(dt)
+        except (ValueError, OverflowError):
             pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
         try:
@@ -115,7 +141,7 @@ def _classify_cardinality(sample_size: int, non_null: int, distinct: int | None)
     return "medium"
 
 
-def _quantile(sorted_vals: list[float], q: float) -> float:
+def _quantile(sorted_vals: list[float], q: float) -> float | None:
     if not sorted_vals:
         return 0.0
     pos = (len(sorted_vals) - 1) * q
@@ -123,7 +149,20 @@ def _quantile(sorted_vals: list[float], q: float) -> float:
     hi = int(math.ceil(pos))
     if lo == hi:
         return sorted_vals[lo]
-    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
+    frac = pos - lo
+    val = sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+    return val if math.isfinite(val) else None
+
+
+def _supports_sql_min_max(col: ColumnInfo, adapter_name: str) -> bool:
+    if col.canonical_type in {"binary", "json", "boolean", "other", "uuid"}:
+        return False
+    base = re.split(r"[\s(<]", col.raw_type.strip().upper(), maxsplit=1)[0]
+    if base in _NON_ORDERABLE_RAW_BASES:
+        return False
+    if base == "TEXT" and adapter_name in {"mssql", "hana"}:
+        return False
+    return True
 
 
 def _fetch_full_table_aggregates(
@@ -131,39 +170,47 @@ def _fetch_full_table_aggregates(
     adapter: DialectAdapter,
     quoted_table: str,
     columns: list[ColumnInfo],
+    config: DiscoveryConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run a single batched SQL aggregate query for exact null counts and min/max."""
     if not columns:
         return {}
 
-    select_parts: list[str] = ["COUNT(*) AS __total__"]
+    # Use alphabetic alias prefixes so Oracle/DB2 (which forbid leading '_') parse cleanly
+    select_parts: list[str] = ["COUNT(*) AS t_total"]
     for idx, col in enumerate(columns):
         qcol = adapter.quote_identifier(conn, col.name)
-        select_parts.append(f"COUNT({qcol}) AS __nn_{idx}__")
-        if col.canonical_type not in {"binary", "json", "boolean", "other"}:
-            select_parts.append(f"MIN({qcol}) AS __min_{idx}__")
-            select_parts.append(f"MAX({qcol}) AS __max_{idx}__")
+        select_parts.append(f"COUNT({qcol}) AS c_nn_{idx}")
+        if _supports_sql_min_max(col, adapter.name):
+            select_parts.append(f"MIN({qcol}) AS c_min_{idx}")
+            select_parts.append(f"MAX({qcol}) AS c_max_{idx}")
 
     sql = f"SELECT {', '.join(select_parts)} FROM {quoted_table}"
     try:
-        row = conn.execute(text(sql)).mappings().first()
+        row = conn.exec_driver_sql(sql).mappings().first()
     except Exception:
         safe_rollback(conn)
+        if config is not None:
+            adapter.configure_safe_session(
+                conn,
+                read_uncommitted=config.read_uncommitted,
+                query_timeout_seconds=config.query_timeout_seconds,
+            )
         return {}
     if not row:
         return {}
 
     # Normalize keys case-insensitively (Snowflake/Oracle/DB2 fold unquoted aliases to UPPERCASE)
     row_ci = {str(k).lower(): v for k, v in row.items()}
-    total = int(row_ci.get("__total__") or 0)
+    total = int(row_ci.get("t_total") or 0)
     out: dict[str, dict[str, Any]] = {}
     for idx, col in enumerate(columns):
-        nn = int(row_ci.get(f"__nn_{idx}__") or 0)
+        nn = int(row_ci.get(f"c_nn_{idx}") or 0)
         out[col.name] = {
             "total": total,
             "non_null": nn,
-            "min": row_ci.get(f"__min_{idx}__"),
-            "max": row_ci.get(f"__max_{idx}__"),
+            "min": row_ci.get(f"c_min_{idx}"),
+            "max": row_ci.get(f"c_max_{idx}"),
         }
     return out
 
@@ -195,11 +242,31 @@ def _profile_single_table(
     if not tbl.columns:
         return artifacts
 
+    quoted_table = adapter.quote_table(conn, tbl.schema_name, tbl.name, default_schema)
+
     # Production safety guardrails: empty table triage & byte-budget skip
     if config.skip_empty_tables and tbl.table_type == "table" and tbl.row_count == 0:
-        tbl.skipped_profiling_reason = "Empty table (skipped via --skip-empty-tables)"
-        _apply_metadata_only_scanners([tbl], config)
-        return artifacts
+        truly_empty = tbl.row_count_exact
+        if not truly_empty:
+            # Verify stale stats (e.g. Postgres reltuples=0 after INSERT before ANALYZE) with a cheap 1-row probe
+            probe_sql = adapter.build_sample_query(
+                quoted_table=quoted_table,
+                columns_sql="1",
+                sample_size=1,
+                total_rows=0,
+                use_tablesample=False,
+                read_uncommitted=config.read_uncommitted,
+            )
+            try:
+                truly_empty = conn.exec_driver_sql(probe_sql).first() is None
+            except Exception:
+                safe_rollback(conn)
+                truly_empty = False
+        if truly_empty:
+            tbl.row_count_exact = True
+            tbl.skipped_profiling_reason = "Empty table (skipped via --skip-empty-tables)"
+            _apply_metadata_only_scanners([tbl], config)
+            return artifacts
 
     if (
         config.skip_tables_over_mb is not None
@@ -213,21 +280,23 @@ def _profile_single_table(
         _apply_metadata_only_scanners([tbl], config)
         return artifacts
 
-    quoted_table = adapter.quote_table(conn, tbl.schema_name, tbl.name, default_schema)
-
     # Full-table exact aggregates only when NOT in tablesample/fast/read-uncommitted large mode
     exact_aggs: dict[str, dict[str, Any]] = {}
     if (
         config.profile_mode == "full"
         and not config.use_tablesample
+        and not config.read_uncommitted
         and tbl.table_type == "table"
         and tbl.row_count is not None
         and tbl.row_count > effective_sample
         and len(tbl.columns) <= 60
     ):
-        exact_aggs = _fetch_full_table_aggregates(conn, adapter, quoted_table, tbl.columns)
+        exact_aggs = _fetch_full_table_aggregates(conn, adapter, quoted_table, tbl.columns, config)
 
     col_names_sql = ", ".join(adapter.quote_identifier(conn, c.name) for c in tbl.columns)
+    used_tablesample = bool(
+        config.use_tablesample and tbl.row_count and tbl.row_count > effective_sample * 4
+    )
     sample_sql = adapter.build_sample_query(
         quoted_table=quoted_table,
         columns_sql=col_names_sql,
@@ -238,7 +307,19 @@ def _profile_single_table(
     )
 
     try:
-        rows = conn.execute(text(sample_sql)).fetchall()
+        rows = conn.exec_driver_sql(sample_sql).fetchall()
+        # TABLESAMPLE SYSTEM / N ROWS can return 0 rows on non-empty tables — fall back once to LIMIT
+        if used_tablesample and not rows and (tbl.row_count is None or tbl.row_count > 0):
+            used_tablesample = False
+            fallback_sql = adapter.build_sample_query(
+                quoted_table=quoted_table,
+                columns_sql=col_names_sql,
+                sample_size=effective_sample,
+                total_rows=tbl.row_count,
+                use_tablesample=False,
+                read_uncommitted=config.read_uncommitted,
+            )
+            rows = conn.exec_driver_sql(fallback_sql).fetchall()
     except Exception as exc:
         safe_rollback(conn)
         adapter.configure_safe_session(
@@ -251,10 +332,16 @@ def _profile_single_table(
             col.profile = ColumnProfile(profile_error=err_msg)
         return artifacts
 
+    if used_tablesample:
+        artifacts.tablesampled_tables.add(tbl.full_name)
+
     sample_n = len(rows)
-    if tbl.row_count is None and sample_n < effective_sample:
-        tbl.row_count = sample_n
-        tbl.row_count_exact = True
+    if not used_tablesample:
+        if sample_n < effective_sample and (tbl.row_count is None or not tbl.row_count_exact):
+            tbl.row_count = sample_n
+            tbl.row_count_exact = True
+        elif not tbl.row_count_exact and sample_n > (tbl.row_count or 0):
+            tbl.row_count = sample_n
 
     # Capture per-tag timestamp groups for multi-tag OT historian tables
     ts_col_indices = [
@@ -263,11 +350,14 @@ def _profile_single_table(
     tag_col_indices = [
         (idx, c.name)
         for idx, c in enumerate(tbl.columns)
-        if _TAG_HINT_RE.search(re.sub(r"[\s\-]+", "_", c.name.strip()))
+        if c.canonical_type in {"string", "integer", "uuid"}
+        and _TAG_HINT_RE.search(re.sub(r"[\s\-]+", "_", c.name.strip()))
     ]
     if rows and ts_col_indices and tag_col_indices:
         for ts_idx, ts_name in ts_col_indices:
             for tag_idx, tag_name in tag_col_indices:
+                if tag_idx == ts_idx:
+                    continue
                 grouped: dict[str, list[datetime]] = {}
                 for r in rows:
                     tv = r[tag_idx]
@@ -280,10 +370,9 @@ def _profile_single_table(
                 if grouped:
                     artifacts.timestamp_by_tag_samples[(tbl.full_name, ts_name, tag_name)] = grouped
 
-    table_fully_fetched = (
-        tbl.row_count is not None
-        and sample_n >= tbl.row_count
-        and not (config.use_tablesample and tbl.row_count > effective_sample * 2)
+    table_fully_fetched = (not used_tablesample) and (
+        sample_n < effective_sample
+        or (tbl.row_count_exact and tbl.row_count is not None and sample_n >= tbl.row_count)
     )
 
     for col_idx, col in enumerate(tbl.columns):
@@ -366,12 +455,25 @@ def _profile_single_table(
         if col.canonical_type in {"integer", "float", "decimal"} and non_null_vals:
             nums = sorted(f for f in (_to_float(v) for v in non_null_vals) if f is not None)
             if nums:
-                mean_val = round(statistics.fmean(nums), 4)
+                try:
+                    m = statistics.fmean(nums)
+                    if math.isfinite(m):
+                        mean_val = round(m, 4)
+                except (OverflowError, ValueError):
+                    mean_val = None
                 if len(nums) > 1:
-                    stddev_val = round(statistics.stdev(nums), 4)
-                p25 = round(_quantile(nums, 0.25), 4)
-                p50 = round(_quantile(nums, 0.50), 4)
-                p75 = round(_quantile(nums, 0.75), 4)
+                    try:
+                        sd = statistics.stdev(nums)
+                        if math.isfinite(sd):
+                            stddev_val = round(sd, 4)
+                    except (OverflowError, ValueError):
+                        stddev_val = None
+                q25 = _quantile(nums, 0.25)
+                q50 = _quantile(nums, 0.50)
+                q75 = _quantile(nums, 0.75)
+                p25 = round(q25, 4) if q25 is not None else None
+                p50 = round(q50, 4) if q50 is not None else None
+                p75 = round(q75, 4) if q75 is not None else None
 
         min_len = max_len = None
         avg_len = None
@@ -425,6 +527,8 @@ def _profile_single_table(
                 min_val = redact_value(min_val, pii_findings)
             if max_val is not None:
                 max_val = redact_value(max_val, pii_findings)
+            if freshness_max_ts is not None:
+                freshness_max_ts = redact_value(freshness_max_ts, pii_findings)
 
         col.profile = ColumnProfile(
             sample_size=profile_base,
@@ -459,6 +563,11 @@ def _profile_single_table(
 def _can_parallelize(engine: Engine, workers: int, table_count: int) -> bool:
     if workers <= 1 or table_count <= 1:
         return False
+    if isinstance(engine.pool, (StaticPool, SingletonThreadPool)):
+        return False
+    url_str = str(engine.url).lower()
+    if ":memory:" in url_str or "mode=memory" in url_str:
+        return False
     # In-memory SQLite and DuckDB engines share a single in-memory instance not safe for multi-thread checkout
     if engine.dialect.name in {"sqlite", "duckdb"} and engine.url.database in {None, "", ":memory:"}:
         return False
@@ -483,7 +592,8 @@ def profile_tables(
     now_utc = datetime.now(timezone.utc)
 
     if _can_parallelize(engine, config.workers, len(tables)):
-        max_workers = min(config.workers, len(tables))
+        pool_cap = 10 if engine.dialect.name in {"sqlite", "duckdb"} else config.workers
+        max_workers = min(config.workers, len(tables), pool_cap)
 
         def _worker(tbl: TableInfo) -> ProfileArtifacts:
             try:

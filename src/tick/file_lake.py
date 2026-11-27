@@ -39,7 +39,12 @@ _SUPPORTED_GZ_EXTS: dict[str, tuple[FileFormat, str]] = {
     ".ndjson.gz": ("jsonl", "gzip"),
 }
 _HIVE_PART_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=([^/\\]+)$")
-_SHARD_NAME_RE = re.compile(r"^(?:part[-_]\d+|data[-_]\d+|\d{4,}|.+[-_]\d{3,})$", re.I)
+_SHARD_NAME_RE = re.compile(r"^(?:part[-_]\d+(?:[-_.].+)?|data[-_]\d+(?:[-_.].+)?|\d{4,})$", re.I)
+_DELTA_COMMIT_RE = re.compile(r"^\d{20}\.json$")
+_RESERVED_SCHEMAS = {"system", "temp", "information_schema", "pg_catalog", "main"}
+_DB_FILE_EXTS = {".duckdb", ".ddb", ".sqlite", ".sqlite3", ".db"}
+_SQLITE_INT64_MIN = -(1 << 63)
+_SQLITE_INT64_MAX = (1 << 63) - 1
 _IGNORED_FILENAMES = {".ds_store", "_success", "_committed", "_started"}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
@@ -85,10 +90,15 @@ def is_file_lake_target(target: str) -> bool:
     stripped = target.strip()
     if not stripped or stripped == ":memory:" or "://" in stripped:
         return False
-    if _has_glob_magic(stripped):
-        return True
     p = Path(stripped).expanduser()
-    if p.is_dir():
+    # Check literal filesystem existence BEFORE glob magic so paths containing '[' or ']' work cleanly
+    if p.exists():
+        if p.is_dir():
+            return True
+        if p.suffix.lower() in _DB_FILE_EXTS:
+            return False
+        return _detect_file_format(p) is not None
+    if _has_glob_magic(stripped):
         return True
     if _detect_file_format(p) is not None:
         return True
@@ -252,7 +262,9 @@ def _resolve_active_delta_parquet_files(delta_dir: Path) -> list[Path]:
     if any(".checkpoint." in p.name for p in log_dir.iterdir() if p.is_file()):
         return fallback_files
 
-    commit_files = sorted(p for p in log_dir.iterdir() if p.is_file() and p.suffix.lower() == ".json")
+    commit_files = sorted(
+        p for p in log_dir.iterdir() if p.is_file() and _DELTA_COMMIT_RE.match(p.name)
+    )
     if not commit_files:
         return fallback_files
 
@@ -279,13 +291,15 @@ def _resolve_active_delta_parquet_files(delta_dir: Path) -> list[Path]:
                         if not cand.is_file():
                             cand = (root_resolved / raw_rel).resolve()
                         if cand.is_relative_to(root_resolved):
-                            active[rel] = cand
+                            active[str(cand)] = cand
                     elif isinstance(rem_act, dict) and rem_act.get("path"):
                         raw_rel = str(rem_act["path"])
                         rel = unquote(raw_rel)
                         saw_file_action = True
-                        active.pop(rel, None)
-                        active.pop(raw_rel, None)
+                        cand1 = (root_resolved / rel).resolve()
+                        cand2 = (root_resolved / raw_rel).resolve()
+                        active.pop(str(cand1), None)
+                        active.pop(str(cand2), None)
     except Exception:
         return fallback_files
 
@@ -324,6 +338,13 @@ def _looks_like_sharded_table(files: list[tuple[Path, FileFormat, str | None]]) 
     return False
 
 
+def _sanitize_schema_ident(name: str) -> str:
+    ident = _sanitize_sql_ident(name, fallback="files")
+    if ident.lower() in _RESERVED_SCHEMAS:
+        return f"s_{ident}"
+    return ident
+
+
 def _build_dataset(
     schema_name: str,
     raw_table_name: str,
@@ -336,16 +357,25 @@ def _build_dataset(
     partition_columns: list[str] | None = None,
 ) -> DiscoveredFileDataset:
     total_bytes = sum(p.stat().st_size for p in files if p.exists())
+    # Only report dataset-level gzip compression when EVERY shard is gzipped; mixed sets use AUTO
+    effective_comp: str | None = (
+        "gzip" if (files and all(p.name.lower().endswith(".gz") for p in files)) else None
+    )
+    if effective_comp is None and compression == "gzip" and not files:
+        effective_comp = "gzip"
     actual_fmt = fmt
     delimiter: str | None = None
     has_header: bool | None = None
-    if fmt in {"csv", "tsv"} and files:
-        delimiter, has_header = _sniff_csv_props(files[0], fmt == "tsv", compression)
-    elif fmt in {"json", "jsonl"} and files:
-        actual_fmt = _detect_json_lines(files[0], compression, fmt)
+    if files:
+        sniff_path = next((p for p in files if p.exists() and p.stat().st_size > 0), files[0])
+        sniff_comp = "gzip" if sniff_path.name.lower().endswith(".gz") else None
+        if fmt in {"csv", "tsv"}:
+            delimiter, has_header = _sniff_csv_props(sniff_path, fmt == "tsv", sniff_comp)
+        elif fmt in {"json", "jsonl"}:
+            actual_fmt = _detect_json_lines(sniff_path, sniff_comp, fmt)
 
     return DiscoveredFileDataset(
-        schema_name=_sanitize_sql_ident(schema_name, fallback="files"),
+        schema_name=_sanitize_schema_ident(schema_name),
         table_name=_sanitize_sql_ident(raw_table_name, fallback="dataset"),
         source_paths=files,
         read_glob=read_glob,
@@ -354,7 +384,7 @@ def _build_dataset(
             file_format=actual_fmt,
             file_count=len(files),
             total_bytes=total_bytes,
-            compression=compression,
+            compression=effective_comp,
             delimiter=delimiter,
             has_header=has_header,
             hive_partitioned=hive_partitioned,
@@ -386,8 +416,9 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
     """
     stripped = target.strip()
 
-    # 1. Glob pattern (e.g. "./drop/*.csv" or "/data/**/*.parquet")
-    if _has_glob_magic(stripped):
+    # 1. Glob pattern (only when target is not a literal existing path on disk)
+    literal_path = Path(stripped).expanduser()
+    if _has_glob_magic(stripped) and not literal_path.exists():
         expanded = str(Path(stripped).expanduser())
         matched_paths = sorted(Path(p).resolve() for p in glob.glob(expanded, recursive=True) if Path(p).is_file())
         valid: list[tuple[Path, FileFormat, str | None]] = []
@@ -530,7 +561,14 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
             continue
 
         sub_children_dirs = [c for c in subdir.iterdir() if c.is_dir() and not c.name.startswith((".", "_"))]
-        is_hive_dir = bool(sub_children_dirs) and all(_HIVE_PART_RE.match(d.name) for d in sub_children_dirs)
+        sub_direct_data = [
+            c for c in subdir.iterdir() if c.is_file() and _detect_file_format(c) is not None
+        ]
+        is_hive_dir = (
+            not sub_direct_data
+            and bool(sub_children_dirs)
+            and all(_HIVE_PART_RE.match(d.name) for d in sub_children_dirs)
+        )
         sub_fmts = {fmt for _, fmt, _ in sub_all}
 
         if is_hive_dir and len(sub_fmts) == 1:
@@ -576,7 +614,10 @@ def scan_file_sources(target: str) -> tuple[str, str, list[DiscoveredFileDataset
                         )
                 else:
                     ndirs = [c for c in nested.iterdir() if c.is_dir() and not c.name.startswith((".", "_"))]
-                    if ndirs and all(_HIVE_PART_RE.match(d.name) for d in ndirs):
+                    ndirect_data = [
+                        c for c in nested.iterdir() if c.is_file() and _detect_file_format(c) is not None
+                    ]
+                    if not ndirect_data and ndirs and all(_HIVE_PART_RE.match(d.name) for d in ndirs):
                         nfiles_all = _list_data_files(nested, ignore_delta_log=True)
                         if nfiles_all and len({fmt for _, fmt, _ in nfiles_all}) == 1:
                             nested_special_dirs.add(nested)
@@ -636,7 +677,13 @@ def _duckdb_sql_str(val: str) -> str:
 
 def _duckdb_read_expr(ds: DiscoveredFileDataset) -> str:
     fs = ds.file_source
-    paths_sql = "[" + ", ".join(_duckdb_sql_str(str(p)) for p in ds.source_paths) + "]"
+    paths = ds.source_paths
+    # Filter out 0-byte text shards when populated shards exist to avoid DuckDB phantom `column0`
+    if fs.file_format in {"csv", "tsv", "json", "jsonl"} and len(paths) > 1:
+        non_empty = [p for p in paths if p.exists() and p.stat().st_size > 0]
+        if non_empty:
+            paths = non_empty
+    paths_sql = "[" + ", ".join(_duckdb_sql_str(glob.escape(str(p))) for p in paths) + "]"
 
     if fs.file_format in {"parquet", "delta"}:
         opts = ["union_by_name = true"]
@@ -666,9 +713,10 @@ def _is_effectively_empty_text_dataset(ds: DiscoveredFileDataset) -> bool:
     if fs.total_bytes == 0:
         return True
     if fs.file_format in {"csv", "tsv", "json", "jsonl"}:
-        if fs.compression == "gzip" or fs.total_bytes < 64:
-            opener = gzip.open if fs.compression == "gzip" else open
+        has_gz = any(p.name.lower().endswith(".gz") for p in ds.source_paths)
+        if has_gz or fs.total_bytes < 64:
             for p in ds.source_paths:
+                opener = gzip.open if p.name.lower().endswith(".gz") else open
                 try:
                     with opener(p, "rt", encoding="utf-8-sig", errors="replace") as fh:
                         if fh.read(64).strip():
@@ -695,34 +743,49 @@ def _mount_via_duckdb(
         backend_note="Mounted via DuckDB in-memory file engine",
     )
 
-    with engine.begin() as conn:
-        for ds in datasets:
-            sch_q = '"' + ds.schema_name.replace('"', '""') + '"'
-            tbl_q = '"' + ds.table_name.replace('"', '""') + '"'
-            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {sch_q}"))
+    try:
+        with engine.connect() as conn:
+            for ds in datasets:
+                sch_q = '"' + ds.schema_name.replace('"', '""') + '"'
+                tbl_q = '"' + ds.table_name.replace('"', '""') + '"'
 
-            if _is_effectively_empty_text_dataset(ds):
-                conn.execute(text(f'CREATE TABLE {sch_q}.{tbl_q} ("value" VARCHAR)'))
-                exact_rows = 0
-            else:
-                read_expr = _duckdb_read_expr(ds)
-                try:
-                    exact_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {read_expr}")).scalar() or 0)
-                except Exception:
-                    # Retry CSV with ignore_errors=true if dirty rows exist
-                    if ds.file_source.file_format in {"csv", "tsv"}:
-                        read_expr = read_expr.replace("ignore_errors = false", "ignore_errors = true")
-                        exact_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {read_expr}")).scalar() or 0)
-                    else:
-                        raise
+                if _is_effectively_empty_text_dataset(ds):
+                    conn.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {sch_q}")
+                    conn.exec_driver_sql(f'CREATE TABLE {sch_q}.{tbl_q} ("value" VARCHAR)')
+                    conn.commit()
+                    exact_rows = 0
+                else:
+                    read_expr = _duckdb_read_expr(ds)
+                    try:
+                        conn.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {sch_q}")
+                        exact_rows = int(conn.exec_driver_sql(f"SELECT COUNT(*) FROM {read_expr}").scalar() or 0)
+                        limit_clause = f" LIMIT {max_materialize}" if exact_rows > max_materialize else ""
+                        conn.exec_driver_sql(
+                            f"CREATE TABLE {sch_q}.{tbl_q} AS SELECT * FROM {read_expr}{limit_clause}"
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        # Retry dirty/type-drifting CSV/TSV with ignore_errors=true in a fresh transaction
+                        if ds.file_source.file_format in {"csv", "tsv"}:
+                            retry_expr = read_expr.replace("ignore_errors = false", "ignore_errors = true")
+                            conn.exec_driver_sql(f"CREATE SCHEMA IF NOT EXISTS {sch_q}")
+                            exact_rows = int(conn.exec_driver_sql(f"SELECT COUNT(*) FROM {retry_expr}").scalar() or 0)
+                            limit_clause = f" LIMIT {max_materialize}" if exact_rows > max_materialize else ""
+                            conn.exec_driver_sql(
+                                f"CREATE TABLE {sch_q}.{tbl_q} AS SELECT * FROM {retry_expr}{limit_clause}"
+                            )
+                            conn.commit()
+                        else:
+                            raise
 
-                limit_clause = f" LIMIT {max_materialize}" if exact_rows > max_materialize else ""
-                conn.execute(text(f"CREATE TABLE {sch_q}.{tbl_q} AS SELECT * FROM {read_expr}{limit_clause}"))
-
-            full_name = f"{ds.schema_name}.{ds.table_name}"
-            mounted.file_sources[full_name] = ds.file_source
-            mounted.exact_row_counts[full_name] = exact_rows
-            mounted.size_bytes_map[full_name] = ds.file_source.total_bytes
+                full_name = f"{ds.schema_name}.{ds.table_name}"
+                mounted.file_sources[full_name] = ds.file_source
+                mounted.exact_row_counts[full_name] = exact_rows
+                mounted.size_bytes_map[full_name] = ds.file_source.total_bytes
+    except Exception:
+        engine.dispose()
+        raise
 
     return mounted
 
@@ -739,7 +802,10 @@ def _infer_sqlite_type(values: list[Any]) -> str:
             all_int = False
             break
         try:
-            int(str(v).strip())
+            iv = int(str(v).strip())
+            if not (_SQLITE_INT64_MIN <= iv <= _SQLITE_INT64_MAX):
+                all_int = False
+                break
         except ValueError:
             all_int = False
             break
@@ -807,12 +873,12 @@ def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[st
                     canon_pk = _register_col(m.group(1))
                     part_vals[canon_pk] = m.group(2)
 
-        opener = gzip.open if fs.compression == "gzip" else open
+        opener = gzip.open if fpath.name.lower().endswith(".gz") else open
         if fs.file_format in {"csv", "tsv"}:
             delim = fs.delimiter or ("\t" if fs.file_format == "tsv" else ",")
             with opener(fpath, "rt", encoding="utf-8-sig", errors="replace", newline="") as fh:
                 reader = csv.reader(fh, delimiter=delim)
-                header = next(reader, None)
+                header = next((r for r in reader if any(cell.strip() for cell in r)), None)
                 if header is None:
                     continue
                 if fs.has_header is False:
@@ -820,7 +886,10 @@ def _read_rows_python(ds: DiscoveredFileDataset, max_rows: int) -> tuple[list[st
                     first_row = header
                     total_rows += 1
                     if len(rows) < max_rows:
-                        row_dict = {col_names[i]: (first_row[i] if i < len(first_row) else None) for i in range(len(col_names))}
+                        row_dict = {
+                            col_names[i]: (first_row[i] if i < len(first_row) and first_row[i] != "" else None)
+                            for i in range(len(col_names))
+                        }
                         row_dict.update(part_vals)
                         rows.append(row_dict)
                 else:
@@ -886,45 +955,55 @@ def _mount_via_sqlite_fallback(
         backend_note="Mounted via Python/SQLite fallback file engine (install tick-db[duckdb] for Parquet/Delta)",
     )
 
-    with engine.begin() as conn:
-        seen_tables: set[str] = set()
-        for ds in datasets:
-            # SQLite uses a single default schema ("main"); prefix table name if subdir schema differs
-            tbl_name = ds.table_name if ds.schema_name == "files" else f"{ds.schema_name}_{ds.table_name}"
-            base = tbl_name
-            sfx = 2
-            while tbl_name.lower() in seen_tables:
-                tbl_name = f"{base}_{sfx}"
-                sfx += 1
-            seen_tables.add(tbl_name.lower())
+    try:
+        with engine.begin() as conn:
+            seen_tables: set[str] = set()
+            for ds in datasets:
+                # SQLite uses a single default schema ("main"); prefix table name if subdir schema differs
+                tbl_name = ds.table_name if ds.schema_name == "files" else f"{ds.schema_name}_{ds.table_name}"
+                base = tbl_name
+                sfx = 2
+                while tbl_name.lower() in seen_tables:
+                    tbl_name = f"{base}_{sfx}"
+                    sfx += 1
+                seen_tables.add(tbl_name.lower())
 
-            cols, rows, exact_rows = _read_rows_python(ds, max_materialize)
-            if not cols:
-                cols = ["value"]
+                cols, rows, exact_rows = _read_rows_python(ds, max_materialize)
+                if not cols:
+                    cols = ["value"]
 
-            col_defs: list[str] = []
-            for cname in cols:
-                inferred = _infer_sqlite_type([r.get(cname) for r in rows[:200]])
-                cq = '"' + cname.replace('"', '""') + '"'
-                col_defs.append(f"{cq} {inferred}")
+                col_defs: list[str] = []
+                for cname in cols:
+                    inferred = _infer_sqlite_type([r.get(cname) for r in rows[:200]])
+                    cq = '"' + cname.replace('"', '""') + '"'
+                    col_defs.append(f"{cq} {inferred}")
 
-            tq = '"' + tbl_name.replace('"', '""') + '"'
-            conn.execute(text(f"CREATE TABLE {tq} ({', '.join(col_defs)})"))
+                tq = '"' + tbl_name.replace('"', '""') + '"'
+                conn.exec_driver_sql(f"CREATE TABLE {tq} ({', '.join(col_defs)})")
 
-            if rows:
-                placeholders = ", ".join(f":p{i}" for i in range(len(cols)))
-                qcols = ", ".join('"' + c.replace('"', '""') + '"' for c in cols)
-                insert_sql = text(f"INSERT INTO {tq} ({qcols}) VALUES ({placeholders})")
-                payloads = [
-                    {f"p{i}": r.get(c) for i, c in enumerate(cols)}
-                    for r in rows
-                ]
-                conn.execute(insert_sql, payloads)
+                if rows:
+                    placeholders = ", ".join(f":p{i}" for i in range(len(cols)))
+                    qcols = ", ".join('"' + c.replace('"', '""') + '"' for c in cols)
+                    insert_sql = text(f"INSERT INTO {tq} ({qcols}) VALUES ({placeholders})")
 
-            full_name = f"main.{tbl_name}"
-            mounted.file_sources[full_name] = ds.file_source
-            mounted.exact_row_counts[full_name] = exact_rows
-            mounted.size_bytes_map[full_name] = ds.file_source.total_bytes
+                    def _safe_sqlite_val(v: Any) -> Any:
+                        if isinstance(v, int) and not isinstance(v, bool) and not (_SQLITE_INT64_MIN <= v <= _SQLITE_INT64_MAX):
+                            return str(v)
+                        return v
+
+                    payloads = [
+                        {f"p{i}": _safe_sqlite_val(r.get(c)) for i, c in enumerate(cols)}
+                        for r in rows
+                    ]
+                    conn.execute(insert_sql, payloads)
+
+                full_name = f"main.{tbl_name}"
+                mounted.file_sources[full_name] = ds.file_source
+                mounted.exact_row_counts[full_name] = exact_rows
+                mounted.size_bytes_map[full_name] = ds.file_source.total_bytes
+    except Exception:
+        engine.dispose()
+        raise
 
     return mounted
 

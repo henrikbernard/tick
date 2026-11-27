@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -69,9 +70,14 @@ def _widen_decimal_types(types: list[str], prefix: str = "DECIMAL") -> str:
     return f"{prefix}({prec}, {scale})"
 
 
+def _norm_type_str(t: str) -> str:
+    return re.sub(r"\s*,\s*", ", ", re.sub(r"\s+", " ", t.strip().upper()))
+
+
 def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
     """Given Spark types across plants for the same column, pick a safe widened target type."""
-    unique_exact = sorted(set(types))
+    normed = [_norm_type_str(t) for t in types]
+    unique_exact = sorted(set(normed))
     if len(unique_exact) == 1:
         return unique_exact[0], False
 
@@ -84,6 +90,10 @@ def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
             return _widen_decimal_types(unique_exact, prefix="DECIMAL"), True
         if "BIGINT" in bases:
             return "BIGINT", True
+        if "INT" in bases:
+            return "INT", True
+        if "SMALLINT" in bases:
+            return "SMALLINT", True
         return "INT", True
 
     # Date + Timestamp -> TIMESTAMP
@@ -96,7 +106,8 @@ def _widen_spark_types(types: list[str]) -> tuple[str, bool]:
 
 def _widen_snowflake_types(types: list[str]) -> tuple[str, bool]:
     """Given Snowflake types across plants for the same column, pick a safe widened target type."""
-    unique_exact = sorted(set(types))
+    normed = [_norm_type_str(t) for t in types]
+    unique_exact = sorted(set(normed))
     if len(unique_exact) == 1:
         return unique_exact[0], False
 
@@ -108,6 +119,10 @@ def _widen_snowflake_types(types: list[str]) -> tuple[str, bool]:
             return _widen_decimal_types(unique_exact, prefix="NUMBER"), True
         if "BIGINT" in bases:
             return "BIGINT", True
+        if "INTEGER" in bases or "INT" in bases:
+            return "INTEGER", True
+        if "SMALLINT" in bases:
+            return "SMALLINT", True
         return "INTEGER", True
 
     if set(bases) <= {"DATE", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIMESTAMP_NTZ"}:
@@ -177,18 +192,19 @@ def harmonize_snapshots(
     sf_db = catalog.upper() if catalog == "manufacturing" else catalog
     sf_bsch = bronze_schema.upper() if bronze_schema == "bronze" else bronze_schema
 
-    # Index base tables across sites; qualify with schema if a single site has duplicate table keys across schemas
-    # and disambiguate same-schema collisions so no table is ever silently dropped.
+    # Index base tables across sites; qualify with schema ONLY when a single site has duplicate
+    # table keys across MULTIPLE distinct schemas (same-schema glossary collisions disambiguate below).
     dup_names_within_source: set[str] = set()
     for res in sources.values():
-        seen_in_src: set[str] = set()
+        seen_schemas: dict[str, set[str]] = {}
         for tbl in res.tables:
             if tbl.table_type != "table":
                 continue
             low = _canon_table_name(tbl)
-            if low in seen_in_src:
+            sch_set = seen_schemas.setdefault(low, set())
+            sch_set.add(tbl.schema_name.lower())
+            if len(sch_set) > 1:
                 dup_names_within_source.add(low)
-            seen_in_src.add(low)
 
     tables_by_name: dict[str, dict[str, TableInfo]] = {}
     for src_name, res in sources.items():
@@ -223,23 +239,20 @@ def harmonize_snapshots(
         source_table_names = {s: site_map[s].name for s in present}
         tbl_matched_glossary = use_glossary and len({site_map[s].name.lower() for s in present}) > 1
 
-        # Compare primary keys using canonical column names when glossary matching is enabled
+        # Compare primary keys case-insensitively (and via canonical glossary names when enabled)
         pks_by_source = {s: site_map[s].primary_key for s in present}
-        if use_glossary:
-            unique_pks = {
-                tuple(
-                    sanitize_delta_column_name(
-                        _canon_col_name(
-                            pk,
-                            next((c.semantic_name for c in site_map[s].columns if c.name == pk), None),
-                        )
+        unique_pks = {
+            tuple(
+                sanitize_delta_column_name(
+                    _canon_col_name(
+                        pk,
+                        next((c.semantic_name for c in site_map[s].columns if c.name == pk), None),
                     )
-                    for pk in site_map[s].primary_key
                 )
-                for s in present
-            }
-        else:
-            unique_pks = {tuple(v) for v in pks_by_source.values()}
+                for pk in site_map[s].primary_key
+            )
+            for s in present
+        }
         pk_divergent = len(unique_pks) > 1
 
         # Gather union of all columns (matched by deduplicated sanitized/canonical name per site)
@@ -285,10 +298,10 @@ def harmonize_snapshots(
             target_sf, sf_conflict = _widen_snowflake_types(list(sf_types.values()))
             if target_platform == "snowflake":
                 has_conflict = sf_conflict
-                cast_needed = [s for s in c_present if sf_types[s] != target_sf]
+                cast_needed = [s for s in c_present if _norm_type_str(sf_types[s]) != target_sf]
             else:
                 has_conflict = spark_conflict
-                cast_needed = [s for s in c_present if spark_types[s] != target_spark]
+                cast_needed = [s for s in c_present if _norm_type_str(spark_types[s]) != target_spark]
             nullable = bool(c_missing) or any(smap[s][5] for s in c_present)
 
             if has_conflict:
@@ -336,15 +349,21 @@ def harmonize_snapshots(
                     if "." in tbl_key
                     else src_tbl_obj.name
                 )
-                escaped_site_lit = s.replace("'", "''")
+                escaped_site_lit = (
+                    s.replace("\\", "\\\\").replace("'", "''").replace("\n", " ").replace("\r", " ")
+                )
                 selects = [f"    '{escaped_site_lit}' AS {_dq(plant_col)}"]
                 for hc in h_cols:
                     sf_col_alias = sf_col_aliases[hc.sanitized_name]
                     tgt_t = hc.target_snowflake_type or "VARCHAR"
                     if s in hc.present_in_sources:
                         orig_col = col_sites[hc.sanitized_name][s][0]
+                        src_sf_type = _norm_type_str(col_sites[hc.sanitized_name][s][3])
                         if s in hc.cast_required_sources:
-                            selects.append(f"    CAST({_dq(orig_col)} AS {tgt_t}) AS {_dq(sf_col_alias)}")
+                            if tgt_t == "VARCHAR" and src_sf_type in {"GEOGRAPHY", "GEOMETRY"}:
+                                selects.append(f"    ST_ASWKT({_dq(orig_col)}) AS {_dq(sf_col_alias)}")
+                            else:
+                                selects.append(f"    CAST({_dq(orig_col)} AS {tgt_t}) AS {_dq(sf_col_alias)}")
                         else:
                             selects.append(f"    {_dq(orig_col)} AS {_dq(sf_col_alias)}")
                     else:
@@ -379,7 +398,12 @@ def harmonize_snapshots(
                     if "." in tbl_key
                     else src_tbl_obj.name
                 )
-                escaped_site_lit = s.replace("'", "''")
+                escaped_site_lit = (
+                    s.replace("\\", "\\\\")
+                    .replace("'", "\\'")
+                    .replace("\n", "\\n")
+                    .replace("\r", "\\r")
+                )
                 selects = [f"    '{escaped_site_lit}' AS `{plant_col_dbx}`"]
                 for hc in h_cols:
                     if s in hc.present_in_sources:
@@ -531,6 +555,17 @@ def render_harmonization_sql(report: HarmonizationReport) -> str:
         f"-- Harmonizing plants: {', '.join(report.sources)}",
         "",
     ]
+    # Emit CREATE SCHEMA IF NOT EXISTS for the target Silver schema inferred from the first view
+    if report.tables:
+        first_sql = report.tables[0].unified_sql
+        if report.target_platform == "snowflake":
+            m = re.search(r'CREATE OR REPLACE VIEW ("(?:[^"]|"")+"\."(?:[^"]|"")+")\.', first_sql)
+            if m:
+                header.extend([f"CREATE SCHEMA IF NOT EXISTS {m.group(1)};", ""])
+        else:
+            m = re.search(r"CREATE OR REPLACE VIEW (`(?:[^`]|``)+`\.`(?:[^`]|``)+`)\.", first_sql)
+            if m:
+                header.extend([f"CREATE SCHEMA IF NOT EXISTS {m.group(1)};", ""])
     return "\n".join(header + [t.unified_sql for t in report.tables])
 
 

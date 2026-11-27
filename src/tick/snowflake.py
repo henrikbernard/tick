@@ -96,11 +96,11 @@ def map_to_snowflake_type(raw_type: str, canonical: CanonicalType) -> str:
             return "NUMBER(19, 4)"
         m = SF_DECIMAL_PREC_RE.search(u)
         if m:
-            prec = int(m.group(1))
+            prec = max(1, int(m.group(1)))
             scale = int(m.group(2)) if m.group(2) else 0
             if prec > 38:
                 return f"NUMBER(38, {min(scale, 18)})"
-            return f"NUMBER({prec}, {scale})"
+            return f"NUMBER({prec}, {min(scale, prec)})"
         return "NUMBER(18, 4)"
 
     if canonical == "float":

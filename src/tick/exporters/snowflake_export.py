@@ -54,46 +54,63 @@ def _target_lag_for_table(tbl: TableInfo) -> str:
     return "1 day"
 
 
-def _snowflake_legacy_date_expr(col: ColumnInfo, col_ref: str, paired_ref: str | None) -> str:
+def _sf_int_str_expr(col_ref: str, is_decimal: bool) -> str:
+    return f"TO_VARCHAR(TRUNC({col_ref}))" if is_decimal else f"TO_VARCHAR({col_ref})"
+
+
+def _snowflake_legacy_date_expr(
+    col: ColumnInfo,
+    col_ref: str,
+    paired_ref: str | None,
+    paired_is_decimal: bool = False,
+) -> str:
     """Translate a detected LegacyDateEncoding into native Snowflake SQL."""
     assert col.profile and col.profile.legacy_date
     enc = col.profile.legacy_date.encoding
+    d_str = _sf_int_str_expr(col_ref, col.canonical_type == "decimal")
+    p_str = _sf_int_str_expr(paired_ref, paired_is_decimal) if paired_ref else None
     if enc in {"yyyymmdd_int", "yyyymmdd_str"}:
-        if paired_ref:
+        if p_str:
             return (
-                f"TRY_TO_TIMESTAMP_NTZ(TO_VARCHAR({col_ref}) || "
-                f"LPAD(TO_VARCHAR({paired_ref}), 6, '0'), 'YYYYMMDDHH24MISS')"
+                f"TRY_TO_TIMESTAMP_NTZ({d_str} || "
+                f"LPAD({p_str}, 6, '0'), 'YYYYMMDDHH24MISS')"
             )
-        return f"TRY_TO_DATE(TO_VARCHAR({col_ref}), 'YYYYMMDD')"
+        return f"TRY_TO_DATE({d_str}, 'YYYYMMDD')"
     if enc == "julian_cyyddd":
+        yr = f"(TRY_TO_NUMBER(SUBSTR({d_str}, 1, 1)) * 100 + 1900 + TRY_TO_NUMBER(SUBSTR({d_str}, 2, 2)))"
+        doy = f"TRY_TO_NUMBER(SUBSTR({d_str}, 4, 3))"
         date_expr = (
-            f"TRY_TO_DATE(TO_VARCHAR(TRY_TO_NUMBER(SUBSTR(TO_VARCHAR({col_ref}), 1, 1)) * 100 + 1900 "
-            f"+ TRY_TO_NUMBER(SUBSTR(TO_VARCHAR({col_ref}), 2, 2))) || "
-            f"SUBSTR(TO_VARCHAR({col_ref}), 4, 3), 'YYYYDDD')"
+            f"IFF({doy} BETWEEN 1 AND 366, "
+            f"DATEADD('DAY', {doy} - 1, DATE_FROM_PARTS({yr}, 1, 1)), NULL)"
         )
-        if paired_ref:
+        if p_str:
             return (
                 f"TRY_TO_TIMESTAMP_NTZ(TO_CHAR({date_expr}, 'YYYYMMDD') || "
-                f"LPAD(TO_VARCHAR({paired_ref}), 6, '0'), 'YYYYMMDDHH24MISS')"
+                f"LPAD({p_str}, 6, '0'), 'YYYYMMDDHH24MISS')"
             )
         return date_expr
     if enc == "julian_yyyyddd":
-        date_expr = f"TRY_TO_DATE(TO_VARCHAR({col_ref}), 'YYYYDDD')"
-        if paired_ref:
+        yr = f"TRY_TO_NUMBER(SUBSTR({d_str}, 1, 4))"
+        doy = f"TRY_TO_NUMBER(SUBSTR({d_str}, 5, 3))"
+        date_expr = (
+            f"IFF({doy} BETWEEN 1 AND 366, "
+            f"DATEADD('DAY', {doy} - 1, DATE_FROM_PARTS({yr}, 1, 1)), NULL)"
+        )
+        if p_str:
             return (
                 f"TRY_TO_TIMESTAMP_NTZ(TO_CHAR({date_expr}, 'YYYYMMDD') || "
-                f"LPAD(TO_VARCHAR({paired_ref}), 6, '0'), 'YYYYMMDDHH24MISS')"
+                f"LPAD({p_str}, 6, '0'), 'YYYYMMDDHH24MISS')"
             )
         return date_expr
     if enc == "excel_serial":
-        date_expr = f"DATEADD('DAY', TRY_TO_NUMBER(TO_VARCHAR({col_ref})), TO_DATE('1899-12-30'))"
-        if paired_ref:
+        date_expr = f"DATEADD('DAY', TRY_TO_NUMBER({d_str}), TO_DATE('1899-12-30'))"
+        if p_str:
             return (
                 f"TRY_TO_TIMESTAMP_NTZ(TO_CHAR({date_expr}, 'YYYYMMDD') || "
-                f"LPAD(TO_VARCHAR({paired_ref}), 6, '0'), 'YYYYMMDDHH24MISS')"
+                f"LPAD({p_str}, 6, '0'), 'YYYYMMDDHH24MISS')"
             )
         return date_expr
-    return f"LPAD(TO_VARCHAR({col_ref}), 6, '0')"
+    return f"LPAD({d_str}, 6, '0')"
 
 
 def render_snowflake_ddl(
@@ -176,7 +193,6 @@ def render_snowflake_ddl(
 
         lines.append(",\n".join(col_defs))
         lines.append(")")
-        lines.append("CHANGE_TRACKING = TRUE")
 
         if sfc and sfc.clustering_keys:
             ckeys = ", ".join(_dq(k) for k in sfc.clustering_keys)
@@ -184,6 +200,8 @@ def render_snowflake_ddl(
                 lines.append(f"CLUSTER BY ({ckeys})")
             else:
                 lines.append(f"-- Recommended CLUSTER BY ({ckeys}) once table exceeds ~1 GB")
+
+        lines.append("CHANGE_TRACKING = TRUE")
 
         tcomment = tbl.business_description or tbl.comment or (
             f"Discovered from {tbl.full_name} (role: {tbl.recommendations.entity_role if tbl.recommendations else 'unknown'})"
@@ -359,12 +377,22 @@ def render_snowflake_dynamic_tables_sql(
                         suffix += 1
                     target_col = f"{target_col}_{suffix}"
                 emitted_cols.add(target_col)
+                paired_obj = (
+                    next((c for c in tbl.columns if c.name == ld.paired_column), None)
+                    if ld.paired_column
+                    else None
+                )
                 paired_ref = (
                     _dq(col_map.get(ld.paired_column, sanitize_snowflake_identifier(ld.paired_column)))
                     if ld.paired_column
                     else None
                 )
-                expr = _snowflake_legacy_date_expr(col, _dq(cname), paired_ref)
+                expr = _snowflake_legacy_date_expr(
+                    col,
+                    _dq(cname),
+                    paired_ref,
+                    paired_is_decimal=bool(paired_obj and paired_obj.canonical_type == "decimal"),
+                )
                 select_exprs.append(f"  {expr} AS {_dq(target_col)}")
 
         if "_INGESTED_AT" not in emitted_cols:
@@ -438,6 +466,7 @@ def render_snowflake_dmf_sql(
     tbl_name_map = deduplicate_snowflake_tables(base_tables)
     custom_dmfs: list[str] = []
     has_opc_num_dmf = False
+    has_opc_float_dmf = False
 
     for tbl in base_tables:
         safe_tbl = tbl_name_map[tbl.full_name]
@@ -467,7 +496,8 @@ def render_snowflake_dmf_sql(
                     f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.NULL_COUNT ON ({_dq(cname)});"
                 )
 
-        # Freshness DMF on top temporal watermark (Snowflake FRESHNESS requires DATE/TIMESTAMP column)
+        # Freshness DMF: SNOWFLAKE.CORE.FRESHNESS only accepts DATE, TIMESTAMP_LTZ, or TIMESTAMP_TZ
+        # (rejects TIMESTAMP_NTZ). Fall back to Bronze `_INGESTED_AT` (TIMESTAMP_LTZ) when watermark is NTZ.
         if tbl.recommendations and tbl.recommendations.watermark_candidates:
             col_by_name = {c.name: c for c in tbl.columns}
             temporal_wm = next(
@@ -481,20 +511,39 @@ def render_snowflake_dmf_sql(
                 None,
             )
             if temporal_wm:
-                wcol = col_map.get(temporal_wm.column, sanitize_snowflake_identifier(temporal_wm.column))
-                stmts.append(
-                    f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.FRESHNESS ON ({_dq(wcol)});"
-                )
+                wm_col_obj = col_by_name[temporal_wm.column]
+                wm_sf_type = (
+                    wm_col_obj.snowflake_type
+                    or map_to_snowflake_type(wm_col_obj.raw_type, wm_col_obj.canonical_type)
+                ).upper()
+                if wm_sf_type in {"DATE", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"}:
+                    wcol = col_map.get(temporal_wm.column, sanitize_snowflake_identifier(temporal_wm.column))
+                    stmts.append(
+                        f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.FRESHNESS ON ({_dq(wcol)});"
+                    )
+                else:
+                    stmts.append(
+                        f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.FRESHNESS ON (\"_INGESTED_AT\"); -- Source watermark '{temporal_wm.column}' is {wm_sf_type} (FRESHNESS requires DATE/LTZ/TZ)"
+                    )
 
-        # Numeric OPC Classic quality DMF (< 192)
+        # Numeric OPC Classic quality DMF (< 192) — match column Snowflake type (NUMBER vs FLOAT)
         if tbl.telemetry_profile and tbl.telemetry_profile.quality_column:
             raw_qcol = tbl.telemetry_profile.quality_column
             qcol = col_map.get(raw_qcol, sanitize_snowflake_identifier(raw_qcol))
             qcol_obj = next((c for c in tbl.columns if c.name == raw_qcol), None)
             if qcol_obj and qcol_obj.canonical_type in {"integer", "decimal", "float"}:
-                has_opc_num_dmf = True
+                q_sf_type = (
+                    qcol_obj.snowflake_type
+                    or map_to_snowflake_type(qcol_obj.raw_type, qcol_obj.canonical_type)
+                ).upper()
+                if q_sf_type == "FLOAT":
+                    has_opc_float_dmf = True
+                    dmf_name = "BAD_OPC_QUALITY_COUNT_FLOAT"
+                else:
+                    has_opc_num_dmf = True
+                    dmf_name = "BAD_OPC_QUALITY_COUNT"
                 stmts.append(
-                    f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION {_dq(db)}.{_dq(sch)}.{_dq('BAD_OPC_QUALITY_COUNT')} ON ({_dq(qcol)});"
+                    f"ALTER TABLE {fqn} ADD DATA METRIC FUNCTION {_dq(db)}.{_dq(sch)}.{_dq(dmf_name)} ON ({_dq(qcol)});"
                 )
 
         if stmts:
@@ -508,6 +557,18 @@ def render_snowflake_dmf_sql(
             [
                 f"CREATE DATA METRIC FUNCTION IF NOT EXISTS {_dq(db)}.{_dq(sch)}.{_dq('BAD_OPC_QUALITY_COUNT')}(",
                 "  ARG_T TABLE(ARG_C NUMBER)",
+                ") RETURNS NUMBER AS",
+                "$$",
+                "  SELECT COUNT(*) FROM ARG_T WHERE ARG_C < 192",
+                "$$;",
+                "",
+            ]
+        )
+    if has_opc_float_dmf:
+        custom_dmfs.extend(
+            [
+                f"CREATE DATA METRIC FUNCTION IF NOT EXISTS {_dq(db)}.{_dq(sch)}.{_dq('BAD_OPC_QUALITY_COUNT_FLOAT')}(",
+                "  ARG_T TABLE(ARG_C FLOAT)",
                 ") RETURNS NUMBER AS",
                 "$$",
                 "  SELECT COUNT(*) FROM ARG_T WHERE ARG_C < 192",

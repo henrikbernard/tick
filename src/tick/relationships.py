@@ -91,17 +91,22 @@ def _match_column_to_target(
             return 0.72, f"Shared key column name '{src}' with unique target '{target_table.name}.{tgt}'"
 
     # Pattern 2: <stem>_id -> <table>.id  (or <stem>_uuid -> <table>.uuid, <stem>_key -> <table>.key)
-    for stem in stems:
+    # Sort longest stems first and keep highest-scoring hit so PYTHONHASHSEED never alters results
+    best_match: tuple[float, str] | None = None
+    for stem in sorted(stems, key=lambda s: (-len(s), s)):
+        cand_match: tuple[float, str] | None = None
         if src == f"{stem}_{tgt}":
-            return 0.88, f"Column '{src}' matches '{target_table.name}' stem + '.{tgt}'"
-        if tgt in {"id", f"{stem}_id"} and src == f"{stem}_id":
-            return 0.88, f"Column '{src}' matches standard FK convention to '{target_table.name}.{tgt}'"
-        if tgt == "id" and src.endswith(f"_{stem}_id"):
-            return 0.76, f"Role-prefixed FK column '{src}' ends with '_{stem}_id' -> '{target_table.name}.id'"
-        if tgt in {"uuid", "guid"} and src == f"{stem}_{tgt}":
-            return 0.84, f"UUID FK column '{src}' matches '{target_table.name}.{tgt}'"
+            cand_match = (0.88, f"Column '{src}' matches '{target_table.name}' stem + '.{tgt}'")
+        elif tgt in {"id", f"{stem}_id"} and src == f"{stem}_id":
+            cand_match = (0.88, f"Column '{src}' matches standard FK convention to '{target_table.name}.{tgt}'")
+        elif tgt == "id" and src.endswith(f"_{stem}_id"):
+            cand_match = (0.76, f"Role-prefixed FK column '{src}' ends with '_{stem}_id' -> '{target_table.name}.id'")
+        elif tgt in {"uuid", "guid"} and src == f"{stem}_{tgt}":
+            cand_match = (0.84, f"UUID FK column '{src}' matches '{target_table.name}.{tgt}'")
+        if cand_match is not None and (best_match is None or cand_match[0] > best_match[0]):
+            best_match = cand_match
 
-    return None
+    return best_match
 
 
 def discover_relationships(
@@ -131,7 +136,7 @@ def discover_relationships(
                 ci_match = table_by_full_lower.get(target_full.lower())
                 if ci_match:
                     target_full = ci_match
-                else:
+                elif not fk.referred_schema:
                     candidates = table_by_name.get(fk.referred_table.lower(), [])
                     if len(candidates) == 1:
                         target_full = candidates[0].full_name
@@ -186,6 +191,7 @@ def discover_relationships(
                 continue
 
             best_candidate: RelationshipInfo | None = None
+            best_same_schema = False
 
             for tgt_tbl, tgt_col in target_keys:
                 if tgt_tbl.full_name == src_tbl.full_name:
@@ -222,7 +228,13 @@ def discover_relationships(
                     src_vals = value_samples.get((src_tbl.full_name, src_col.name))
                     tgt_vals = value_samples.get((tgt_tbl.full_name, tgt_col.name))
                     if src_vals and tgt_vals:
-                        overlap = len(src_vals & tgt_vals) / len(src_vals)
+                        if {src_col.canonical_type, tgt_col.canonical_type} == {"integer", "decimal"}:
+                            src_cmp = {re.sub(r"\.0+$", "", v.strip()) for v in src_vals}
+                            tgt_cmp = {re.sub(r"\.0+$", "", v.strip()) for v in tgt_vals}
+                        else:
+                            src_cmp = src_vals
+                            tgt_cmp = tgt_vals
+                        overlap = len(src_cmp & tgt_cmp) / len(src_cmp)
                         overlap_rate = round(overlap, 4)
                         if overlap >= 0.50:
                             kind = "inferred_name_and_values"
@@ -270,8 +282,14 @@ def discover_relationships(
                     overlap_rate=overlap_rate,
                     evidence=evidence,
                 )
-                if best_candidate is None or cand.confidence > best_candidate.confidence:
+                cand_same_schema = tgt_tbl.schema_name.lower() == src_tbl.schema_name.lower()
+                if (
+                    best_candidate is None
+                    or cand.confidence > best_candidate.confidence
+                    or (cand.confidence == best_candidate.confidence and cand_same_schema and not best_same_schema)
+                ):
                     best_candidate = cand
+                    best_same_schema = cand_same_schema
 
             if best_candidate is not None:
                 relationships.append(best_candidate)
@@ -285,6 +303,9 @@ def _extract_tables_from_sql(sql: str, sqlglot_dialect: str | None) -> set[tuple
     refs: set[tuple[str | None, str]] = set()
     try:
         parsed_list = sqlglot.parse(sql, read=sqlglot_dialect)
+        parsed_cleanly = bool(parsed_list) and all(
+            stmt is not None and not isinstance(stmt, exp.Command) for stmt in parsed_list
+        )
         for stmt in parsed_list:
             if stmt is None:
                 continue
@@ -308,7 +329,7 @@ def _extract_tables_from_sql(sql: str, sqlglot_dialect: str | None) -> set[tuple
                 if schema is None and name.lower() in cte_names:
                     continue
                 refs.add((schema.lower() if schema else None, name.lower()))
-        if refs:
+        if parsed_cleanly or refs:
             return refs
     except Exception:
         pass

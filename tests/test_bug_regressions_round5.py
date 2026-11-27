@@ -97,15 +97,16 @@ def test_snowflake_get_table_stats_handles_lowercase_row_keys_and_upper_schema()
 
 
 def test_profiler_full_table_aggregates_handles_uppercase_folded_aliases():
-    """Snowflake, Oracle, and DB2 fold unquoted aliases (__total__ -> __TOTAL__)."""
+    """Snowflake, Oracle, and DB2 fold unquoted aliases (t_total -> T_TOTAL)."""
     conn = MagicMock()
-    conn.execute.return_value.mappings.return_value.first.return_value = {
-        "__TOTAL__": 500,
-        "__NN_0__": 495,
-        "__MIN_0__": 1,
-        "__MAX_0__": 999,
+    conn.exec_driver_sql.return_value.mappings.return_value.first.return_value = {
+        "T_TOTAL": 500,
+        "C_NN_0": 495,
+        "C_MIN_0": 1,
+        "C_MAX_0": 999,
     }
     adapter = MagicMock()
+    adapter.name = "snowflake"
     adapter.quote_identifier.side_effect = lambda _c, name: f'"{name}"'
     cols = [ColumnInfo(name="amount", raw_type="NUMBER(10,0)", canonical_type="integer")]
     aggs = _fetch_full_table_aggregates(conn, adapter, '"PUBLIC"."ORDERS"', cols)
@@ -188,11 +189,11 @@ def test_odcs_snowflake_physical_types_domain_and_clean_contracts_bundle(tmp_pat
     odcs = yaml.safe_load(render_odcs_yaml(res))
     assert odcs["domain"] == "ACME_SF_DW"
     schema_by_name = {s["name"]: s for s in odcs["schema"]}
-    wo_props = {p["name"]: p for p in schema_by_name["work_orders"]["properties"]}
-    # Snowflake physical types (INTEGER / NUMBER) instead of Spark types (INT / DECIMAL)
-    assert wo_props["order"]["physicalType"] == "INTEGER"
-    assert wo_props["unit_cost"]["physicalType"].startswith("NUMBER(")
-    assert wo_props["plant_code"]["physicalType"] == "VARCHAR"
+    wo_props = {p["name"]: p for p in schema_by_name["WORK_ORDERS"]["properties"]}
+    # Snowflake physical types (INTEGER / NUMBER) & uppercase Snowflake DDL identifiers
+    assert wo_props["ORDER"]["physicalType"] == "INTEGER"
+    assert wo_props["UNIT_COST"]["physicalType"].startswith("NUMBER(")
+    assert wo_props["PLANT_CODE"]["physicalType"] == "VARCHAR"
 
     # Snowflake-only bundle should NOT emit Databricks-only dqx_checks.yml
     written = export_contracts_bundle(res, tmp_path / "sf_contracts")
@@ -250,7 +251,7 @@ def test_databricks_and_snowflake_ddl_no_duplicate_audit_cols_and_no_25_mask_cap
     assert dbx_ddl.count("`_source_system`") == 1
     assert "SET MASK" in dbx_ddl
     assert dbx_ddl.count("SET MASK") == 30
-    assert "'team''s_tag' = 'plant''s_val'" in dbx_ddl
+    assert r"'team\'s_tag' = 'plant\'s_val'" in dbx_ddl
 
     sf_ddl = render_snowflake_ddl(res, database="DB_X", schema="SCH_X")
     assert sf_ddl.count("SET MASKING POLICY") == 30

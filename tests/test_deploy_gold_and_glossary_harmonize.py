@@ -145,10 +145,10 @@ def test_snowflake_cli_manifest_streamlit_app_and_gold_bom_sql(tmp_path):
     # 3. Validate Snowflake Gold Recursive Dynamic Table SQL with sqlglot
     sf_gold = (out_dir / "snowflake_gold_hierarchies.sql").read_text(encoding="utf-8")
     assert "CREATE OR REPLACE DYNAMIC TABLE" in sf_gold
-    assert "WITH RECURSIVE HIERARCHY_EDGES AS (" in sf_gold
+    assert 'WITH RECURSIVE HIERARCHY_EDGES ("PLANT_ID", "ROOT_NODE_ID", "PARENT_NODE_ID", "CHILD_NODE_ID", "EDGE_QTY", "EXTENDED_QTY", "DEPTH", "PATH_NODES") AS (' in sf_gold
     assert 'ARRAY_CONTAINS(TO_VARCHAR(e."CHILD_PART_ID")::VARIANT, r."PATH_NODES")' in sf_gold
     assert '"EXTENDED_QTY"' in sf_gold
-    assert 'e."PLANT_ID" = r."PLANT_ID"' in sf_gold
+    assert 'e."PLANT_ID" IS NOT DISTINCT FROM r."PLANT_ID"' in sf_gold
     parsed = [s for s in sqlglot.parse(sf_gold, read="snowflake") if s is not None]
     assert len(parsed) >= 2
 

@@ -158,7 +158,13 @@ def _find_pk_candidates(table: TableInfo) -> list[str]:
         if col.is_unique and not col.nullable:
             candidates.append((3, col.name))
             continue
-        if col.profile and col.profile.cardinality_class == "unique" and col.profile.null_count == 0 and col.profile.sample_size > 0:
+        if (
+            col.canonical_type in {"integer", "string", "uuid", "decimal"}
+            and col.profile
+            and col.profile.cardinality_class == "unique"
+            and col.profile.null_count == 0
+            and col.profile.sample_size > 0
+        ):
             bonus = 2 if col.name.lower() == "id" or col.name.lower().endswith(("_id", "_key", "_uuid")) else 1
             candidates.append((bonus, col.name))
     candidates.sort(key=lambda x: (-x[0], x[1]))
@@ -198,7 +204,7 @@ def _classify_entity(
             "fact",
             f"Has {outbound_count} outbound relationships and {len(numeric_measures)} measure column(s)",
         )
-    if REF_TABLE_RE.search(table.name) and rows <= 500:
+    if REF_TABLE_RE.search(table.name) and table.row_count is not None and rows <= 500:
         return "reference", f"Small lookup/reference table ({rows:,} rows)"
     if inbound_count >= 1 or DIM_TABLE_RE.search(table.name):
         return (
@@ -406,7 +412,7 @@ def analyze_tables_and_quality(
                     )
                     penalty += 2
 
-                if prof.cardinality_class == "constant" and prof.sample_size >= 10:
+                if prof.cardinality_class == "constant" and prof.non_null_count >= 10:
                     issues.append(
                         QualityIssue(
                             severity="low",

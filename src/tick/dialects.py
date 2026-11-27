@@ -10,7 +10,7 @@ from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.engine.url import make_url
+from sqlalchemy.engine.url import URL, make_url
 
 from tick.models import CanonicalType, CdcDatabaseAudit
 
@@ -134,9 +134,9 @@ def resolve_connection_url(target: str) -> str:
         path = Path(stripped).expanduser().resolve()
         suffix = path.suffix.lower()
         if suffix in {".duckdb", ".ddb"}:
-            return f"duckdb:///{path}"
+            return URL.create("duckdb", database=str(path)).render_as_string(hide_password=False)
         if suffix in {".sqlite", ".sqlite3", ".db"}:
-            return f"sqlite:///{path}"
+            return URL.create("sqlite", database=str(path)).render_as_string(hide_password=False)
         raise ValueError(
             f"Unrecognized connection target '{target}'. Provide a SQLAlchemy URL "
             "(e.g. postgresql://..., mssql+pyodbc://..., databricks://..., duckdb:///file.duckdb) "
@@ -170,6 +170,8 @@ _SENSITIVE_QUERY_KEYS = {
     "pwd",
     "pass",
     "passcode",
+    "passphrase",
+    "private_key_passphrase",
     "token",
     "access_token",
     "auth_token",
@@ -177,6 +179,9 @@ _SENSITIVE_QUERY_KEYS = {
     "authenticator_token",
     "secret",
     "client_secret",
+    "oauth_client_secret",
+    "aws_secret_access_key",
+    "aws_session_token",
     "api_key",
     "apikey",
     "sas_token",
@@ -184,8 +189,15 @@ _SENSITIVE_QUERY_KEYS = {
     "private_key",
     "private_key_pwd",
     "private_key_file_pwd",
+    "credentials_base64",
+    "service_account_json",
 }
-_ODBC_SECRET_RE = re.compile(r"(?i)((?:^|[;&?])(?:PWD|Password|AccessToken|Token)\s*=\s*)([^;&]+)")
+_ODBC_SECRET_RE = re.compile(
+    r"(?i)((?:^|[;&?])(?:PWD|Password|AccessToken|Token|ClientSecret|Secret|Passcode)\s*=\s*)(\{(?:[^{}]|\}\})*\}|[^;&]+)"
+)
+_SENSITIVE_QUERY_FALLBACK_RE = re.compile(
+    r"(?i)([?&](?:" + "|".join(sorted(_SENSITIVE_QUERY_KEYS)) + r")=)([^&]+)"
+)
 
 
 def sanitize_url(url: str) -> str:
@@ -197,19 +209,23 @@ def sanitize_url(url: str) -> str:
             for k, v in parsed.query.items():
                 if k.lower() in _SENSITIVE_QUERY_KEYS:
                     clean_query[k] = "***"
-                elif k.lower() == "odbc_connect" and isinstance(v, str):
-                    clean_query[k] = _ODBC_SECRET_RE.sub(r"\1***", v)
+                elif k.lower() == "odbc_connect":
+                    if isinstance(v, str):
+                        clean_query[k] = _ODBC_SECRET_RE.sub(r"\1***", v)
+                    elif isinstance(v, (tuple, list)):
+                        clean_query[k] = tuple(
+                            _ODBC_SECRET_RE.sub(r"\1***", item) if isinstance(item, str) else item
+                            for item in v
+                        )
+                    else:
+                        clean_query[k] = v
                 else:
                     clean_query[k] = v
             parsed = parsed.set(query=clean_query)
         return parsed.render_as_string(hide_password=True)
     except Exception:
         masked = re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", url)
-        masked = re.sub(
-            r"(?i)([?&](?:password|pwd|pass|passcode|token|access_token|auth_token|oauth_token|authenticator_token|secret|client_secret|api_key|apikey|sas_token|sig|private_key|private_key_pwd|private_key_file_pwd)=)([^&]+)",
-            r"\1***",
-            masked,
-        )
+        masked = _SENSITIVE_QUERY_FALLBACK_RE.sub(r"\1***", masked)
         return _ODBC_SECRET_RE.sub(r"\1***", masked)
 
 
@@ -312,14 +328,16 @@ def normalize_type(raw_type: str) -> CanonicalType:
 
     if base in _OTHER_TYPE_BASES:
         return "other"
-    if any(k in t for k in ("UUID", "UNIQUEIDENTIFIER", "GUID")):
-        return "uuid"
     if (
         base in _JSON_TYPE_BASES
         or t.startswith(("STRUCT<", "MAP<", "ARRAY<"))
         or t.endswith("[]")
     ):
         return "json"
+    if base == "ENUM":
+        return "string"
+    if any(k in t for k in ("UUID", "UNIQUEIDENTIFIER", "GUID")):
+        return "uuid"
     if any(
         k in t
         for k in (
@@ -551,11 +569,12 @@ class PostgresAdapter(DialectAdapter):
         read_uncommitted: bool = False,
         query_timeout_seconds: int | None = None,
     ) -> None:
-        try:
-            if query_timeout_seconds and query_timeout_seconds > 0:
+        if query_timeout_seconds and query_timeout_seconds > 0:
+            try:
                 conn.execute(text(f"SET statement_timeout = {int(query_timeout_seconds * 1000)}"))
-        except Exception:
-            safe_rollback(conn)
+                conn.commit()
+            except Exception:
+                safe_rollback(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
         wal_level: str | None = None
@@ -784,12 +803,17 @@ class SqlServerAdapter(DialectAdapter):
             SELECT
                 t.name AS table_name,
                 SUM(p.rows) AS row_count,
-                SUM(a.total_pages) * 8 * 1024 AS total_bytes
+                SUM(au.total_pages) * 8 * 1024 AS total_bytes
             FROM sys.tables t
             JOIN sys.schemas s ON t.schema_id = s.schema_id
             JOIN sys.indexes i ON t.object_id = i.object_id
             JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
-            JOIN sys.allocation_units a ON p.partition_id = a.container_id
+            OUTER APPLY (
+                SELECT SUM(a.total_pages) AS total_pages
+                FROM sys.allocation_units a
+                WHERE (a.type IN (1, 3) AND a.container_id = p.hobt_id)
+                   OR (a.type = 2 AND a.container_id = p.partition_id)
+            ) au
             WHERE s.name = :schema AND i.index_id IN (0, 1)
             GROUP BY t.name
             """
@@ -1113,13 +1137,18 @@ class MySQLAdapter(DialectAdapter):
         read_uncommitted: bool = False,
         query_timeout_seconds: int | None = None,
     ) -> None:
-        try:
-            if read_uncommitted:
+        if read_uncommitted:
+            try:
                 conn.execute(text("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"))
-            if query_timeout_seconds and query_timeout_seconds > 0:
+                conn.commit()
+            except Exception:
+                safe_rollback(conn)
+        if query_timeout_seconds and query_timeout_seconds > 0:
+            try:
                 conn.execute(text(f"SET SESSION max_execution_time = {int(query_timeout_seconds * 1000)}"))
-        except Exception:
-            safe_rollback(conn)
+                conn.commit()
+            except Exception:
+                safe_rollback(conn)
 
     def audit_database_cdc(self, conn: Connection) -> CdcDatabaseAudit:
         fmt: str | None = None

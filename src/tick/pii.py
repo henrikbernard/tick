@@ -68,6 +68,19 @@ def _is_credit_card(value: str) -> bool:
     return _luhn_valid(digits)
 
 
+def _is_iban(value: str) -> bool:
+    """Validate IBAN format plus ISO 13616 MOD-97 checksum so serials/work-orders aren't misflagged."""
+    compact = re.sub(r"\s+", "", value).upper()
+    if not (15 <= len(compact) <= 34) or not IBAN_RE.match(compact):
+        return False
+    rearranged = compact[4:] + compact[:4]
+    numeric = "".join(str(ord(ch) - 55) if ch.isalpha() else ch for ch in rearranged)
+    try:
+        return int(numeric) % 97 == 1
+    except ValueError:
+        return False
+
+
 def _match_value_category(category: str, value: str) -> bool:
     v = value.strip()
     if not v or len(v) > 256:
@@ -83,7 +96,7 @@ def _match_value_category(category: str, value: str) -> bool:
     if category == "ip_address":
         return bool(IPV4_RE.match(v))
     if category == "iban":
-        return bool(IBAN_RE.match(v.replace(" ", "")))
+        return _is_iban(v)
     if category == "secret_token":
         return bool(SECRET_RE.match(v))
     return False
@@ -108,6 +121,9 @@ def detect_pii(
     norm_col = re.sub(r"[\s\-]+", "_", column_name.strip())
 
     for category, patterns in NAME_PATTERNS.items():
+        # Temporal metadata columns (e.g. password_updated_at, email_sent_at) can only carry DOB PII
+        if canonical_type in {"date", "timestamp", "time"} and category != "date_of_birth":
+            continue
         name_hit = any(p.search(norm_col) for p in patterns)
         match_rate: float | None = None
         evidence: list[str] = []

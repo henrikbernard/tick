@@ -15,7 +15,11 @@ from tick.databricks import (
     sanitize_delta_column_name,
 )
 from tick.models import CanonicalType, DiscoveryResult
-from tick.snowflake import map_to_snowflake_type
+from tick.snowflake import (
+    deduplicate_snowflake_columns,
+    deduplicate_snowflake_tables,
+    map_to_snowflake_type,
+)
 
 _ODCS_LOGICAL_TYPES: dict[CanonicalType, str] = {
     "integer": "integer",
@@ -247,12 +251,20 @@ def render_odcs_yaml(
     ov = result.overview
 
     base_tables = [t for t in result.tables if t.table_type == "table"]
-    tbl_name_map = deduplicate_table_names(base_tables)
+    tbl_name_map = (
+        deduplicate_snowflake_tables(base_tables)
+        if is_sf_only
+        else deduplicate_table_names(base_tables)
+    )
 
     schema_objects: list[dict[str, Any]] = []
     for tbl in base_tables:
         safe_tbl = tbl_name_map[tbl.full_name]
-        col_map = deduplicate_column_names([c.name for c in tbl.columns])
+        col_map = (
+            deduplicate_snowflake_columns([c.name for c in tbl.columns])
+            if is_sf_only
+            else deduplicate_column_names([c.name for c in tbl.columns])
+        )
         pk_positions = {col_name: idx + 1 for idx, col_name in enumerate(tbl.primary_key)}
 
         properties: list[dict[str, Any]] = []
@@ -379,8 +391,8 @@ def render_odcs_yaml(
             {
                 "server": "snowflake_target",
                 "type": "snowflake",
-                "database": result.config.snowflake_database,
-                "schema": result.config.snowflake_schema,
+                "database": cat if is_sf_only else result.config.snowflake_database,
+                "schema": sch if is_sf_only else result.config.snowflake_schema,
                 "warehouse": result.config.snowflake_warehouse,
                 "description": "Target Snowflake Data Cloud schema",
             }

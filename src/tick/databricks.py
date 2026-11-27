@@ -93,11 +93,11 @@ def map_to_spark_type(raw_type: str, canonical: CanonicalType) -> str:
             return "DECIMAL(19, 4)"
         m = DECIMAL_PREC_RE.search(u)
         if m:
-            prec = int(m.group(1))
+            prec = max(1, int(m.group(1)))
             scale = int(m.group(2)) if m.group(2) else 0
             if prec > 38:
                 return f"DECIMAL(38, {min(scale, 18)})"
-            return f"DECIMAL({prec}, {scale})"
+            return f"DECIMAL({prec}, {min(scale, prec)})"
         return "DECIMAL(18, 4)"
     if canonical == "float":
         return "DOUBLE"

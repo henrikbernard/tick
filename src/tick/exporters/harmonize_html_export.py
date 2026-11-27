@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 
 from tick.models import HarmonizationReport
@@ -516,11 +517,21 @@ def render_harmonization_html(report: HarmonizationReport) -> str:
         "report": report.model_dump(mode="json"),
         "all_sql": "\n".join(all_sql_lines),
     }
-    raw_json = json.dumps(payload).replace("</", "<\\/")
+    raw_json = (
+        json.dumps(payload)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
     title = " vs ".join(report.sources[:3]) + (f" (+{len(report.sources) - 3})" if len(report.sources) > 3 else "")
-    return (
-        HARMONIZE_HTML_TEMPLATE.replace("__TITLE__", html.escape(title))
-        .replace("__PAYLOAD_JSON__", raw_json)
+    replacements = {
+        "__TITLE__": html.escape(title),
+        "__PAYLOAD_JSON__": raw_json,
+    }
+    return re.sub(
+        r"__TITLE__|__PAYLOAD_JSON__",
+        lambda m: replacements[m.group(0)],
+        HARMONIZE_HTML_TEMPLATE,
     )
 
 

@@ -358,8 +358,8 @@ class CdcDatabaseAudit(BaseModel):
 
 class DiscoveryConfig(BaseModel):
     profile_mode: ProfileMode = "full"
-    sample_size: int = 5000
-    top_k: int = 5
+    sample_size: int = Field(default=5000, ge=1)
+    top_k: int = Field(default=5, ge=1)
     include_schemas: list[str] = Field(default_factory=list)
     exclude_schemas: list[str] = Field(default_factory=list)
     include_tables: list[str] = Field(default_factory=list)

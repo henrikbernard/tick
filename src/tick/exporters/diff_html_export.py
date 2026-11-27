@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 
 from tick.models import SnapshotDiff
@@ -354,11 +355,21 @@ DIFF_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 def render_diff_html(diff: SnapshotDiff) -> str:
     """Render a standalone, offline-capable interactive HTML schema & data drift report."""
-    raw_json = json.dumps(diff.model_dump(mode="json")).replace("</", "<\\/")
+    raw_json = (
+        json.dumps(diff.model_dump(mode="json"))
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
     title = f"{diff.before_database} vs {diff.after_database}"
-    return (
-        DIFF_HTML_TEMPLATE.replace("__TITLE__", html.escape(title))
-        .replace("__PAYLOAD_JSON__", raw_json)
+    replacements = {
+        "__TITLE__": html.escape(title),
+        "__PAYLOAD_JSON__": raw_json,
+    }
+    return re.sub(
+        r"__TITLE__|__PAYLOAD_JSON__",
+        lambda m: replacements[m.group(0)],
+        DIFF_HTML_TEMPLATE,
     )
 
 

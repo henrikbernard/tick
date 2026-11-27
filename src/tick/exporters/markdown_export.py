@@ -23,13 +23,33 @@ def _fmt_int(num: int | None) -> str:
     return f"{num:,}" if num is not None else "—"
 
 
+_MERMAID_RESERVED = {"end", "subgraph", "graph", "flowchart", "erdiagram", "class", "style", "click"}
+
+
 def _mermaid_id(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name)
     if not cleaned:
         return "n_node"
-    if cleaned[0].isdigit():
+    if cleaned[0].isdigit() or cleaned.lower() in _MERMAID_RESERVED:
         return f"n_{cleaned}"
     return cleaned
+
+
+def _build_mermaid_id_map(names: list[str]) -> dict[str, str]:
+    used: set[str] = set()
+    mapping: dict[str, str] = {}
+    for name in names:
+        if name in mapping:
+            continue
+        base = _mermaid_id(name)
+        cand = base
+        suffix = 2
+        while cand in used:
+            cand = f"{base}_{suffix}"
+            suffix += 1
+        used.add(cand)
+        mapping[name] = cand
+    return mapping
 
 
 def _escape_mermaid_label(val: str) -> str:
@@ -46,9 +66,11 @@ def _md_code(val: str | None) -> str:
     if not val:
         return "—"
     escaped = _escape_md(val)
-    if "`" in escaped:
-        return f"`` {escaped} ``"
-    return f"`{escaped}`"
+    max_run = max((len(m.group(0)) for m in re.finditer(r"`+", escaped)), default=0)
+    fence = "`" * (max_run + 1)
+    if max_run > 0 or escaped.startswith("`") or escaped.endswith("`"):
+        return f"{fence} {escaped} {fence}"
+    return f"{fence}{escaped}{fence}"
 
 
 def _render_mermaid_erd(result: DiscoveryResult) -> str:
@@ -56,9 +78,14 @@ def _render_mermaid_erd(result: DiscoveryResult) -> str:
     if not base_tables:
         return ""
 
+    all_erd_names = [t.full_name for t in base_tables[:40]]
+    for rel in result.relationships[:80]:
+        all_erd_names.extend([rel.source_table, rel.target_table])
+    id_map = _build_mermaid_id_map(all_erd_names)
+
     lines = ["```mermaid", "erDiagram"]
     for tbl in base_tables[:40]:
-        tid = _mermaid_id(tbl.full_name)
+        tid = id_map[tbl.full_name]
         lines.append(f"    {tid} {{")
         for col in tbl.columns[:25]:
             ctype = re.sub(r"[^A-Za-z0-9_]", "_", col.canonical_type)
@@ -73,8 +100,8 @@ def _render_mermaid_erd(result: DiscoveryResult) -> str:
         lines.append("    }")
 
     for rel in result.relationships[:80]:
-        src = _mermaid_id(rel.source_table)
-        tgt = _mermaid_id(rel.target_table)
+        src = id_map[rel.source_table]
+        tgt = id_map[rel.target_table]
         if rel.kind == "explicit_fk":
             connector = "}o--||"
             label = _escape_mermaid_label(f"{rel.source_column} -> {rel.target_column}")
@@ -96,12 +123,16 @@ def _render_mermaid_lineage(result: DiscoveryResult) -> str:
     lines = ["```mermaid", "flowchart LR"]
     seen_nodes: set[str] = set()
     type_map = {t.full_name: t.table_type for t in result.tables}
+    node_names: list[str] = []
+    for edge in view_edges:
+        node_names.extend([edge.upstream_table, edge.downstream_table])
+    id_map = _build_mermaid_id_map(node_names)
 
     for edge in view_edges:
         for node in (edge.upstream_table, edge.downstream_table):
             if node not in seen_nodes:
                 seen_nodes.add(node)
-                nid = _mermaid_id(node)
+                nid = id_map[node]
                 ttype = type_map.get(node, "table")
                 safe_node = _escape_mermaid_label(node)
                 if ttype == "table":
@@ -109,7 +140,7 @@ def _render_mermaid_lineage(result: DiscoveryResult) -> str:
                 else:
                     lines.append(f'    {nid}["{safe_node} ({ttype})"]')
         lines.append(
-            f"    {_mermaid_id(edge.upstream_table)} --> {_mermaid_id(edge.downstream_table)}"
+            f"    {id_map[edge.upstream_table]} --> {id_map[edge.downstream_table]}"
         )
     lines.append("```")
     return "\n".join(lines)
@@ -123,7 +154,9 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
     lines.append(f"### `{tbl.full_name}`{sem} ({badge} · role: `{role}` · health: `{tbl.quality_score}/100`)")
     lines.append("")
     if tbl.business_description or tbl.comment:
-        lines.append(f"> {tbl.business_description or tbl.comment}")
+        desc_text = tbl.business_description or tbl.comment or ""
+        for desc_line in desc_text.splitlines():
+            lines.append(f"> {desc_line}")
         lines.append("")
 
     meta_parts = [
@@ -148,7 +181,7 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
         )
         delim_str = f" · delimiter: `{repr(fs.delimiter)}`" if fs.delimiter else ""
         lines.append(
-            f"- **File Source:** `{fs.file_format.upper()}` ({fs.file_count} file(s), {_fmt_bytes(fs.total_bytes)}{delim_str}{hive_str}) — `{_escape_md(fs.path)}`"
+            f"- **File Source:** `{fs.file_format.upper()}` ({fs.file_count} file(s), {_fmt_bytes(fs.total_bytes)}{delim_str}{hive_str}) — {_md_code(fs.path)}"
         )
 
     if tbl.recommendations:
@@ -233,9 +266,11 @@ def _render_table_section(tbl: TableInfo) -> list[str]:
     if tbl.view_definition:
         lines.append("<details><summary>View SQL Definition</summary>")
         lines.append("")
-        lines.append("```sql")
+        max_ticks = max((len(m.group(0)) for m in re.finditer(r"`+", tbl.view_definition)), default=0)
+        fence = "`" * max(3, max_ticks + 1)
+        lines.append(f"{fence}sql")
         lines.append(tbl.view_definition)
-        lines.append("```")
+        lines.append(fence)
         lines.append("</details>")
         lines.append("")
 

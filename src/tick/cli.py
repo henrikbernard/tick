@@ -308,7 +308,7 @@ def discover(
     snowflake_schema: str = typer.Option("BRONZE", "--snowflake-schema", help="Target Snowflake bronze schema."),
     snowflake_warehouse: str = typer.Option("TRANSFORMING_WH", "--snowflake-warehouse", help="Target Snowflake warehouse for Dynamic Tables."),
     profile: ProfileMode = typer.Option("full", "--profile", "-p", help="Profiling depth: none | fast | full."),
-    sample_size: int = typer.Option(5000, "--sample-size", help="Max rows sampled per table for profiling."),
+    sample_size: int = typer.Option(5000, "--sample-size", min=1, help="Max rows sampled per table for profiling."),
     workers: int = typer.Option(
         1, "--workers", "-w", min=1, max=32, help="Parallel profiling worker threads (bounded for large ERP databases)."
     ),
@@ -320,8 +320,8 @@ def discover(
     no_pii: bool = typer.Option(False, "--no-pii", help="Disable PII heuristic scanning."),
     redact_pii: bool = typer.Option(False, "--redact-pii", help="Mask sample/top values on PII-flagged columns."),
     no_infer_rels: bool = typer.Option(False, "--no-infer-relationships", help="Disable automatic FK/join inference."),
-    stale_days: int = typer.Option(30, "--stale-days", help="Flag timestamp columns older than N days as stale."),
-    max_tables: Optional[int] = typer.Option(None, "--max-tables", help="Cap total number of tables/views inspected."),
+    stale_days: int = typer.Option(30, "--stale-days", min=0, help="Flag timestamp columns older than N days as stale."),
+    max_tables: Optional[int] = typer.Option(None, "--max-tables", min=0, help="Cap total number of tables/views inspected."),
     exact_counts: bool = typer.Option(False, "--exact-counts", help="Force exact COUNT(*) on all tables."),
     # Production safety guardrails
     read_uncommitted: bool = typer.Option(
@@ -341,7 +341,7 @@ def discover(
     ),
     # Manufacturing & Databricks extensions
     glossary: Optional[Path] = typer.Option(
-        None, "--glossary", exists=True, help="Custom ERP/MES table & column glossary YAML/JSON file."
+        None, "--glossary", exists=True, dir_okay=False, help="Custom ERP/MES table & column glossary YAML/JSON file."
     ),
     no_manufacturing: bool = typer.Option(False, "--no-manufacturing", help="Disable manufacturing/OT/BOM/governance detectors."),
     no_databricks_compat: bool = typer.Option(False, "--no-databricks-compat", help="Disable Spark/Delta compatibility linting."),
@@ -447,8 +447,8 @@ def discover(
 
 @app.command()
 def diff(
-    before: Path = typer.Argument(..., exists=True, help="Baseline snapshot JSON file."),
-    after: Path = typer.Argument(..., exists=True, help="New snapshot JSON file."),
+    before: Path = typer.Argument(..., exists=True, dir_okay=False, help="Baseline snapshot JSON file."),
+    after: Path = typer.Argument(..., exists=True, dir_okay=False, help="New snapshot JSON file."),
     html_out: Optional[Path] = typer.Option(None, "--html", help="Write interactive HTML drift report."),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write diff JSON."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write diff Markdown report."),
@@ -457,9 +457,13 @@ def diff(
     ),
 ) -> None:
     """Compare two tick discovery snapshots for schema drift, new PII, and metric regressions."""
-    before_res = load_snapshot(before)
-    after_res = load_snapshot(after)
-    result = diff_snapshots(before_res, after_res)
+    try:
+        before_res = load_snapshot(before)
+        after_res = load_snapshot(after)
+        result = diff_snapshots(before_res, after_res)
+    except Exception as exc:
+        console.print(f"[bold red]Snapshot diff failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
     _render_diff_summary(result)
 
     if html_out:
@@ -478,7 +482,7 @@ def diff(
 
 @app.command(name="compare-sources")
 def compare_sources(
-    snapshots: list[Path] = typer.Argument(..., exists=True, help="2 or more plant/site discovery snapshot JSON files."),
+    snapshots: list[Path] = typer.Argument(..., exists=True, dir_okay=False, help="2 or more plant/site discovery snapshot JSON files."),
     html_out: Optional[Path] = typer.Option(None, "--html", help="Write interactive multi-plant HTML harmonization dashboard."),
     md_out: Optional[Path] = typer.Option(None, "--md", help="Write harmonization matrix Markdown report."),
     json_out: Optional[Path] = typer.Option(None, "--json", help="Write harmonization report JSON."),
@@ -497,6 +501,7 @@ def compare_sources(
         None,
         "--glossary",
         exists=True,
+        dir_okay=False,
         help="Custom YAML/JSON glossary file for cross-plant semantic table/column matching (implies --use-glossary).",
     ),
 ) -> None:
@@ -506,28 +511,32 @@ def compare_sources(
         raise typer.Exit(code=2)
 
     loaded: dict[str, DiscoveryResult] = {}
-    for p in snapshots:
-        snap = load_snapshot(p)
-        if p.stem.lower() == "snapshot":
-            parent_name = p.resolve().parent.name
-            base_label = parent_name or snap.overview.database_name or p.stem
-        else:
-            base_label = p.stem
-        label = base_label
-        suffix = 2
-        while label in loaded:
-            label = f"{base_label}_{suffix}"
-            suffix += 1
-        loaded[label] = snap
+    try:
+        for p in snapshots:
+            snap = load_snapshot(p)
+            if p.stem.lower() == "snapshot":
+                parent_name = p.resolve().parent.name
+                base_label = parent_name or snap.overview.database_name or p.stem
+            else:
+                base_label = p.stem
+            label = base_label
+            suffix = 2
+            while label in loaded:
+                label = f"{base_label}_{suffix}"
+                suffix += 1
+            loaded[label] = snap
 
-    report = harmonize_snapshots(
-        loaded,
-        catalog=catalog,
-        bronze_schema=bronze_schema,
-        target_platform=target_platform,
-        match_by_glossary=use_glossary,
-        glossary_path=glossary,
-    )
+        report = harmonize_snapshots(
+            loaded,
+            catalog=catalog,
+            bronze_schema=bronze_schema,
+            target_platform=target_platform,
+            match_by_glossary=use_glossary,
+            glossary_path=glossary,
+        )
+    except Exception as exc:
+        console.print(f"[bold red]Schema harmonization failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
     _render_harmonization_summary(report)
 
     written = export_harmonization(

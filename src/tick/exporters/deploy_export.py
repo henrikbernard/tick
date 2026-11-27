@@ -202,10 +202,13 @@ def render_lakeview_dashboard_json(
     y_cursor = 0
 
     # 1. Catalog inventory dataset (always present; includes gold_schema when Gold hierarchies exist)
-    cat_lit = cat.replace("'", "''")
-    bsch_lit = bsch.replace("'", "''")
-    ssch_lit = silver_schema.replace("'", "''")
-    gsch_lit = gold_schema.replace("'", "''")
+    # Unity Catalog information_schema.tables stores table_schema in lowercase; Spark SQL escapes via backslash
+    def _spark_sq(val: str) -> str:
+        return val.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r")
+
+    bsch_lit = _spark_sq(bsch.lower())
+    ssch_lit = _spark_sq(silver_schema.lower())
+    gsch_lit = _spark_sq(gold_schema.lower())
     hier_tables = get_hierarchy_tables(result)
     inv_schemas = [bsch_lit, ssch_lit] + ([gsch_lit] if hier_tables else [])
     inv_in_clause = ", ".join(f"'{s}'" for s in inv_schemas)
@@ -216,7 +219,7 @@ def render_lakeview_dashboard_json(
             "query": (
                 f"SELECT table_schema, table_name, table_type, created, last_altered, comment\n"
                 f"FROM {_bt(cat)}.information_schema.tables\n"
-                f"WHERE table_schema IN ({inv_in_clause})\n"
+                f"WHERE LOWER(table_schema) IN ({inv_in_clause})\n"
                 f"ORDER BY table_schema, table_name"
             ),
         }
@@ -228,7 +231,7 @@ def render_lakeview_dashboard_json(
             "query": (
                 f"SELECT COUNT(*) AS total_tables\n"
                 f"FROM {_bt(cat)}.information_schema.tables\n"
-                f"WHERE table_schema IN ({inv_in_clause})"
+                f"WHERE LOWER(table_schema) IN ({inv_in_clause})"
             ),
         }
     )
@@ -241,7 +244,7 @@ def render_lakeview_dashboard_json(
                 "spec": {
                     "version": 2,
                     "widgetType": "counter",
-                    "encodings": {"value": {"fieldName": "total_tables", "displayName": f"Tables in {cat_lit}"}},
+                    "encodings": {"value": {"fieldName": "total_tables", "displayName": f"Tables in {cat}"}},
                     "frame": {"showTitle": True, "title": "Managed Lakehouse Tables"},
                 },
             },
@@ -466,6 +469,8 @@ def render_snowflake_project_yml(
     if has_hier:
         sql_scripts.append("snowflake_gold_hierarchies.sql")
 
+    # Deploy Streamlit into gold_schema when Gold hierarchies create it; otherwise silver_schema (always created)
+    sis_schema = gold_schema if has_hier else silver_schema
     manifest: dict[str, Any] = {
         "definition_version": "2",
         "env": {
@@ -480,13 +485,13 @@ def render_snowflake_project_yml(
                 "type": "streamlit",
                 "identifier": {
                     "name": f"TICK_{sanitize_snowflake_identifier(result.overview.database_name)}_APP",
-                    "schema": gold_schema,
+                    "schema": sis_schema,
                     "database": db,
                 },
                 "title": f"tick {result.overview.database_name} Operational Monitor",
                 "query_warehouse": wh,
                 "main_file": "streamlit_app.py",
-                "stage": f"{db}.{gold_schema}.TICK_STREAMLIT_STAGE",
+                "stage": f"{db}.{sis_schema}.TICK_STREAMLIT_STAGE",
                 "artifacts": ["streamlit_app.py"],
             }
         },
@@ -553,10 +558,10 @@ def render_snowflake_streamlit_app(
         f"SILVER_SCHEMA = {silver_schema!r}",
         f"GOLD_SCHEMA = {gold_schema!r}",
         "_DB_DQ = DATABASE.replace('\"', '\"\"')",
-        "_DB_SQ = DATABASE.replace(\"'\", \"''\")",
-        "_BS_SQ = BRONZE_SCHEMA.replace(\"'\", \"''\")",
-        "_SS_SQ = SILVER_SCHEMA.replace(\"'\", \"''\")",
-        "_GS_SQ = GOLD_SCHEMA.replace(\"'\", \"''\")",
+        "_DB_SQ = DATABASE.replace('\\\\', '\\\\\\\\').replace(\"'\", \"''\")",
+        "_BS_SQ = BRONZE_SCHEMA.replace('\\\\', '\\\\\\\\').replace(\"'\", \"''\")",
+        "_SS_SQ = SILVER_SCHEMA.replace('\\\\', '\\\\\\\\').replace(\"'\", \"''\")",
+        "_GS_SQ = GOLD_SCHEMA.replace('\\\\', '\\\\\\\\').replace(\"'\", \"''\")",
         "",
         f"st.title({f'Snowflake Pipeline & Data Quality Monitor — {result.overview.database_name}'!r})",
         "st.caption(f'Target: `{DATABASE}` · Bronze: `{BRONZE_SCHEMA}` · Silver: `{SILVER_SCHEMA}` · Gold: `{GOLD_SCHEMA}`')",

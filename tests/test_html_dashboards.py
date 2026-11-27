@@ -148,10 +148,11 @@ def test_harmonization_html_escapes_script_injection(tmp_path):
     out = export_harmonization_html(report, tmp_path / "xss_harm.html")
     html_text = out.read_text(encoding="utf-8")
     assert "<title>tick Harmonize — &lt;/script&gt;plant_a vs plant_b</title>" in html_text
-    # Ensure embedded JSON script tag cannot break out via raw </script>
+    # Ensure embedded JSON script tag cannot break out via raw </script> or <!--<script>
     json_block = html_text.split('id="tick-harmonize-data" type="application/json">')[1].split("</script>")[0]
     assert "</script>" not in json_block
-    assert "<\\/script>" in json_block
+    assert "\\u003c/script\\u003e" in json_block
+    assert json.loads(json_block)["report"]["sources"][0] == "</script>plant_a"
 
 
 def test_diff_html_dashboard_and_cli_e2e(tmp_path):

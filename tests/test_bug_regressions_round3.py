@@ -124,6 +124,7 @@ def test_round3_bug3_introspect_object_and_view_def_rollback_on_inspector_errors
     conn.in_transaction.return_value = True
     conn.dialect.identifier_preparer.quote.side_effect = lambda s: f'"{s}"'
     conn.execute.side_effect = RuntimeError("count error")
+    conn.exec_driver_sql.side_effect = RuntimeError("count error")
 
     inspector = MagicMock()
     inspector.get_columns.side_effect = RuntimeError("cols error")
