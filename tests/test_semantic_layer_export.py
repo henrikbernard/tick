@@ -21,24 +21,30 @@ from tick.exporters import (
     render_databricks_genie_context_md,
     render_databricks_metric_views_sql,
     render_html_report,
+    render_lakeview_dashboard_json,
+    render_snowflake_project_yml,
 )
 from tick.models import (
     ColumnInfo,
     ColumnProfile,
     DatabaseOverview,
     DiscoveryResult,
+    ForeignKeyInfo,
     GovernanceFinding,
+    HierarchyInfo,
+    LegacyDateEncoding,
     PiiFinding,
     RelationshipInfo,
     TableInfo,
     TableRecommendations,
+    TelemetryProfile,
     ValueFrequency,
 )
 
 runner = CliRunner()
 
 _MV_BLOCK_RE = re.compile(
-    r"CREATE OR REPLACE VIEW\s+(?P<fqn>[^\n]+)\nWITH METRICS\nLANGUAGE YAML\nAS \$\$\n(?P<yaml>.*?)\n\$\$;",
+    r"CREATE OR REPLACE VIEW\s+(?P<fqn>[^\n]+)\nWITH METRICS\nLANGUAGE YAML\nAS \$(?P<tag>[A-Za-z0-9_]*)\$\n(?P<yaml>.*?)\n\$(?P=tag)\$;",
     re.S,
 )
 
@@ -506,3 +512,335 @@ def test_semantic_edge_cases_empty_db_dollar_injection_pii_pk_and_multi_schema(t
     # export_semantic_bundle writes cleanly
     written = export_semantic_bundle(tricky_res, tmp_path / "tricky_sem")
     assert len(written) == 3
+
+
+def test_round9_composite_fk_unpaired_hhmmss_measure_guards_and_dollar_tags():
+    """Regression suite covering Round-9 pre-push code review findings."""
+    # 1. Composite PK/FK (MANDT, MATNR) + non-unique inferred target + colliding joined dim name
+    t_mara = TableInfo(
+        schema_name="sap",
+        name="MARA",
+        full_name="sap.MARA",
+        semantic_name="material_master",
+        row_count=100,
+        primary_key=["MANDT", "MATNR"],
+        recommendations=TableRecommendations(entity_role="dimension"),
+        columns=[
+            ColumnInfo(name="MANDT", raw_type="VARCHAR(3)", canonical_type="string", is_primary_key=True),
+            ColumnInfo(name="MATNR", raw_type="VARCHAR(18)", canonical_type="string", is_primary_key=True),
+            ColumnInfo(name="MTART", raw_type="VARCHAR(4)", canonical_type="string"),
+            ColumnInfo(name="external_sku", raw_type="VARCHAR(32)", canonical_type="string", is_unique=True),
+        ],
+    )
+    t_total = TableInfo(
+        schema_name="sap",
+        name="total",
+        full_name="sap.total",
+        row_count=10,
+        primary_key=["id"],
+        recommendations=TableRecommendations(entity_role="dimension"),
+        columns=[
+            ColumnInfo(name="id", raw_type="INT", canonical_type="integer", is_primary_key=True),
+            # Joined dim becomes `total_amount` which collides with `SUM(amount)` -> forces `total_amount_2`!
+            ColumnInfo(name="amount", raw_type="VARCHAR(32)", canonical_type="string"),
+        ],
+    )
+    t_fact = TableInfo(
+        schema_name="sap",
+        name="orders",
+        full_name="sap.orders",
+        row_count=500,
+        primary_key=["order_id"],
+        recommendations=TableRecommendations(entity_role="fact"),
+        foreign_keys=[
+            ForeignKeyInfo(
+                constrained_columns=["MANDT", "MATNR"],
+                referred_schema="sap",
+                referred_table="MARA",
+                referred_columns=["MANDT", "MATNR"],
+            ),
+            ForeignKeyInfo(
+                constrained_columns=["total_id"],
+                referred_schema="sap",
+                referred_table="total",
+                referred_columns=["id"],
+            ),
+        ],
+        columns=[
+            ColumnInfo(name="order_id", raw_type="INT", canonical_type="integer", is_primary_key=True),
+            ColumnInfo(name="MANDT", raw_type="VARCHAR(3)", canonical_type="string", is_foreign_key=True),
+            ColumnInfo(name="MATNR", raw_type="VARCHAR(18)", canonical_type="string", is_foreign_key=True),
+            ColumnInfo(name="total_id", raw_type="INT", canonical_type="integer", is_foreign_key=True),
+            # Unpaired HHMMSS column (must stay VARCHAR/STRING dimension, NEVER DATE/DATE_TRUNC!)
+            ColumnInfo(
+                name="shift_tm",
+                raw_type="INT",
+                canonical_type="integer",
+                profile=ColumnProfile(
+                    legacy_date=LegacyDateEncoding(
+                        encoding="hhmmss",
+                        confidence="high",
+                        sample_match_rate=1.0,
+                        paired_column=None,
+                        spark_expression="F.lpad(F.col('shift_tm').cast('string'), 6, '0')",
+                    )
+                ),
+            ),
+            # Non-measure numeric identifiers/codes containing measure-like tokens (must NOT be summed!)
+            ColumnInfo(name="tax_id", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="cost_center_code", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="sales_rep_id", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="defect_code", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="bar_code", raw_type="BIGINT", canonical_type="integer"),
+            ColumnInfo(name="current_year", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="is_current", raw_type="INT", canonical_type="integer"),
+            ColumnInfo(name="price_tier", raw_type="INT", canonical_type="integer"),
+            # Integer plant isolation key (must be dimension, NEVER SUM(plant_num)!)
+            ColumnInfo(
+                name="plant_num",
+                raw_type="INT",
+                canonical_type="integer",
+                profile=ColumnProfile(
+                    governance_findings=[
+                        GovernanceFinding(
+                            category="plant_isolation_key",
+                            confidence="high",
+                            uc_policy="row_filter",
+                            uc_tag_key="governance_scope",
+                            uc_tag_value="plant_isolation",
+                        )
+                    ]
+                ),
+            ),
+            # Numeric PII inferred join key (must be dimension with sensitive warning, NEVER fact/measure!)
+            ColumnInfo(
+                name="employee_ssn",
+                raw_type="BIGINT",
+                canonical_type="integer",
+                profile=ColumnProfile(
+                    pii_findings=[PiiFinding(category="ssn", confidence="high", score=0.95)]
+                ),
+            ),
+            # True quantitative measures (amount + percentage rates containing currency words!)
+            ColumnInfo(name="amount", raw_type="DECIMAL(12,2)", canonical_type="decimal"),
+            ColumnInfo(name="tax_rate", raw_type="DECIMAL(5,4)", canonical_type="decimal"),
+            ColumnInfo(name="profit_margin_pct", raw_type="DECIMAL(5,2)", canonical_type="decimal"),
+            ColumnInfo(name="unit_cost", raw_type="DECIMAL(10,2)", canonical_type="decimal"),
+            # Snowflake keyword match_recognize
+            ColumnInfo(name="match_recognize", raw_type="VARCHAR(20)", canonical_type="string"),
+            # Order reserved keyword to test Markdown double-backtick fence in genie join table
+            ColumnInfo(name="order", raw_type="VARCHAR(20)", canonical_type="string"),
+        ],
+    )
+    # Table with composite PK containing a binary column (must NOT collapse to single-col PK!)
+    t_comp_bin = TableInfo(
+        schema_name="sap",
+        name="device_blobs",
+        full_name="sap.device_blobs",
+        row_count=20,
+        primary_key=["device_id", "raw_blob"],
+        columns=[
+            ColumnInfo(name="device_id", raw_type="INT", canonical_type="integer", is_primary_key=True),
+            ColumnInfo(name="raw_blob", raw_type="BLOB", canonical_type="binary", is_primary_key=True),
+            ColumnInfo(name="label", raw_type="VARCHAR(32)", canonical_type="string"),
+        ],
+    )
+    # OT telemetry where DATE column precedes TIMESTAMP column
+    t_ot = TableInfo(
+        schema_name="sap",
+        name="press_sensors",
+        full_name="sap.press_sensors",
+        row_count=200,
+        telemetry_profile=TelemetryProfile(
+            pattern="wide_plc_polling",
+            timestamp_column="reading_ts",
+            value_columns=["temp_c"],
+        ),
+        columns=[
+            ColumnInfo(name="shift_date", raw_type="DATE", canonical_type="date"),
+            ColumnInfo(name="reading_ts", raw_type="TIMESTAMP", canonical_type="timestamp"),
+            ColumnInfo(name="temp_c", raw_type="DOUBLE", canonical_type="float"),
+        ],
+    )
+    # Non-BOM integer-ID hierarchy without quantity column
+    t_org = TableInfo(
+        schema_name="sap",
+        name="asset_tree",
+        full_name="sap.asset_tree",
+        row_count=30,
+        hierarchy=HierarchyInfo(
+            pattern="asset_or_org_tree",
+            parent_column="parent_asset_id",
+            child_column="asset_id",
+            reason="Asset tree",
+        ),
+        columns=[
+            ColumnInfo(name="parent_asset_id", raw_type="INTEGER", canonical_type="integer"),
+            ColumnInfo(name="asset_id", raw_type="INTEGER", canonical_type="integer", is_primary_key=True),
+            ColumnInfo(name="asset_name", raw_type="VARCHAR(64)", canonical_type="string"),
+        ],
+    )
+    # Reference table for numeric PII inferred join key + case-mismatched column test
+    t_emp = TableInfo(
+        schema_name="sap",
+        name="employees",
+        full_name="sap.employees",
+        row_count=50,
+        primary_key=["employee_ssn"],
+        columns=[
+            ColumnInfo(
+                name="employee_ssn",
+                raw_type="BIGINT",
+                canonical_type="integer",
+                is_primary_key=True,
+                profile=ColumnProfile(
+                    pii_findings=[PiiFinding(category="ssn", confidence="high", score=0.95)]
+                ),
+            ),
+            ColumnInfo(name="dept", raw_type="VARCHAR(32)", canonical_type="string"),
+        ],
+    )
+
+    res = DiscoveryResult(
+        config=DiscoveryConfig(
+            target_platform="both",
+            databricks_catalog="cat$$$prod",
+            snowflake_database="MyDb",
+            snowflake_schema="bronze",
+        ),
+        overview=DatabaseOverview(
+            dialect="postgresql",
+            driver="psycopg",
+            database_name="review_edge$$$",
+            sanitized_url="postgresql://review_edge",
+            discovered_at="2026-01-01T00:00:00Z",
+            duration_seconds=0.1,
+            schema_count=1,
+            table_count=6,
+            column_count=30,
+        ),
+        tables=[t_mara, t_total, t_fact, t_comp_bin, t_ot, t_org, t_emp],
+        relationships=[
+            # Flattened half-composite FK (must NOT produce single-col fan-out join!)
+            RelationshipInfo(
+                source_table="sap.orders",
+                source_column="MANDT",
+                target_table="sap.MARA",
+                target_column="MANDT",
+                kind="explicit_fk",
+                confidence=1.0,
+            ),
+            # Case-mismatched inferred relationship onto PII numeric PK
+            RelationshipInfo(
+                source_table="sap.orders",
+                source_column="EMPLOYEE_SSN",
+                target_table="sap.employees",
+                target_column="EMPLOYEE_SSN",
+                kind="inferred_name_and_values",
+                confidence=0.95,
+            ),
+            # Non-unique target relationship onto t_mara.MTART (must be rejected by Metric View joins!)
+            RelationshipInfo(
+                source_table="sap.orders",
+                source_column="order",
+                target_table="sap.MARA",
+                target_column="MTART",
+                kind="inferred_name_and_values",
+                confidence=0.9,
+            ),
+        ],
+    )
+
+    # A. Snowflake Cortex Analyst checks
+    cortex_text = render_cortex_analyst_yaml(res)
+    assert 'CREATE STAGE IF NOT EXISTS "MyDb"."SILVER"."SEMANTIC_STAGE";' in cortex_text
+    assert '@"MyDb"."SILVER"."SEMANTIC_STAGE"' in cortex_text
+    cortex_doc = yaml.safe_load(cortex_text)
+    _validate_cortex_yaml_invariants(cortex_doc)
+
+    by_name = {t["name"]: t for t in cortex_doc["tables"]}
+    orders_c = by_name["orders"]
+    order_fact_names = {f["name"] for f in orders_c.get("facts", [])}
+    order_dim_names = {d["name"] for d in orders_c.get("dimensions", [])}
+    order_tdim_names = {d["name"] for d in orders_c.get("time_dimensions", [])}
+
+    # Unpaired HHMMSS is VARCHAR dimension, NOT time_dimension
+    assert "shift_tm" in order_dim_names
+    assert "shift_tm" not in order_tdim_names
+    shift_dim = next(d for d in orders_c["dimensions"] if d["name"] == "shift_tm")
+    assert shift_dim["data_type"] == "VARCHAR"
+
+    # None of the ID/code/flag/year/plant/PII columns are in facts!
+    for bad_measure in (
+        "tax_id", "cost_center_code", "sales_rep_id", "defect_code",
+        "bar_code", "current_year", "is_current", "price_tier", "plant_num", "employee_ssn",
+    ):
+        assert bad_measure not in order_fact_names, f"{bad_measure} wrongly classified as fact"
+        assert bad_measure in order_dim_names
+    assert "match_recognize_col" in order_dim_names
+
+    # Composite PK with omitted binary column does NOT collapse to single-column PK
+    assert "primary_key" not in by_name["device_blobs"]
+    # Non-PK unique column emits unique_keys on material_master
+    assert by_name["material_master"].get("unique_keys") == [{"columns": ["external_sku"]}]
+    # OT VQR uses reading_ts (TIMESTAMP) with DATE_TRUNC('HOUR', ...), NOT shift_date!
+    ot_vqr = next(v for v in cortex_doc["verified_queries"] if "telemetry" in v["name"])
+    assert "DATE_TRUNC('HOUR', reading_ts)" in ot_vqr["sql"]
+    # Non-BOM integer hierarchy uses INTEGER (not VARCHAR) for root_node_id
+    org_gold = by_name["asset_tree_exploded"]
+    root_dim = next(d for d in org_gold["dimensions"] if d["name"] == "root_node_id")
+    assert root_dim["data_type"] == "INTEGER"
+    # VQR names are strictly unique
+    vqr_names = [v["name"] for v in cortex_doc["verified_queries"]]
+    assert len(vqr_names) == len(set(vqr_names))
+
+    # B. Databricks Metric Views checks
+    mv_sql = render_databricks_metric_views_sql(res)
+    assert "Runtime 17.3+" in mv_sql
+    # Catalog with $$$ uses tagged dollar quote $mv_yaml$ WITHOUT corrupting catalog name!
+    assert "AS $mv_yaml$" in mv_sql
+    assert "`cat$$$prod`.silver.silver_orders" in mv_sql
+    views = _validate_metric_views_invariants(mv_sql)
+    by_short = {fqn.split(".")[-1]: spec for fqn, spec in views}
+
+    orders_mv = by_short["mv_orders"]
+    # Explicit composite FK emitted as compound AND join (no fan-out!)
+    mara_join = next(j for j in orders_mv["joins"] if j["name"] == "material_master")
+    assert "source.mandt = material_master.mandt AND source.matnr = material_master.matnr" == mara_join["on"]
+    # Non-unique target MTART was NOT emitted as a second fan-out join
+    assert sum(1 for j in orders_mv["joins"] if "silver_material_master" in j["source"]) == 1
+    # Unpaired shift_tm did NOT generate a bogus DATE_TRUNC('MONTH', source.shift_tm_parsed)
+    assert not any("DATE_TRUNC" in d["expr"] for d in orders_mv["dimensions"])
+    # Percentage format checked BEFORE currency for tax_rate & profit_margin_pct!
+    meas_by_name = {m["name"]: m for m in orders_mv["measures"]}
+    assert meas_by_name["avg_tax_rate"]["format"]["type"] == "percentage"
+    assert meas_by_name["avg_profit_margin_pct"]["format"]["type"] == "percentage"
+    assert meas_by_name["avg_unit_cost"]["format"]["type"] == "currency"
+    # Joined dim `total_amount` forced measure rename to `total_amount_2`!
+    assert "total_amount_2" in meas_by_name
+
+    # OT Metric View uses reading_ts for DATE_TRUNC('HOUR', ...), NOT shift_date!
+    ot_mv = by_short["mv_press_sensors"]
+    assert any("DATE_TRUNC('HOUR', source.reading_ts)" == d["expr"] for d in ot_mv["dimensions"])
+    # Non-BOM hierarchy Metric View uses _hierarchy & max_hierarchy_depth (not _bom)
+    assert "mv_asset_tree_hierarchy" in by_short
+    assert any(m["name"] == "max_hierarchy_depth" for m in by_short["mv_asset_tree_hierarchy"]["measures"])
+
+    # C. Genie Context checks (zero KeyError on case-mismatched rel, exact Q1 parity, no extended_qty, silver_ prefix!)
+    genie_md = render_databricks_genie_context_md(res)
+    assert "MEASURE(total_amount_2)" in genie_md  # Exact parity with metric_views.sql!
+    assert "extended_qty" not in genie_md  # Non-BOM tree without qty column!
+    assert "silver_orders.plant_num" in genie_md
+    # Reserved column `order` in join ON uses double-backtick Markdown inline code fence!
+    assert "`` silver_orders.`order` = silver_material_master.mtart ``" in genie_md
+
+    # D. Deployment & Lakeview checks
+    sf_yml_text = render_snowflake_project_yml(res)
+    assert 'CREATE STAGE IF NOT EXISTS "MyDb"."SILVER"."SEMANTIC_STAGE";' in sf_yml_text
+    assert '@"MyDb"."SILVER"."SEMANTIC_STAGE"' in sf_yml_text
+    # Lakeview always includes gold schema even on databases without hierarchies
+    no_hier_res = res.model_copy(deep=True)
+    no_hier_res.tables = [t_mara, t_fact]
+    lv = render_lakeview_dashboard_json(no_hier_res, catalog="mfg", bronze_schema="bronze", gold_schema="gold")
+    assert "'gold'" in lv
+

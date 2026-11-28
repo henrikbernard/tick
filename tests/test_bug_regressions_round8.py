@@ -590,7 +590,7 @@ def test_exporters_snowflake_databricks_dbt_odcs_harmonize_diff_html_and_cli(tmp
 
     # 3. Lakeview dashboard LOWER(table_schema) + unescaped displayName; Streamlit backslash escape
     lv = json.loads(render_lakeview_dashboard_json(_snap([t_plain]), catalog="mfg'cat", bronze_schema="BRONZE"))
-    assert "LOWER(table_schema) IN ('bronze', 'silver')" in lv["datasets"][0]["query"]
+    assert "LOWER(table_schema) IN ('bronze', 'silver', 'gold')" in lv["datasets"][0]["query"]
     assert lv["pages"][0]["layout"][0]["widget"]["spec"]["encodings"]["value"]["displayName"] == "Tables in mfg'cat"
     sis_py = render_snowflake_streamlit_app(plain_sf_res)
     ast.parse(sis_py)

@@ -23,7 +23,6 @@ from tick.snowflake import (
     deduplicate_snowflake_columns,
     deduplicate_snowflake_tables,
     map_to_snowflake_type,
-    sanitize_snowflake_identifier,
 )
 
 # Numeric columns that are identifiers/codes/buckets rather than quantitative measures
@@ -36,7 +35,7 @@ _NON_MEASURE_NUM_RE = re.compile(
     re.I,
 )
 
-# Strong semantic measure hints (override weak suffix heuristics if needed)
+# Strong semantic measure hints
 _MEASURE_HINT_RE = re.compile(
     r"(?:^|_)(?:qty|quantity|amount|amt|total|price|cost|rev|revenue|sales|profit|margin|discount|"
     r"tax|fee|spend|budget|balance|net|gross|subtotal|weight|mass|volume|vol|temp|temperature|"
@@ -55,15 +54,16 @@ _AVG_MEASURE_RE = re.compile(
     re.I,
 )
 
+# Percentage/rate measures (checked BEFORE currency so tax_rate / profit_margin_pct format as %)
+_PERCENT_MEASURE_RE = re.compile(
+    r"(?:^|_)(?:pct|percent|percentage|rate|ratio|oee|yield)(?:$|_)",
+    re.I,
+)
+
 # Currency-like measures (used for Databricks Metric View format hints)
 _CURRENCY_MEASURE_RE = re.compile(
     r"(?:^|_)(?:price|cost|rev|revenue|sales|profit|amount|amt|total_amount|net_value|netwr|"
     r"stprs|verpr|spend|budget|tax|fee|discount|balance|subtotal|gross|margin)(?:$|_)",
-    re.I,
-)
-
-_PERCENT_MEASURE_RE = re.compile(
-    r"(?:^|_)(?:pct|percent|percentage|rate|ratio|oee|yield)(?:$|_)",
     re.I,
 )
 
@@ -88,7 +88,6 @@ _SPARK_RESERVED_WORDS = {
     "window", "with", "year",
 }
 
-
 # Hard SQL parser-breaking reserved keywords to avoid as bare logical semantic identifiers
 _HARD_SQL_RESERVED = {
     "all", "alter", "and", "any", "as", "between", "by", "case", "cast", "check", "column",
@@ -96,11 +95,12 @@ _HARD_SQL_RESERVED = {
     "current_timestamp", "current_user", "default", "delete", "distinct", "drop", "else", "end",
     "except", "exists", "false", "fetch", "following", "for", "foreign", "from", "full", "grant",
     "group", "having", "ilike", "in", "inner", "insert", "intersect", "into", "is", "join",
-    "lateral", "left", "like", "limit", "localtime", "localtimestamp", "merge", "natural", "not",
-    "null", "offset", "on", "or", "order", "outer", "over", "partition", "preceding", "primary",
-    "qualify", "range", "regexp", "revoke", "right", "rlike", "row", "rows", "sample", "select",
-    "set", "some", "start", "table", "tablesample", "then", "to", "true", "try_cast", "union",
-    "unique", "update", "user", "using", "values", "view", "when", "where", "window", "with",
+    "lateral", "left", "like", "limit", "localtime", "localtimestamp", "match_recognize", "merge",
+    "natural", "not", "null", "offset", "on", "or", "order", "outer", "over", "partition",
+    "preceding", "primary", "qualify", "range", "regexp", "revoke", "right", "rlike", "row",
+    "rows", "sample", "select", "set", "some", "start", "table", "tablesample", "then", "to",
+    "true", "try_cast", "union", "unique", "update", "user", "using", "values", "view", "when",
+    "where", "window", "with",
 }
 
 
@@ -112,7 +112,7 @@ def _slug(val: str) -> str:
 
 
 def _semantic_slug(val: str, suffix: str = "col") -> str:
-    """Clean lowercase identifier that also avoids hard SQL parser-breaking reserved words."""
+    """Clean lowercase identifier that avoids hard SQL parser-breaking reserved words."""
     s = _slug(val)
     if s in _HARD_SQL_RESERVED:
         return f"{s}_{suffix}"
@@ -125,9 +125,22 @@ def _human_label(name: str) -> str:
 
 
 def _clean_text(val: str) -> str:
-    """Normalize whitespace and strip any literal '$$' that could break dollar-quoted SQL."""
-    text = re.sub(r"\s+", " ", val.replace("$$", "$ $")).strip()
-    return text
+    """Normalize whitespace and separate any consecutive '$' runs that could confuse dollar-quoting."""
+    separated = re.sub(r"\${2,}", lambda m: " ".join(m.group(0)), val)
+    return re.sub(r"\s+", " ", separated).strip()
+
+
+def _pick_dollar_quote_tag(body: str) -> str:
+    """Return '$$' if safe, otherwise an unused tagged dollar-quote delimiter (e.g. '$mv_yaml$')."""
+    if "$$" not in body:
+        return "$$"
+    base = "mv_yaml"
+    tag = f"${base}$"
+    sfx = 2
+    while tag in body:
+        tag = f"${base}_{sfx}$"
+        sfx += 1
+    return tag
 
 
 def _dq(val: str) -> str:
@@ -154,6 +167,23 @@ def _escape_md(val: str | None) -> str:
     return val.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
+def _md_code(val: str | None) -> str:
+    """Wrap text in a Markdown inline code span using a backtick fence wider than any inner backticks."""
+    if not val:
+        return "—"
+    escaped = _escape_md(val)
+    max_run = max((len(m.group(0)) for m in re.finditer(r"`+", escaped)), default=0)
+    fence = "`" * (max_run + 1)
+    if max_run > 0 or escaped.startswith("`") or escaped.endswith("`"):
+        return f"{fence} {escaped} {fence}"
+    return f"{fence}{escaped}{fence}"
+
+
+def _md_fence(content: str) -> str:
+    max_ticks = max((len(m.group(0)) for m in re.finditer(r"`+", content)), default=0)
+    return "`" * max(3, max_ticks + 1)
+
+
 def _is_direct_pii(col: ColumnInfo) -> bool:
     return bool(col.profile and col.profile.pii_findings)
 
@@ -165,8 +195,24 @@ def _is_itar_or_ip(col: ColumnInfo) -> bool:
     )
 
 
+def _is_plant_key(col: ColumnInfo) -> bool:
+    return bool(
+        col.profile
+        and any(g.category == "plant_isolation_key" for g in col.profile.governance_findings)
+    )
+
+
 def _is_sensitive_for_samples(col: ColumnInfo) -> bool:
     return bool(col.profile and (col.profile.pii_findings or col.profile.governance_findings))
+
+
+def _effective_pk_columns(tbl: TableInfo) -> list[str]:
+    """Return explicit PK columns, or single heuristic PK candidate when no explicit PK exists."""
+    if tbl.primary_key:
+        return list(tbl.primary_key)
+    if tbl.recommendations and tbl.recommendations.primary_key_candidates:
+        return list(tbl.recommendations.primary_key_candidates[:1])
+    return []
 
 
 def _safe_sample_values(col: ColumnInfo, limit: int = 10) -> tuple[list[str], bool]:
@@ -202,11 +248,22 @@ def _safe_sample_values(col: ColumnInfo, limit: int = 10) -> tuple[list[str], bo
     return vals, is_enum
 
 
-def _is_numeric_measure_column(col: ColumnInfo, tbl: TableInfo) -> bool:
-    """Determine if a numeric column is a quantitative fact/measure rather than a key, code, or date."""
+def _is_numeric_measure_column(
+    col: ColumnInfo,
+    tbl: TableInfo,
+    join_keys: set[tuple[str, str]] | None = None,
+    pk_cols: set[str] | None = None,
+) -> bool:
+    """Determine if a numeric column is a quantitative fact/measure rather than a key, code, PII, or date."""
     if col.canonical_type not in {"decimal", "float", "integer"}:
         return False
     if col.is_primary_key or col.is_foreign_key:
+        return False
+    if pk_cols and col.name in pk_cols:
+        return False
+    if join_keys and (tbl.full_name, col.name.lower()) in join_keys:
+        return False
+    if _is_direct_pii(col) or _is_itar_or_ip(col) or _is_plant_key(col):
         return False
     if col.profile and col.profile.legacy_date is not None:
         return False
@@ -218,14 +275,13 @@ def _is_numeric_measure_column(col: ColumnInfo, tbl: TableInfo) -> bool:
         return False
 
     name_to_check = col.semantic_name or col.name
-    if _MEASURE_HINT_RE.search(name_to_check) or _MEASURE_HINT_RE.search(col.name):
-        return True
+    # Reject identifier/code/flag/year names BEFORE checking broad measure hints (e.g. tax_id, cost_center_code)
     if _NON_MEASURE_NUM_RE.search(name_to_check) or _NON_MEASURE_NUM_RE.search(col.name):
         return False
-    # Decimals & floats not matching non-measure ID/code patterns are almost always quantitative measures
+    if _MEASURE_HINT_RE.search(name_to_check) or _MEASURE_HINT_RE.search(col.name):
+        return True
     if col.canonical_type in {"decimal", "float"}:
         return True
-    # Integers: require non-key, non-unique, non-monotonic ID look
     if col.is_unique:
         return False
     if tbl.recommendations and any(
@@ -270,10 +326,10 @@ def _deduplicate_logical_table_names(tables: list[TableInfo]) -> dict[str, str]:
 def _compute_snowflake_silver_legacy_cols(
     tbl: TableInfo,
     sf_col_map: dict[str, str],
-) -> dict[str, tuple[str, str]]:
-    """Mirror snowflake_export.py legacy date column derivation: raw_col -> (sf_col_name, sf_type)."""
+) -> dict[str, tuple[str, str, bool]]:
+    """Mirror snowflake_export.py legacy derivation: raw_col -> (sf_col_name, sf_type, is_date_or_ts)."""
     emitted_cols: set[str] = set(sf_col_map.values())
-    derived: dict[str, tuple[str, str]] = {}
+    derived: dict[str, tuple[str, str, bool]] = {}
     for col in tbl.columns:
         if col.profile and col.profile.legacy_date:
             ld = col.profile.legacy_date
@@ -287,18 +343,22 @@ def _compute_snowflake_silver_legacy_cols(
                     sfx += 1
                 target_col = f"{target_col}_{sfx}"
             emitted_cols.add(target_col)
-            sf_type = "TIMESTAMP_NTZ" if ld.paired_column else "DATE"
-            derived[col.name] = (target_col, sf_type)
+            if ld.encoding == "hhmmss":
+                # Unpaired HHMMSS produces zero-padded 6-char VARCHAR in Silver, NOT DATE
+                derived[col.name] = (target_col, "VARCHAR", False)
+            else:
+                sf_type = "TIMESTAMP_NTZ" if ld.paired_column else "DATE"
+                derived[col.name] = (target_col, sf_type, True)
     return derived
 
 
 def _compute_databricks_silver_legacy_cols(
     tbl: TableInfo,
     dbx_col_map: dict[str, str],
-) -> dict[str, tuple[str, str]]:
-    """Mirror databricks_export.py legacy date column derivation: raw_col -> (dbx_col_name, spark_type)."""
+) -> dict[str, tuple[str, str, bool]]:
+    """Mirror databricks_export.py legacy derivation: raw_col -> (dbx_col_name, spark_type, is_date_or_ts)."""
     seen_stitched: set[str] = set(dbx_col_map.values())
-    derived: dict[str, tuple[str, str]] = {}
+    derived: dict[str, tuple[str, str, bool]] = {}
     for col in tbl.columns:
         if col.profile and col.profile.legacy_date:
             ld = col.profile.legacy_date
@@ -312,18 +372,21 @@ def _compute_databricks_silver_legacy_cols(
                 target_col = f"{base_target}_{sfx}"
                 sfx += 1
             seen_stitched.add(target_col)
-            spark_type = "TIMESTAMP" if ld.paired_column else "DATE"
-            derived[col.name] = (target_col, spark_type)
+            if ld.encoding == "hhmmss":
+                derived[col.name] = (target_col, "STRING", False)
+            else:
+                spark_type = "TIMESTAMP" if ld.paired_column else "DATE"
+                derived[col.name] = (target_col, spark_type, True)
     return derived
 
 
 def _collect_join_key_columns(result: DiscoveryResult, min_confidence: float = 0.75) -> set[tuple[str, str]]:
-    """Return {(table_full_name, raw_column_name)} participating in verified relationships."""
+    """Return {(table_full_name, lower_column_name)} participating in verified relationships."""
     keys: set[tuple[str, str]] = set()
     for rel in result.relationships:
         if rel.kind == "explicit_fk" or rel.confidence >= min_confidence:
-            keys.add((rel.source_table, rel.source_column))
-            keys.add((rel.target_table, rel.target_column))
+            keys.add((rel.source_table, rel.source_column.lower()))
+            keys.add((rel.target_table, rel.target_column.lower()))
     return keys
 
 
@@ -364,7 +427,6 @@ def _filtered_verified_relationships(
     """Return high-confidence, non-self relationships between active tables, deduplicated."""
     out: list[RelationshipInfo] = []
     seen: set[tuple[str, str, str, str]] = set()
-    # Explicit FKs first, then highest confidence
     ordered = sorted(
         result.relationships,
         key=lambda r: (0 if r.kind == "explicit_fk" else 1, -r.confidence, r.source_table, r.target_table),
@@ -382,6 +444,71 @@ def _filtered_verified_relationships(
         seen.add(key)
         out.append(rel)
     return out
+
+
+def _is_unique_single_key(tbl: TableInfo, col_name: str) -> bool:
+    """True if col_name uniquely identifies rows in tbl (single-col PK, is_unique, unique 1-col index, or PK candidate)."""
+    col_low = col_name.lower()
+    if len(tbl.primary_key) == 1 and tbl.primary_key[0].lower() == col_low:
+        return True
+    for c in tbl.columns:
+        if c.name.lower() == col_low and c.is_unique:
+            return True
+    for idx in tbl.indexes:
+        if idx.unique and len(idx.columns) == 1 and idx.columns[0].lower() == col_low:
+            return True
+    if (
+        not tbl.primary_key
+        and tbl.recommendations
+        and tbl.recommendations.primary_key_candidates
+        and tbl.recommendations.primary_key_candidates[0].lower() == col_low
+    ):
+        return True
+    return False
+
+
+def _is_unique_column_set(tbl: TableInfo, col_names: list[str]) -> bool:
+    """True if col_names matches the full primary key or a unique index on tbl."""
+    if not col_names:
+        return False
+    if len(col_names) == 1:
+        return _is_unique_single_key(tbl, col_names[0])
+    target_set = {c.lower() for c in col_names}
+    if tbl.primary_key and {p.lower() for p in tbl.primary_key} == target_set and len(tbl.primary_key) == len(col_names):
+        return True
+    for idx in tbl.indexes:
+        if idx.unique and {c.lower() for c in idx.columns} == target_set and len(idx.columns) == len(col_names):
+            return True
+    return False
+
+
+def _resolve_col_name_ci(col_map: dict[str, str], raw_col: str) -> str | None:
+    """Look up raw_col in col_map (exact first, then case-insensitive)."""
+    if raw_col in col_map:
+        return col_map[raw_col]
+    raw_low = raw_col.lower()
+    for k, v in col_map.items():
+        if k.lower() == raw_low:
+            return v
+    return None
+
+
+def _resolve_referred_table(
+    src_tbl: TableInfo,
+    referred_schema: str | None,
+    referred_table: str,
+    active_by_full: dict[str, TableInfo],
+) -> TableInfo | None:
+    cand_schema = referred_schema or src_tbl.schema_name
+    cand_full = f"{cand_schema}.{referred_table}"
+    if cand_full in active_by_full:
+        return active_by_full[cand_full]
+    low_full = cand_full.lower()
+    for full, tbl in active_by_full.items():
+        if full.lower() == low_full:
+            return tbl
+    matches = [t for t in active_by_full.values() if t.name.lower() == referred_table.lower()]
+    return matches[0] if len(matches) == 1 else None
 
 
 # =============================================================================
@@ -404,15 +531,11 @@ def render_cortex_analyst_yaml(
     logical_tbl_map = _deduplicate_logical_table_names(active_tables)
     join_keys = _collect_join_key_columns(result)
 
-    # Track emitted logical columns & unique keys per table for relationship & VQR grounding
-    # table_full_name -> raw_col -> logical_col_name
     raw_to_logical_col: dict[str, dict[str, str]] = {}
-    # table_full_name -> set of logical_col_names that are PK or unique (valid Cortex many_to_one target)
     unique_logical_cols: dict[str, set[str]] = {}
-    # Metadata for verified query synthesis
     table_meta: dict[str, dict[str, Any]] = {}
     excluded_pii_notes: list[str] = []
-    plant_tables: list[tuple[str, str]] = []  # (logical_table, logical_plant_col)
+    plant_tables: list[tuple[str, str]] = []
 
     semantic_tables: list[dict[str, Any]] = []
 
@@ -421,6 +544,8 @@ def render_cortex_analyst_yaml(
         safe_sf_tbl = sf_tbl_map[tbl.full_name]
         sf_col_map = deduplicate_snowflake_columns([c.name for c in tbl.columns])
         legacy_sf_map = _compute_snowflake_silver_legacy_cols(tbl, sf_col_map)
+        eff_pks = _effective_pk_columns(tbl)
+        eff_pk_set = set(eff_pks)
 
         dimensions: list[dict[str, Any]] = []
         time_dimensions: list[dict[str, Any]] = []
@@ -429,7 +554,10 @@ def render_cortex_analyst_yaml(
 
         seen_col_names: set[str] = set()
         col_raw_to_logical: dict[str, str] = {}
+        keyable_logical_cols: set[str] = set()  # dimensions + time_dimensions only (valid for PK/FK)
         unique_cols_here: set[str] = set()
+        non_pk_unique_cols: list[str] = []
+        fact_agg_by_lname: dict[str, str] = {}
 
         def _alloc_col_name(preferred: str) -> str:
             base = _semantic_slug(preferred, suffix="col")
@@ -441,7 +569,6 @@ def render_cortex_analyst_yaml(
             seen_col_names.add(cand)
             return cand
 
-        # Track paired HHMMSS columns already stitched into companion date _TS
         stitched_hhmmss = {
             c.profile.legacy_date.paired_column
             for c in tbl.columns
@@ -449,11 +576,14 @@ def render_cortex_analyst_yaml(
         }
 
         for col in tbl.columns:
-            # Skip binary blobs from AI semantic layer
             if col.canonical_type == "binary":
                 continue
 
-            is_join_or_pk = col.is_primary_key or (tbl.full_name, col.name) in join_keys
+            is_join_or_pk = (
+                col.is_primary_key
+                or col.name in eff_pk_set
+                or (tbl.full_name, col.name.lower()) in join_keys
+            )
 
             # Exclude direct PII & ITAR/IP columns unless needed as PK/join key
             if (_is_direct_pii(col) or _is_itar_or_ip(col)) and not is_join_or_pk:
@@ -463,7 +593,6 @@ def render_cortex_analyst_yaml(
                 excluded_pii_notes.append(f"{logical_tname}.{col.name} ({', '.join(cats)})")
                 continue
 
-            # Skip standalone HHMMSS column when already stitched into companion date's _TS column
             if (
                 col.profile
                 and col.profile.legacy_date
@@ -476,10 +605,11 @@ def render_cortex_analyst_yaml(
             sf_type = col.snowflake_type or map_to_snowflake_type(col.raw_type, col.canonical_type)
             preferred_logical = col.semantic_name or col.name
 
-            # 1. Native temporal columns OR legacy date columns (use Silver parsed _TS / _PARSED column!)
+            # 1a. Native temporal columns -> time_dimensions
             if col.canonical_type in {"date", "timestamp"}:
                 lname = _alloc_col_name(preferred_logical)
                 col_raw_to_logical[col.name] = lname
+                keyable_logical_cols.add(lname)
                 entry: dict[str, Any] = {
                     "name": lname,
                     "expr": _dq(sf_cname),
@@ -491,35 +621,60 @@ def render_cortex_analyst_yaml(
                 syns = _synonyms_for_name(lname, col.name, col.semantic_name)
                 if syns:
                     entry["synonyms"] = syns
-                if col.is_primary_key and len(tbl.primary_key) == 1:
+                if (col.is_primary_key and len(tbl.primary_key) == 1) or col.is_unique:
                     entry["unique"] = True
                     unique_cols_here.add(lname)
+                    if not (col.is_primary_key and len(tbl.primary_key) == 1):
+                        non_pk_unique_cols.append(lname)
                 time_dimensions.append(entry)
                 continue
 
+            # 1b. Legacy date/time columns: DATE/TIMESTAMP -> time_dimension; unpaired HHMMSS -> VARCHAR dimension
             if col.name in legacy_sf_map:
-                derived_sf_col, derived_sf_type = legacy_sf_map[col.name]
-                lname = _alloc_col_name(f"{preferred_logical}_ts" if derived_sf_type == "TIMESTAMP_NTZ" else preferred_logical)
-                col_raw_to_logical[col.name] = lname
-                entry = {
-                    "name": lname,
-                    "expr": _dq(derived_sf_col),
-                    "data_type": derived_sf_type,
-                    "description": _clean_text(
-                        (col.business_description or col.comment or _human_label(preferred_logical))
-                        + f" (parsed in Silver from legacy {col.profile.legacy_date.encoding} column {col.name})."  # type: ignore[union-attr]
-                    ),
-                }
-                syns = _synonyms_for_name(lname, col.name, col.semantic_name)
-                if syns:
-                    entry["synonyms"] = syns
-                time_dimensions.append(entry)
+                derived_sf_col, derived_sf_type, is_temporal = legacy_sf_map[col.name]
+                if is_temporal:
+                    lname = _alloc_col_name(
+                        f"{preferred_logical}_ts" if derived_sf_type == "TIMESTAMP_NTZ" else preferred_logical
+                    )
+                    col_raw_to_logical[col.name] = lname
+                    keyable_logical_cols.add(lname)
+                    entry = {
+                        "name": lname,
+                        "expr": _dq(derived_sf_col),
+                        "data_type": derived_sf_type,
+                        "description": _clean_text(
+                            (col.business_description or col.comment or _human_label(preferred_logical))
+                            + f" (parsed in Silver from legacy {col.profile.legacy_date.encoding} column {col.name})."  # type: ignore[union-attr]
+                        ),
+                    }
+                    syns = _synonyms_for_name(lname, col.name, col.semantic_name)
+                    if syns:
+                        entry["synonyms"] = syns
+                    time_dimensions.append(entry)
+                else:
+                    lname = _alloc_col_name(preferred_logical)
+                    col_raw_to_logical[col.name] = lname
+                    keyable_logical_cols.add(lname)
+                    entry = {
+                        "name": lname,
+                        "expr": _dq(derived_sf_col),
+                        "data_type": derived_sf_type,
+                        "description": _clean_text(
+                            (col.business_description or col.comment or _human_label(preferred_logical))
+                            + f" (zero-padded HHMMSS string parsed from {col.name})."
+                        ),
+                    }
+                    syns = _synonyms_for_name(lname, col.name, col.semantic_name)
+                    if syns:
+                        entry["synonyms"] = syns
+                    dimensions.append(entry)
                 continue
 
             # 2. Quantitative numeric measures -> facts
-            if _is_numeric_measure_column(col, tbl):
+            if _is_numeric_measure_column(col, tbl, join_keys=join_keys, pk_cols=eff_pk_set):
                 lname = _alloc_col_name(preferred_logical)
                 col_raw_to_logical[col.name] = lname
+                fact_agg_by_lname[lname] = _pick_metric_aggregation(col)
                 fact_entry: dict[str, Any] = {
                     "name": lname,
                     "expr": _dq(sf_cname),
@@ -537,8 +692,9 @@ def render_cortex_analyst_yaml(
             # 3. Qualitative attributes, keys, flags, codes -> dimensions
             lname = _alloc_col_name(preferred_logical)
             col_raw_to_logical[col.name] = lname
+            keyable_logical_cols.add(lname)
             desc = col.business_description or col.comment or f"{_human_label(lname)} attribute."
-            if _is_direct_pii(col):
+            if _is_direct_pii(col) or _is_itar_or_ip(col):
                 desc += " [Sensitive identifier; masked under governance policy]"
             dim_entry: dict[str, Any] = {
                 "name": lname,
@@ -552,6 +708,8 @@ def render_cortex_analyst_yaml(
             if (col.is_primary_key and len(tbl.primary_key) == 1) or col.is_unique:
                 dim_entry["unique"] = True
                 unique_cols_here.add(lname)
+                if not (col.is_primary_key and len(tbl.primary_key) == 1):
+                    non_pk_unique_cols.append(lname)
             sample_vals, is_enum = _safe_sample_values(col)
             if sample_vals:
                 dim_entry["sample_values"] = sample_vals
@@ -559,9 +717,7 @@ def render_cortex_analyst_yaml(
                     dim_entry["is_enum"] = True
             dimensions.append(dim_entry)
 
-            if col.profile and any(
-                g.category == "plant_isolation_key" for g in col.profile.governance_findings
-            ):
+            if _is_plant_key(col):
                 plant_tables.append((logical_tname, lname))
 
         # Build table-level aggregated metrics
@@ -577,7 +733,6 @@ def render_cortex_analyst_yaml(
             seen_metric_names.add(cand)
             return cand
 
-        # Record count metric
         single_pk_raw = tbl.primary_key[0] if len(tbl.primary_key) == 1 else None
         single_pk_sf = sf_col_map.get(single_pk_raw) if single_pk_raw else None
         count_name = _alloc_metric_name(
@@ -592,14 +747,8 @@ def render_cortex_analyst_yaml(
             }
         )
 
-        # Fact-based aggregated metrics (cap at top 8 facts so LLM context stays focused)
-        fact_by_lname = {f["name"]: f for f in facts}
         for f_entry in facts[:8]:
-            raw_col_obj = next(
-                (c for c in tbl.columns if col_raw_to_logical.get(c.name) == f_entry["name"]),
-                None,
-            )
-            agg = _pick_metric_aggregation(raw_col_obj) if raw_col_obj else "sum"
+            agg = fact_agg_by_lname.get(f_entry["name"], "sum")
             if agg == "avg":
                 m_name = _alloc_metric_name(f"avg_{f_entry['name']}")
                 metrics.append(
@@ -628,17 +777,20 @@ def render_cortex_analyst_yaml(
                     }
                 )
 
-        # Primary key columns mapped to logical names (only those emitted in dimensions/time_dimensions/facts)
-        raw_pks = tbl.primary_key or (
-            tbl.recommendations.primary_key_candidates[:1] if tbl.recommendations else []
-        )
-        logical_pks = [col_raw_to_logical[p] for p in raw_pks if p in col_raw_to_logical]
-        if len(logical_pks) == 1:
-            unique_cols_here.add(logical_pks[0])
+        # Primary key: emit ONLY if ALL key columns were emitted as keyable dimensions/time_dimensions
+        logical_pks = [
+            col_raw_to_logical[p]
+            for p in eff_pks
+            if p in col_raw_to_logical and col_raw_to_logical[p] in keyable_logical_cols
+        ]
+        emit_pks = logical_pks if (eff_pks and len(logical_pks) == len(eff_pks)) else []
+        if len(emit_pks) == 1:
+            unique_cols_here.add(emit_pks[0])
             for entry_list in (dimensions, time_dimensions):
                 for item in entry_list:
-                    if item["name"] == logical_pks[0]:
+                    if item["name"] == emit_pks[0]:
                         item["unique"] = True
+            non_pk_unique_cols = [u for u in non_pk_unique_cols if u != emit_pks[0]]
 
         role = tbl.recommendations.entity_role if tbl.recommendations else "unknown"
         t_desc = tbl.business_description or tbl.comment or (
@@ -659,8 +811,10 @@ def render_cortex_analyst_yaml(
         t_syns = _synonyms_for_name(logical_tname, tbl.name, tbl.semantic_name)
         if t_syns:
             tbl_entry["synonyms"] = t_syns
-        if logical_pks:
-            tbl_entry["primary_key"] = {"columns": logical_pks}
+        if emit_pks:
+            tbl_entry["primary_key"] = {"columns": emit_pks}
+        if non_pk_unique_cols:
+            tbl_entry["unique_keys"] = [{"columns": [u]} for u in dict.fromkeys(non_pk_unique_cols)]
         if dimensions:
             tbl_entry["dimensions"] = dimensions
         if time_dimensions:
@@ -680,14 +834,16 @@ def render_cortex_analyst_yaml(
             "time_dimensions": time_dimensions,
             "facts": facts,
             "metrics": metrics,
-            "fact_by_lname": fact_by_lname,
+            "fact_agg_by_lname": fact_agg_by_lname,
+            "raw_to_logical": col_raw_to_logical,
         }
 
-    # Emit exploded Gold Hierarchy / BOM logical tables when detected
-    hier_tables = get_hierarchy_tables(result)
+    # Emit exploded Gold Hierarchy / BOM logical tables for active hierarchy tables
+    hier_tables = [t for t in get_hierarchy_tables(result) if t.full_name in active_by_full]
     existing_logical_names = {t["name"] for t in semantic_tables}
     gold_hier_logical: list[tuple[str, TableInfo, bool]] = []
     for htbl in hier_tables:
+        assert htbl.hierarchy is not None
         safe_h = sf_tbl_map[htbl.full_name]
         base_h_name = _slug(f"{logical_tbl_map.get(htbl.full_name, htbl.name)}_exploded")
         h_name = base_h_name
@@ -700,6 +856,20 @@ def render_cortex_analyst_yaml(
         plant_obj = _find_plant_column(htbl)
         qty_obj = _find_quantity_column(htbl)
         h_col_map = deduplicate_snowflake_columns([c.name for c in htbl.columns])
+        parent_obj = next((c for c in htbl.columns if c.name == htbl.hierarchy.parent_column), None)
+        child_obj = next((c for c in htbl.columns if c.name == htbl.hierarchy.child_column), None)
+        p_node_type = (
+            parent_obj.snowflake_type or map_to_snowflake_type(parent_obj.raw_type, parent_obj.canonical_type)
+            if parent_obj
+            else "VARCHAR"
+        )
+        c_node_type = (
+            child_obj.snowflake_type or map_to_snowflake_type(child_obj.raw_type, child_obj.canonical_type)
+            if child_obj
+            else p_node_type
+        )
+        root_node_type = p_node_type if p_node_type == c_node_type else "VARCHAR"
+
         h_dims: list[dict[str, Any]] = []
         if plant_obj:
             p_sf = h_col_map[plant_obj.name]
@@ -719,9 +889,9 @@ def render_cortex_analyst_yaml(
             )
         h_dims.extend(
             [
-                {"name": "root_node_id", "expr": '"ROOT_NODE_ID"', "data_type": "VARCHAR", "description": "Top-level root assembly / parent node ID."},
-                {"name": "parent_node_id", "expr": '"PARENT_NODE_ID"', "data_type": "VARCHAR", "description": "Direct parent node ID in the hierarchy edge."},
-                {"name": "child_node_id", "expr": '"CHILD_NODE_ID"', "data_type": "VARCHAR", "description": "Direct child component / node ID."},
+                {"name": "root_node_id", "expr": '"ROOT_NODE_ID"', "data_type": root_node_type, "description": "Top-level root assembly / parent node ID."},
+                {"name": "parent_node_id", "expr": '"PARENT_NODE_ID"', "data_type": p_node_type, "description": "Direct parent node ID in the hierarchy edge."},
+                {"name": "child_node_id", "expr": '"CHILD_NODE_ID"', "data_type": c_node_type, "description": "Direct child component / node ID."},
                 {"name": "hierarchy_path", "expr": '"HIERARCHY_PATH"', "data_type": "VARCHAR", "description": "Full root-to-leaf path trace."},
             ]
         )
@@ -743,7 +913,6 @@ def render_cortex_analyst_yaml(
                 {"name": "total_extended_qty", "expr": 'SUM("EXTENDED_QTY")', "description": "Total rolled-up component quantity across all levels."}
             )
 
-        assert htbl.hierarchy is not None
         semantic_tables.append(
             {
                 "name": h_name,
@@ -770,11 +939,10 @@ def render_cortex_analyst_yaml(
     for rel in verified_rels:
         l_tbl = logical_tbl_map[rel.source_table]
         r_tbl = logical_tbl_map[rel.target_table]
-        l_col = raw_to_logical_col.get(rel.source_table, {}).get(rel.source_column)
-        r_col = raw_to_logical_col.get(rel.target_table, {}).get(rel.target_column)
+        l_col = _resolve_col_name_ci(raw_to_logical_col.get(rel.source_table, {}), rel.source_column)
+        r_col = _resolve_col_name_ci(raw_to_logical_col.get(rel.target_table, {}), rel.target_column)
         if not l_col or not r_col:
             continue
-        # Cortex Analyst requires right_column of many_to_one join to be unique or PK on right_table
         if r_col not in unique_logical_cols.get(rel.target_table, set()):
             continue
 
@@ -804,7 +972,6 @@ def render_cortex_analyst_yaml(
             }
         )
 
-    # Synthesize grounded Verified Queries (VQRs)
     verified_queries = _build_cortex_verified_queries(
         active_tables=active_tables,
         table_meta=table_meta,
@@ -818,7 +985,7 @@ def render_cortex_analyst_yaml(
         f"This semantic model queries cleaned Silver Dynamic Tables in {db}.{silver_schema} discovered from {result.overview.database_name} ({result.overview.dialect})."
     ]
     if any(
-        c.profile and c.profile.legacy_date
+        c.profile and c.profile.legacy_date and c.profile.legacy_date.encoding != "hhmmss"
         for t in active_tables
         for c in t.columns
     ):
@@ -862,11 +1029,12 @@ def render_cortex_analyst_yaml(
     if verified_queries:
         model_doc["verified_queries"] = verified_queries
 
+    stage_ref = f"{_dq(db)}.{_dq(silver_schema)}.\"SEMANTIC_STAGE\""
     header = (
         f"# Auto-generated by tick: Snowflake Cortex Analyst Semantic Model for {result.overview.database_name}\n"
         f"# Upload to a Snowflake stage, e.g.:\n"
-        f"#   CREATE STAGE IF NOT EXISTS {_dq(db)}.{_dq(silver_schema)}.\"SEMANTIC_STAGE\";\n"
-        f"#   PUT file://cortex_analyst_semantic_model.yml @{db}.{silver_schema}.SEMANTIC_STAGE AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n\n"
+        f"#   CREATE STAGE IF NOT EXISTS {stage_ref};\n"
+        f"#   PUT file://cortex_analyst_semantic_model.yml @{stage_ref} AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n\n"
     )
     return header + yaml.safe_dump(model_doc, sort_keys=False, width=110)
 
@@ -900,6 +1068,18 @@ def _pick_best_fact_meta(
     return scored[0][1]
 
 
+def _vqr_fact_agg_clause(meta: dict[str, Any], prefix: str = "") -> tuple[str, str]:
+    """Return (sql_select_fragment, question_phrase) respecting AVG vs SUM for the table's first fact."""
+    if not meta["facts"]:
+        return "", ""
+    fname = meta["facts"][0]["name"]
+    agg = meta["fact_agg_by_lname"].get(fname, "sum")
+    col_ref = f"{prefix}{fname}"
+    if agg == "avg":
+        return f",\n  AVG({col_ref}) AS avg_{fname}", f" and average {_human_label(fname).lower()}"
+    return f",\n  SUM({col_ref}) AS total_{fname}", f" and total {_human_label(fname).lower()}"
+
+
 def _build_cortex_verified_queries(
     active_tables: list[TableInfo],
     table_meta: dict[str, dict[str, Any]],
@@ -909,29 +1089,35 @@ def _build_cortex_verified_queries(
 ) -> list[dict[str, Any]]:
     """Synthesize grounded, Snowflake-valid Verified Queries (VQRs) using logical table/column names."""
     vqrs: list[dict[str, Any]] = []
+    seen_vqr_names: set[str] = set()
+    covered_group_pairs: set[tuple[str, str]] = set()
     meta_by_logical = {m["logical_name"]: m for m in table_meta.values()}
     best_fact = _pick_best_fact_meta(active_tables, table_meta)
+
+    def _alloc_vqr_name(base: str) -> str:
+        cand = _slug(base)
+        sfx = 2
+        while cand in seen_vqr_names:
+            cand = f"{_slug(base)}_{sfx}"
+            sfx += 1
+        seen_vqr_names.add(cand)
+        return cand
 
     # 1. Monthly trend on primary fact table (if time dimension exists)
     if best_fact and best_fact["time_dimensions"]:
         lt = best_fact["logical_name"]
         td = best_fact["time_dimensions"][0]["name"]
-        fact_metric = best_fact["facts"][0]["name"] if best_fact["facts"] else None
-        agg_sel = (
-            f",\n  SUM({fact_metric}) AS total_{fact_metric}"
-            if fact_metric
-            else ""
-        )
+        agg_sel, q_phrase = _vqr_fact_agg_clause(best_fact)
+        month_alias = "period_month" if td != "period_month" else "bucket_month"
+        cnt_alias = "record_count" if td != "record_count" else "row_cnt"
         vqrs.append(
             {
-                "name": f"{lt}_monthly_trend",
-                "question": f"What is the monthly trend of {_human_label(lt).lower()}"
-                + (f" and total {_human_label(fact_metric).lower()}" if fact_metric else "")
-                + "?",
+                "name": _alloc_vqr_name(f"{lt}_monthly_trend"),
+                "question": f"What is the monthly trend of {_human_label(lt).lower()}{q_phrase}?",
                 "sql": (
                     f"SELECT\n"
-                    f"  DATE_TRUNC('MONTH', {td}) AS period_month,\n"
-                    f"  COUNT(*) AS record_count{agg_sel}\n"
+                    f"  DATE_TRUNC('MONTH', {td}) AS {month_alias},\n"
+                    f"  COUNT(*) AS {cnt_alias}{agg_sel}\n"
                     f"FROM {lt}\n"
                     f"GROUP BY 1\n"
                     f"ORDER BY 1 DESC\n"
@@ -942,7 +1128,7 @@ def _build_cortex_verified_queries(
             }
         )
 
-    # 2. Joined fact + dimension breakdown (using first verified relationship from best fact or any rel)
+    # 2. Joined fact + dimension breakdown (or fallback low-cardinality dimension breakdown)
     chosen_rel = next(
         (r for r in relationships_yaml if best_fact and r["left_table"] == best_fact["logical_name"]),
         relationships_yaml[0] if relationships_yaml else None,
@@ -959,21 +1145,21 @@ def _build_cortex_verified_queries(
                 (d["name"] for d in rmeta["dimensions"] if d["name"] != rcol and not d.get("unique")),
                 rcol,
             )
-            l_fact = lmeta["facts"][0]["name"] if lmeta["facts"] else None
-            agg_sql = f",\n  SUM(l.{l_fact}) AS total_{l_fact}" if l_fact else ""
+            agg_sql, _ = _vqr_fact_agg_clause(lmeta, prefix="l.")
+            cnt_alias = "record_count" if r_group_dim != "record_count" else "row_cnt"
             vqrs.append(
                 {
-                    "name": f"{lt}_by_{rt}",
+                    "name": _alloc_vqr_name(f"{lt}_by_{rt}"),
                     "question": f"Break down {_human_label(lt).lower()} by {_human_label(rt).lower()} {_human_label(r_group_dim).lower()}.",
                     "sql": (
                         f"SELECT\n"
                         f"  r.{r_group_dim},\n"
-                        f"  COUNT(*) AS record_count{agg_sql}\n"
+                        f"  COUNT(*) AS {cnt_alias}{agg_sql}\n"
                         f"FROM {lt} AS l\n"
                         f"LEFT JOIN {rt} AS r\n"
                         f"  ON l.{lcol} = r.{rcol}\n"
                         f"GROUP BY 1\n"
-                        f"ORDER BY record_count DESC\n"
+                        f"ORDER BY {cnt_alias} DESC\n"
                         f"LIMIT 25"
                     ),
                     "verified_by": "tick-auto-discovery",
@@ -981,25 +1167,25 @@ def _build_cortex_verified_queries(
                 }
             )
     elif best_fact and best_fact["dimensions"]:
-        # Fallback breakdown by low-cardinality dimension
         lt = best_fact["logical_name"]
         low_dim = next(
             (d["name"] for d in best_fact["dimensions"] if d.get("sample_values")),
             best_fact["dimensions"][0]["name"],
         )
-        l_fact = best_fact["facts"][0]["name"] if best_fact["facts"] else None
-        agg_sql = f",\n  SUM({l_fact}) AS total_{l_fact}" if l_fact else ""
+        agg_sql, _ = _vqr_fact_agg_clause(best_fact)
+        cnt_alias = "record_count" if low_dim != "record_count" else "row_cnt"
+        covered_group_pairs.add((lt, low_dim))
         vqrs.append(
             {
-                "name": f"{lt}_by_{low_dim}",
+                "name": _alloc_vqr_name(f"{lt}_by_{low_dim}"),
                 "question": f"Show {_human_label(lt).lower()} grouped by {_human_label(low_dim).lower()}.",
                 "sql": (
                     f"SELECT\n"
                     f"  {low_dim},\n"
-                    f"  COUNT(*) AS record_count{agg_sql}\n"
+                    f"  COUNT(*) AS {cnt_alias}{agg_sql}\n"
                     f"FROM {lt}\n"
                     f"GROUP BY 1\n"
-                    f"ORDER BY record_count DESC\n"
+                    f"ORDER BY {cnt_alias} DESC\n"
                     f"LIMIT 25"
                 ),
                 "verified_by": "tick-auto-discovery",
@@ -1007,24 +1193,38 @@ def _build_cortex_verified_queries(
             }
         )
 
-    # 3. OT telemetry summary VQR
+    # 3. OT telemetry summary VQR (explicitly resolves telemetry_profile.timestamp_column!)
     ot_tbl = next((t for t in active_tables if t.telemetry_profile is not None), None)
-    if ot_tbl:
+    if ot_tbl and ot_tbl.telemetry_profile:
         ometa = table_meta[ot_tbl.full_name]
         lt = ometa["logical_name"]
-        ts_dim = ometa["time_dimensions"][0]["name"] if ometa["time_dimensions"] else None
+        ot_ts_logical = ometa["raw_to_logical"].get(ot_tbl.telemetry_profile.timestamp_column)
+        td_by_name = {d["name"]: d for d in ometa["time_dimensions"]}
+        ts_entry = td_by_name.get(ot_ts_logical) if ot_ts_logical else None
+        if ts_entry is None:
+            ts_entry = next(
+                (d for d in ometa["time_dimensions"] if "TIMESTAMP" in d["data_type"].upper()),
+                ometa["time_dimensions"][0] if ometa["time_dimensions"] else None,
+            )
         val_fact = ometa["facts"][0]["name"] if ometa["facts"] else None
-        if ts_dim:
+        if ts_entry:
+            ts_dim = ts_entry["name"]
+            is_ts = "TIMESTAMP" in ts_entry["data_type"].upper()
+            trunc_unit = "HOUR" if is_ts else "DAY"
+            bucket_label = "hourly" if is_ts else "daily"
+            bucket_alias = ("reading_hour" if is_ts else "reading_day")
+            if bucket_alias == ts_dim:
+                bucket_alias = f"{bucket_alias}_bucket"
             avg_sql = f",\n  AVG({val_fact}) AS avg_{val_fact}" if val_fact else ""
             vqrs.append(
                 {
-                    "name": f"{lt}_hourly_telemetry",
-                    "question": f"What is the hourly sensor reading volume"
+                    "name": _alloc_vqr_name(f"{lt}_{bucket_label}_telemetry"),
+                    "question": f"What is the {bucket_label} sensor reading volume"
                     + (f" and average {_human_label(val_fact).lower()}" if val_fact else "")
                     + f" for {_human_label(lt).lower()}?",
                     "sql": (
                         f"SELECT\n"
-                        f"  DATE_TRUNC('HOUR', {ts_dim}) AS reading_hour,\n"
+                        f"  DATE_TRUNC('{trunc_unit}', {ts_dim}) AS {bucket_alias},\n"
                         f"  COUNT(*) AS reading_count{avg_sql}\n"
                         f"FROM {lt}\n"
                         f"GROUP BY 1\n"
@@ -1042,7 +1242,7 @@ def _build_cortex_verified_queries(
         qty_sel = ",\n  SUM(extended_qty) AS total_extended_qty" if has_qty else ""
         vqrs.append(
             {
-                "name": f"{h_name}_top_assemblies",
+                "name": _alloc_vqr_name(f"{h_name}_top_assemblies"),
                 "question": f"Which root assemblies have the most exploded components and deepest hierarchy in {_human_label(h_name).lower()}?",
                 "sql": (
                     f"SELECT\n"
@@ -1059,29 +1259,33 @@ def _build_cortex_verified_queries(
             }
         )
 
-    # 5. Multi-plant comparison VQR (if plant key exists and wasn't already covered)
-    if plant_tables:
-        pt_tbl, pt_col = plant_tables[0]
+    # 5. Multi-plant comparison VQR (skip any (table, col) already covered by VQR #2)
+    for pt_tbl, pt_col in plant_tables:
+        if (pt_tbl, pt_col) in covered_group_pairs:
+            continue
         pmeta = meta_by_logical.get(pt_tbl)
-        if pmeta:
-            p_fact = pmeta["facts"][0]["name"] if pmeta["facts"] else None
-            agg_sql = f",\n  SUM({p_fact}) AS total_{p_fact}" if p_fact else ""
-            vqrs.append(
-                {
-                    "name": f"{pt_tbl}_by_plant",
-                    "question": f"Compare {_human_label(pt_tbl).lower()} activity across plants.",
-                    "sql": (
-                        f"SELECT\n"
-                        f"  {pt_col},\n"
-                        f"  COUNT(*) AS record_count{agg_sql}\n"
-                        f"FROM {pt_tbl}\n"
-                        f"GROUP BY 1\n"
-                        f"ORDER BY record_count DESC"
-                    ),
-                    "verified_by": "tick-auto-discovery",
-                    "use_as_onboarding_question": False,
-                }
-            )
+        if not pmeta:
+            continue
+        agg_sql, _ = _vqr_fact_agg_clause(pmeta)
+        cnt_alias = "record_count" if pt_col != "record_count" else "row_cnt"
+        covered_group_pairs.add((pt_tbl, pt_col))
+        vqrs.append(
+            {
+                "name": _alloc_vqr_name(f"{pt_tbl}_by_plant"),
+                "question": f"Compare {_human_label(pt_tbl).lower()} activity across plants.",
+                "sql": (
+                    f"SELECT\n"
+                    f"  {pt_col},\n"
+                    f"  COUNT(*) AS {cnt_alias}{agg_sql}\n"
+                    f"FROM {pt_tbl}\n"
+                    f"GROUP BY 1\n"
+                    f"ORDER BY {cnt_alias} DESC"
+                ),
+                "verified_by": "tick-auto-discovery",
+                "use_as_onboarding_question": False,
+            }
+        )
+        break
 
     return vqrs
 
@@ -1094,6 +1298,7 @@ def _build_cortex_verified_queries(
 def _choose_metric_view_anchors(
     active_tables: list[TableInfo],
     verified_rels: list[RelationshipInfo],
+    join_keys: set[tuple[str, str]],
 ) -> list[TableInfo]:
     """Choose the best tables to publish as Unity Catalog Metric Views (facts, telemetry, or top tables)."""
     outgoing_counts: dict[str, int] = {}
@@ -1103,9 +1308,12 @@ def _choose_metric_view_anchors(
     anchors: list[TableInfo] = []
     for tbl in active_tables:
         if tbl.hierarchy is not None:
-            continue  # Handled via exploded Gold hierarchy metric view
+            continue
         role = tbl.recommendations.entity_role if tbl.recommendations else "unknown"
-        measure_count = sum(1 for c in tbl.columns if _is_numeric_measure_column(c, tbl))
+        pk_set = set(_effective_pk_columns(tbl))
+        measure_count = sum(
+            1 for c in tbl.columns if _is_numeric_measure_column(c, tbl, join_keys=join_keys, pk_cols=pk_set)
+        )
         if (
             role in {"fact", "event_log", "bridge"}
             or tbl.telemetry_profile is not None
@@ -1114,13 +1322,19 @@ def _choose_metric_view_anchors(
         ):
             anchors.append(tbl)
 
-    # Fallback: if no classic facts/telemetry detected, pick up to 3 tables with measures or largest row count
     if not anchors and active_tables:
         non_hier = [t for t in active_tables if t.hierarchy is None] or active_tables
         ranked = sorted(
             non_hier,
             key=lambda t: (
-                1 if any(_is_numeric_measure_column(c, t) for c in t.columns) else 0,
+                1
+                if any(
+                    _is_numeric_measure_column(
+                        c, t, join_keys=join_keys, pk_cols=set(_effective_pk_columns(t))
+                    )
+                    for c in t.columns
+                )
+                else 0,
                 t.row_count or 0,
                 len(t.columns),
             ),
@@ -1131,13 +1345,122 @@ def _choose_metric_view_anchors(
     return anchors
 
 
-def render_databricks_metric_views_sql(
+def _databricks_measure_format(col: ColumnInfo) -> dict[str, Any] | None:
+    """Format hint for Databricks Metric Views v1.1 (check percentage BEFORE currency)."""
+    name_to_check = col.semantic_name or col.name
+    if _PERCENT_MEASURE_RE.search(name_to_check) or _PERCENT_MEASURE_RE.search(col.name):
+        return {"type": "percentage", "decimal_places": {"type": "exact", "places": 1}}
+    if _CURRENCY_MEASURE_RE.search(name_to_check) or _CURRENCY_MEASURE_RE.search(col.name):
+        return {"type": "currency", "currency_code": "USD", "decimal_places": {"type": "exact", "places": 2}}
+    if col.canonical_type in {"decimal", "float"}:
+        return {"type": "number", "decimal_places": {"type": "exact", "places": 2}}
+    return None
+
+
+def _collect_safe_metric_view_joins(
+    tbl: TableInfo,
+    cat: str,
+    silver_schema: str,
+    active_by_full: dict[str, TableInfo],
+    verified_rels: list[RelationshipInfo],
+    dbx_tbl_map: dict[str, str],
+    dbx_col_maps: dict[str, dict[str, str]],
+    logical_tbl_map: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[tuple[str, TableInfo]]]:
+    """Build fan-out-safe many-to-one joins (supports compound explicit FKs; enforces target uniqueness)."""
+    joins_yaml: list[dict[str, Any]] = []
+    joined_tables: list[tuple[str, TableInfo]] = []
+    seen_join_aliases: set[str] = {"source"}
+    seen_join_targets: set[str] = set()
+    col_map = dbx_col_maps[tbl.full_name]
+
+    def _alloc_alias(tgt_tbl: TableInfo) -> str:
+        base_alias = _slug(logical_tbl_map[tgt_tbl.full_name])
+        alias = base_alias
+        sfx = 2
+        while alias in seen_join_aliases:
+            alias = f"{base_alias}_{sfx}"
+            sfx += 1
+        seen_join_aliases.add(alias)
+        return alias
+
+    # 1. Explicit FKs first — preserves compound multi-column FKs as AND predicates!
+    for fk in tbl.foreign_keys:
+        if len(joins_yaml) >= 6:
+            break
+        if len(fk.constrained_columns) != len(fk.referred_columns) or not fk.constrained_columns:
+            continue
+        tgt_tbl = _resolve_referred_table(tbl, fk.referred_schema, fk.referred_table, active_by_full)
+        if tgt_tbl is None or tgt_tbl.full_name == tbl.full_name or tgt_tbl.full_name in seen_join_targets:
+            continue
+        if not _is_unique_column_set(tgt_tbl, fk.referred_columns):
+            continue
+        tgt_col_map = dbx_col_maps[tgt_tbl.full_name]
+        pairs: list[tuple[str, str]] = []
+        valid = True
+        for sc, tc in zip(fk.constrained_columns, fk.referred_columns):
+            sc_dbx = _resolve_col_name_ci(col_map, sc)
+            tc_dbx = _resolve_col_name_ci(tgt_col_map, tc)
+            if not sc_dbx or not tc_dbx:
+                valid = False
+                break
+            pairs.append((sc_dbx, tc_dbx))
+        if not valid:
+            continue
+        alias = _alloc_alias(tgt_tbl)
+        seen_join_targets.add(tgt_tbl.full_name)
+        tgt_safe = dbx_tbl_map[tgt_tbl.full_name]
+        on_clause = " AND ".join(
+            f"source.{_spark_ident(sc_dbx)} = {_spark_ident(alias)}.{_spark_ident(tc_dbx)}"
+            for sc_dbx, tc_dbx in pairs
+        )
+        joins_yaml.append(
+            {
+                "name": alias,
+                "source": _spark_table_ref(cat, silver_schema, f"silver_{tgt_safe}"),
+                "on": on_clause,
+            }
+        )
+        joined_tables.append((alias, tgt_tbl))
+
+    # 2. Single-column verified relationships (strictly requiring unique target column -> zero fan-out!)
+    outgoing = [r for r in verified_rels if r.source_table == tbl.full_name]
+    for rel in outgoing:
+        if len(joins_yaml) >= 6:
+            break
+        if rel.target_table in seen_join_targets:
+            continue
+        tgt_tbl = active_by_full[rel.target_table]
+        if not _is_unique_single_key(tgt_tbl, rel.target_column):
+            continue
+        tgt_col_map = dbx_col_maps[tgt_tbl.full_name]
+        src_col_dbx = _resolve_col_name_ci(col_map, rel.source_column)
+        tgt_col_dbx = _resolve_col_name_ci(tgt_col_map, rel.target_column)
+        if not src_col_dbx or not tgt_col_dbx:
+            continue
+
+        alias = _alloc_alias(tgt_tbl)
+        seen_join_targets.add(rel.target_table)
+        tgt_safe = dbx_tbl_map[tgt_tbl.full_name]
+        joins_yaml.append(
+            {
+                "name": alias,
+                "source": _spark_table_ref(cat, silver_schema, f"silver_{tgt_safe}"),
+                "on": f"source.{_spark_ident(src_col_dbx)} = {_spark_ident(alias)}.{_spark_ident(tgt_col_dbx)}",
+            }
+        )
+        joined_tables.append((alias, tgt_tbl))
+
+    return joins_yaml, joined_tables
+
+
+def _build_databricks_metric_view_specs(
     result: DiscoveryResult,
     catalog: str | None = None,
     silver_schema: str = "silver",
     gold_schema: str = "gold",
-) -> str:
-    """Generate Databricks Unity Catalog Metric Views SQL (WITH METRICS LANGUAGE YAML, spec v1.1)."""
+) -> list[dict[str, Any]]:
+    """Single source of truth for Databricks Metric Views (used by both metric_views.sql & genie_context.md)."""
     cat = catalog or result.config.databricks_catalog
     all_base_tables = [t for t in result.tables if t.table_type == "table"]
     dbx_tbl_map = deduplicate_table_names(all_base_tables)
@@ -1147,27 +1470,13 @@ def render_databricks_metric_views_sql(
     verified_rels = _filtered_verified_relationships(result, active_by_full)
     join_keys = _collect_join_key_columns(result)
 
-    lines: list[str] = [
-        f"-- Auto-generated by tick: Databricks Unity Catalog Metric Views ({cat}.{gold_schema})",
-        f"-- Source database: {result.overview.database_name} ({result.overview.dialect})",
-        "-- Requires Databricks Runtime 16.4+ / Serverless SQL Warehouse with Unity Catalog Metric Views.",
-        "",
-        f"CREATE SCHEMA IF NOT EXISTS {_spark_ident(cat)}.{_spark_ident(gold_schema)};",
-        "",
-    ]
+    anchors = _choose_metric_view_anchors(active_tables, verified_rels, join_keys)
+    hier_tables = [t for t in get_hierarchy_tables(result) if t.full_name in active_by_full]
 
-    anchors = _choose_metric_view_anchors(active_tables, verified_rels)
-    hier_tables = get_hierarchy_tables(result)
-
-    if not anchors and not hier_tables:
-        lines.append("-- No eligible base tables discovered to generate Unity Catalog Metric Views.")
-        return "\n".join(lines) + "\n"
-
-    # Precompute Databricks Silver column maps for all active tables
     dbx_col_maps: dict[str, dict[str, str]] = {
         t.full_name: deduplicate_column_names([c.name for c in t.columns]) for t in active_tables
     }
-    legacy_dbx_maps: dict[str, dict[str, tuple[str, str]]] = {
+    legacy_dbx_maps: dict[str, dict[str, tuple[str, str, bool]]] = {
         t.full_name: _compute_databricks_silver_legacy_cols(t, dbx_col_maps[t.full_name])
         for t in active_tables
     }
@@ -1184,6 +1493,8 @@ def render_databricks_metric_views_sql(
         seen_view_names.add(cand)
         return cand
 
+    specs: list[dict[str, Any]] = []
+
     for tbl in anchors:
         safe_tbl = dbx_tbl_map[tbl.full_name]
         logical_tname = logical_tbl_map[tbl.full_name]
@@ -1192,50 +1503,24 @@ def render_databricks_metric_views_sql(
         src_fqn = _spark_table_ref(cat, silver_schema, f"silver_{safe_tbl}")
         col_map = dbx_col_maps[tbl.full_name]
         legacy_map = legacy_dbx_maps[tbl.full_name]
+        eff_pk_set = set(_effective_pk_columns(tbl))
 
-        # Outgoing many-to-one joins for this anchor table (up to 6 unique dimension joins)
-        outgoing = [r for r in verified_rels if r.source_table == tbl.full_name]
-        joins_yaml: list[dict[str, Any]] = []
-        joined_tables: list[tuple[str, TableInfo]] = []
-        seen_join_aliases: set[str] = {"source"}
-        seen_join_targets: set[str] = set()
+        joins_yaml, joined_tables = _collect_safe_metric_view_joins(
+            tbl=tbl,
+            cat=cat,
+            silver_schema=silver_schema,
+            active_by_full=active_by_full,
+            verified_rels=verified_rels,
+            dbx_tbl_map=dbx_tbl_map,
+            dbx_col_maps=dbx_col_maps,
+            logical_tbl_map=logical_tbl_map,
+        )
 
-        for rel in outgoing:
-            if len(joins_yaml) >= 6:
-                break
-            if rel.target_table in seen_join_targets:
-                continue
-            tgt_tbl = active_by_full[rel.target_table]
-            tgt_safe = dbx_tbl_map[tgt_tbl.full_name]
-            tgt_col_map = dbx_col_maps[tgt_tbl.full_name]
-            src_col_dbx = col_map.get(rel.source_column)
-            tgt_col_dbx = tgt_col_map.get(rel.target_column)
-            if not src_col_dbx or not tgt_col_dbx:
-                continue
-
-            base_alias = _slug(logical_tbl_map[tgt_tbl.full_name])
-            alias = base_alias
-            sfx = 2
-            while alias in seen_join_aliases:
-                alias = f"{base_alias}_{sfx}"
-                sfx += 1
-            seen_join_aliases.add(alias)
-            seen_join_targets.add(rel.target_table)
-
-            joins_yaml.append(
-                {
-                    "name": alias,
-                    "source": _spark_table_ref(cat, silver_schema, f"silver_{tgt_safe}"),
-                    "on": f"source.{_spark_ident(src_col_dbx)} = {_spark_ident(alias)}.{_spark_ident(tgt_col_dbx)}",
-                }
-            )
-            joined_tables.append((alias, tgt_tbl))
-
-        # Dimensions & Measures
         dimensions_yaml: list[dict[str, Any]] = []
         measures_yaml: list[dict[str, Any]] = []
         seen_dim_names: set[str] = set()
         seen_meas_names: set[str] = set()
+        preferred_string_dim: str | None = None
 
         def _alloc_dim(preferred: str) -> str:
             base = _semantic_slug(preferred, suffix="col")
@@ -1265,12 +1550,18 @@ def render_databricks_metric_views_sql(
 
         primary_time_expr: str | None = None
         primary_time_slug: str | None = None
+        primary_time_is_ts: bool = False
+        ot_ts_col_name = tbl.telemetry_profile.timestamp_column if tbl.telemetry_profile else None
         measure_cols: list[tuple[ColumnInfo, str]] = []
 
         for col in tbl.columns:
             if col.canonical_type == "binary":
                 continue
-            is_join_or_pk = col.is_primary_key or (tbl.full_name, col.name) in join_keys
+            is_join_or_pk = (
+                col.is_primary_key
+                or col.name in eff_pk_set
+                or (tbl.full_name, col.name.lower()) in join_keys
+            )
             if (_is_direct_pii(col) or _is_itar_or_ip(col)) and not is_join_or_pk:
                 continue
             if (
@@ -1284,9 +1575,9 @@ def render_databricks_metric_views_sql(
             dbx_col = col_map[col.name]
             pref_name = col.semantic_name or col.name
 
-            # Legacy parsed date/timestamp column in Silver
+            # Legacy parsed date/timestamp (or unpaired HHMMSS string)
             if col.name in legacy_map:
-                derived_col, _ = legacy_map[col.name]
+                derived_col, derived_type, is_temporal = legacy_map[col.name]
                 dname = _alloc_dim(pref_name)
                 expr = f"source.{_spark_ident(derived_col)}"
                 dimensions_yaml.append(
@@ -1299,9 +1590,10 @@ def render_databricks_metric_views_sql(
                         ),
                     }
                 )
-                if primary_time_expr is None:
+                if is_temporal and (primary_time_expr is None or col.name == ot_ts_col_name):
                     primary_time_expr = expr
                     primary_time_slug = dname
+                    primary_time_is_ts = derived_type == "TIMESTAMP"
                 continue
 
             # Native date / timestamp column
@@ -1318,17 +1610,23 @@ def render_databricks_metric_views_sql(
                         ),
                     }
                 )
-                if primary_time_expr is None:
+                is_col_ts = col.canonical_type == "timestamp"
+                if (
+                    col.name == ot_ts_col_name
+                    or primary_time_expr is None
+                    or (tbl.telemetry_profile and is_col_ts and not primary_time_is_ts)
+                ):
                     primary_time_expr = expr
                     primary_time_slug = dname
+                    primary_time_is_ts = is_col_ts
                 continue
 
-            # Numeric measures
-            if _is_numeric_measure_column(col, tbl):
+            # Quantitative numeric measures
+            if _is_numeric_measure_column(col, tbl, join_keys=join_keys, pk_cols=eff_pk_set):
                 measure_cols.append((col, dbx_col))
                 continue
 
-            # Regular dimension (skip if already super wide > 20 source dimensions)
+            # Regular dimension (capped at 20 source dimensions for readability)
             if len(dimensions_yaml) < 20:
                 dname = _alloc_dim(pref_name)
                 dim_obj: dict[str, Any] = {
@@ -1339,11 +1637,23 @@ def render_databricks_metric_views_sql(
                 if col.business_description or col.comment:
                     dim_obj["comment"] = _clean_text(col.business_description or col.comment or "")
                 dimensions_yaml.append(dim_obj)
+                if (
+                    preferred_string_dim is None
+                    and col.canonical_type in {"string", "boolean"}
+                    and not col.is_primary_key
+                    and not _is_direct_pii(col)
+                    and not _is_itar_or_ip(col)
+                ):
+                    preferred_string_dim = dname
 
-        # Add convenient calendar grain dimension for primary time column
+        # Calendar / hourly grain helper dimension for primary time column
         if primary_time_expr and primary_time_slug:
-            grain_unit = "HOUR" if tbl.telemetry_profile else "MONTH"
-            grain_suffix = "hour" if tbl.telemetry_profile else "month"
+            if tbl.telemetry_profile and primary_time_is_ts:
+                grain_unit, grain_suffix = "HOUR", "hour"
+            elif tbl.telemetry_profile:
+                grain_unit, grain_suffix = "DAY", "day"
+            else:
+                grain_unit, grain_suffix = "MONTH", "month"
             gname = _alloc_dim(f"{primary_time_slug}_{grain_suffix}")
             dimensions_yaml.append(
                 {
@@ -1354,7 +1664,7 @@ def render_databricks_metric_views_sql(
                 }
             )
 
-        # Bring in top non-PII descriptive dimensions from joined dimension tables (up to 4 per join)
+        # Top non-PII descriptive dimensions from joined dimension tables (up to 4 per join)
         for j_alias, j_tbl in joined_tables:
             j_col_map = dbx_col_maps[j_tbl.full_name]
             added_from_join = 0
@@ -1404,6 +1714,7 @@ def render_databricks_metric_views_sql(
                     }
                 )
 
+        first_numeric_measure: str | None = None
         for mcol, mdbx in measure_cols[:8]:
             m_slug = _slug(mcol.semantic_name or mcol.name)
             agg = _pick_metric_aggregation(mcol)
@@ -1428,6 +1739,8 @@ def render_databricks_metric_views_sql(
             if fmt:
                 m_obj["format"] = fmt
             measures_yaml.append(m_obj)
+            if first_numeric_measure is None:
+                first_numeric_measure = mname
 
             if tbl.telemetry_profile:
                 mx_name = _alloc_meas(f"max_{m_slug}")
@@ -1455,35 +1768,29 @@ def render_databricks_metric_views_sql(
             mv_yaml["dimensions"] = dimensions_yaml
         mv_yaml["measures"] = measures_yaml
 
-        yaml_body = yaml.safe_dump(mv_yaml, sort_keys=False, width=110).replace("$$", "$ $").rstrip()
-        sample_dim = dimensions_yaml[0]["name"] if dimensions_yaml else None
-        sample_meas = measures_yaml[-1]["name"] if len(measures_yaml) > 1 else measures_yaml[0]["name"]
-
-        lines.extend(
-            [
-                f"-- Metric View for {tbl.full_name}" + (f" ({tbl.semantic_name})" if tbl.semantic_name else ""),
-                f"CREATE OR REPLACE VIEW {view_fqn}",
-                "WITH METRICS",
-                "LANGUAGE YAML",
-                "AS $$",
-                yaml_body,
-                "$$;",
-                "",
-            ]
+        specs.append(
+            {
+                "view_name": view_name,
+                "view_fqn": view_fqn,
+                "tbl": tbl,
+                "logical_name": logical_tname,
+                "is_hierarchy": False,
+                "yaml_spec": mv_yaml,
+                "benchmark_dim": preferred_string_dim or (dimensions_yaml[0]["name"] if dimensions_yaml else None),
+                "benchmark_measure": first_numeric_measure or cnt_name,
+            }
         )
-        if sample_dim:
-            lines.append(
-                f"-- Example query: SELECT {_spark_ident(sample_dim)}, MEASURE({_spark_ident(sample_meas)}) "
-                f"FROM {view_fqn} GROUP BY 1 ORDER BY 2 DESC LIMIT 20;"
-            )
-            lines.append("")
 
-    # Emit Metric Views for Gold Recursive Hierarchy / BOM exploded tables
+    # Gold Recursive Hierarchy / BOM Metric Views
     for htbl in hier_tables:
         assert htbl.hierarchy is not None
         safe_h = dbx_tbl_map[htbl.full_name]
         logical_h = logical_tbl_map.get(htbl.full_name, _slug(htbl.name))
-        view_name = _alloc_view_name(f"{logical_h}_bom")
+        is_bom = htbl.hierarchy.pattern == "bom"
+        h_suffix = "bom" if is_bom else "hierarchy"
+        h_label = "BOM" if is_bom else "Hierarchy"
+
+        view_name = _alloc_view_name(f"{logical_h}_{h_suffix}")
         view_fqn = _spark_table_ref(cat, gold_schema, view_name)
         gold_src_fqn = _spark_table_ref(cat, gold_schema, f"gold_{safe_h}_exploded")
 
@@ -1506,23 +1813,24 @@ def render_databricks_metric_views_sql(
             )
         h_dims.extend(
             [
-                {"name": "root_node_id", "expr": "source.root_node_id", "display_name": "Root Assembly"},
-                {"name": "parent_node_id", "expr": "source.parent_node_id", "display_name": "Parent Component"},
-                {"name": "child_node_id", "expr": "source.child_node_id", "display_name": "Child Component"},
-                {"name": "depth", "expr": "source.depth", "display_name": "BOM Depth"},
+                {"name": "root_node_id", "expr": "source.root_node_id", "display_name": "Root Assembly" if is_bom else "Root Node"},
+                {"name": "parent_node_id", "expr": "source.parent_node_id", "display_name": "Parent Component" if is_bom else "Parent Node"},
+                {"name": "child_node_id", "expr": "source.child_node_id", "display_name": "Child Component" if is_bom else "Child Node"},
+                {"name": "depth", "expr": "source.depth", "display_name": f"{h_label} Depth"},
             ]
         )
+        max_depth_meas = "max_bom_depth" if is_bom else "max_hierarchy_depth"
         h_measures: list[dict[str, Any]] = [
             {
                 "name": "exploded_component_links",
                 "expr": "COUNT(1)",
-                "display_name": "Exploded Component Links",
-                "comment": "Total exploded parent-child BOM edges.",
+                "display_name": "Exploded Component Links" if is_bom else "Exploded Hierarchy Links",
+                "comment": f"Total exploded parent-child {h_label.lower()} edges.",
             },
             {
-                "name": "max_bom_depth",
+                "name": max_depth_meas,
                 "expr": "MAX(source.depth)",
-                "display_name": "Max Hierarchy Depth",
+                "display_name": f"Max {h_label} Depth",
                 "comment": "Deepest nesting level under each root node.",
             },
         ]
@@ -1545,34 +1853,91 @@ def render_databricks_metric_views_sql(
             "dimensions": h_dims,
             "measures": h_measures,
         }
-        yaml_body = yaml.safe_dump(hmv_yaml, sort_keys=False, width=110).replace("$$", "$ $").rstrip()
+        specs.append(
+            {
+                "view_name": view_name,
+                "view_fqn": view_fqn,
+                "tbl": htbl,
+                "logical_name": logical_h,
+                "is_hierarchy": True,
+                "yaml_spec": hmv_yaml,
+                "benchmark_dim": "root_node_id",
+                "benchmark_measure": "total_extended_qty" if qty_obj else "exploded_component_links",
+                "max_depth_measure": max_depth_meas,
+            }
+        )
+
+    return specs
+
+
+def render_databricks_metric_views_sql(
+    result: DiscoveryResult,
+    catalog: str | None = None,
+    silver_schema: str = "silver",
+    gold_schema: str = "gold",
+) -> str:
+    """Generate Databricks Unity Catalog Metric Views SQL (WITH METRICS LANGUAGE YAML, spec v1.1)."""
+    cat = catalog or result.config.databricks_catalog
+    specs = _build_databricks_metric_view_specs(
+        result,
+        catalog=cat,
+        silver_schema=silver_schema,
+        gold_schema=gold_schema,
+    )
+
+    lines: list[str] = [
+        f"-- Auto-generated by tick: Databricks Unity Catalog Metric Views ({cat}.{gold_schema})",
+        f"-- Source database: {result.overview.database_name} ({result.overview.dialect})",
+        "-- Requires Databricks Runtime 17.3+ / Serverless SQL Warehouse with Unity Catalog Metric Views (v1.1).",
+        "",
+        f"CREATE SCHEMA IF NOT EXISTS {_spark_ident(cat)}.{_spark_ident(gold_schema)};",
+        "",
+    ]
+
+    if not specs:
+        lines.append("-- No eligible base tables discovered to generate Unity Catalog Metric Views.")
+        return "\n".join(lines) + "\n"
+
+    for spec in specs:
+        tbl: TableInfo = spec["tbl"]
+        view_fqn: str = spec["view_fqn"]
+        mv_yaml: dict[str, Any] = spec["yaml_spec"]
+        yaml_body = yaml.safe_dump(mv_yaml, sort_keys=False, width=110).rstrip()
+        dq_tag = _pick_dollar_quote_tag(yaml_body)
+
+        if spec["is_hierarchy"] and tbl.hierarchy is not None:
+            comment_hdr = f"-- Gold Recursive Hierarchy Metric View for {tbl.full_name} ({tbl.hierarchy.pattern})"
+            ex_sql = (
+                f"-- Example query: SELECT root_node_id, MEASURE(exploded_component_links), "
+                f"MEASURE({spec['max_depth_measure']}) FROM {view_fqn} GROUP BY 1 ORDER BY 2 DESC LIMIT 20;"
+            )
+        else:
+            comment_hdr = f"-- Metric View for {tbl.full_name}" + (f" ({tbl.semantic_name})" if tbl.semantic_name else "")
+            sample_dim = spec["benchmark_dim"]
+            sample_meas = spec["benchmark_measure"]
+            ex_sql = (
+                f"-- Example query: SELECT {_spark_ident(sample_dim)}, MEASURE({_spark_ident(sample_meas)}) "
+                f"FROM {view_fqn} GROUP BY 1 ORDER BY 2 DESC LIMIT 20;"
+                if sample_dim
+                else ""
+            )
+
         lines.extend(
             [
-                f"-- Gold Recursive Hierarchy Metric View for {htbl.full_name} ({htbl.hierarchy.pattern})",
+                comment_hdr,
                 f"CREATE OR REPLACE VIEW {view_fqn}",
                 "WITH METRICS",
                 "LANGUAGE YAML",
-                "AS $$",
+                f"AS {dq_tag}",
                 yaml_body,
-                "$$;",
-                f"-- Example query: SELECT root_node_id, MEASURE(exploded_component_links), MEASURE(max_bom_depth) "
-                f"FROM {view_fqn} GROUP BY 1 ORDER BY 2 DESC LIMIT 20;",
-                "",
+                f"{dq_tag};",
             ]
         )
+        if ex_sql:
+            lines.append(ex_sql)
+        lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
-
-
-def _databricks_measure_format(col: ColumnInfo) -> dict[str, Any] | None:
-    name_to_check = col.semantic_name or col.name
-    if _CURRENCY_MEASURE_RE.search(name_to_check) or _CURRENCY_MEASURE_RE.search(col.name):
-        return {"type": "currency", "currency_code": "USD", "decimal_places": {"type": "exact", "places": 2}}
-    if _PERCENT_MEASURE_RE.search(name_to_check) or _PERCENT_MEASURE_RE.search(col.name):
-        return {"type": "percentage", "decimal_places": {"type": "exact", "places": 1}}
-    if col.canonical_type in {"decimal", "float"}:
-        return {"type": "number", "decimal_places": {"type": "exact", "places": 2}}
-    return None
 
 
 # =============================================================================
@@ -1594,25 +1959,30 @@ def render_databricks_genie_context_md(
     dbx_tbl_map = deduplicate_table_names(all_base_tables)
     active_tables, omitted_empty = _select_active_base_tables(result)
     active_by_full = {t.full_name: t for t in active_tables}
-    logical_tbl_map = _deduplicate_logical_table_names(active_tables)
     verified_rels = _filtered_verified_relationships(result, active_by_full)
-    anchors = _choose_metric_view_anchors(active_tables, verified_rels)
-    hier_tables = get_hierarchy_tables(result)
+    hier_tables = [t for t in get_hierarchy_tables(result) if t.full_name in active_by_full]
+
+    mv_specs = _build_databricks_metric_view_specs(
+        result,
+        catalog=cat,
+        silver_schema=silver_schema,
+        gold_schema=gold_schema,
+    )
 
     dbx_col_maps: dict[str, dict[str, str]] = {
         t.full_name: deduplicate_column_names([c.name for c in t.columns]) for t in active_tables
     }
-    legacy_dbx_maps: dict[str, dict[str, tuple[str, str]]] = {
+    legacy_dbx_maps: dict[str, dict[str, tuple[str, str, bool]]] = {
         t.full_name: _compute_databricks_silver_legacy_cols(t, dbx_col_maps[t.full_name])
         for t in active_tables
     }
 
     lines: list[str] = [
-        f"# Databricks AI/BI Genie Space Blueprint: `{result.overview.database_name}`",
+        f"# Databricks AI/BI Genie Space Blueprint: {_md_code(result.overview.database_name)}",
         "",
-        f"- **Source System:** `{result.overview.dialect}` ({result.overview.database_name})",
-        f"- **Target Unity Catalog:** `{cat}` (Bronze: `{bsch}` · Silver: `{silver_schema}` · Gold: `{gold_schema}`)",
-        f"- **Active Data Assets:** `{len(active_tables)}` Silver tables · `{len(anchors) + len(hier_tables)}` Metric Views · `{len(verified_rels)}` verified joins",
+        f"- **Source System:** `{result.overview.dialect}` ({_escape_md(result.overview.database_name)})",
+        f"- **Target Unity Catalog:** {_md_code(cat)} (Bronze: {_md_code(bsch)} · Silver: {_md_code(silver_schema)} · Gold: {_md_code(gold_schema)})",
+        f"- **Active Data Assets:** `{len(active_tables)}` Silver tables · `{len(mv_specs)}` Metric Views · `{len(verified_rels)}` verified joins",
         "",
         "---",
         "",
@@ -1631,75 +2001,50 @@ def render_databricks_genie_context_md(
         notes: list[str] = []
         if tbl.telemetry_profile:
             notes.append(f"OT {tbl.telemetry_profile.pattern}")
-        if legacy_dbx_maps[tbl.full_name]:
+        if any(is_tmp for _, _, is_tmp in legacy_dbx_maps[tbl.full_name].values()):
             notes.append("Legacy dates parsed")
         if tbl.hierarchy:
             notes.append(f"Use Gold exploded view for multi-level {tbl.hierarchy.pattern}")
         lines.append(
-            f"| Silver Table | `{_escape_md(fqn)}` | `{_escape_md(tbl.semantic_name or tbl.name)}` | "
+            f"| Silver Table | {_md_code(fqn)} | {_md_code(tbl.semantic_name or tbl.name)} | "
             f"`{role}` | {_escape_md('; '.join(notes) or (tbl.business_description or tbl.comment))} |"
-        )
-
-    seen_mv_slugs: set[str] = set()
-    for tbl in anchors:
-        base = f"mv_{_slug(logical_tbl_map[tbl.full_name])}"
-        mv_name = base
-        sfx = 2
-        while mv_name in seen_mv_slugs:
-            mv_name = f"{base}_{sfx}"
-            sfx += 1
-        seen_mv_slugs.add(mv_name)
-        lines.append(
-            f"| Gold Metric View | `{_escape_md(f'{cat}.{gold_schema}.{mv_name}')}` | "
-            f"`{_escape_md(logical_tbl_map[tbl.full_name])}` KPIs | `metric_view` | "
-            f"Governed `MEASURE(...)` definitions (`metric_views.sql`) |"
         )
 
     for htbl in hier_tables:
         safe_h = dbx_tbl_map[htbl.full_name]
-        logical_h = logical_tbl_map.get(htbl.full_name, _slug(htbl.name))
         lines.append(
-            f"| Gold Hierarchy | `{_escape_md(f'{cat}.{gold_schema}.gold_{safe_h}_exploded')}` | "
-            f"`{_escape_md(htbl.semantic_name or htbl.name)}` exploded | `hierarchy` | "
+            f"| Gold Hierarchy | {_md_code(f'{cat}.{gold_schema}.gold_{safe_h}_exploded')} | "
+            f"{_md_code(htbl.semantic_name or htbl.name)} exploded | `hierarchy` | "
             f"Pre-exploded recursive {htbl.hierarchy.pattern if htbl.hierarchy else 'tree'} |"
         )
-        base_hmv = f"mv_{_slug(f'{logical_h}_bom')}"
-        hmv_name = base_hmv
-        sfx = 2
-        while hmv_name in seen_mv_slugs:
-            hmv_name = f"{base_hmv}_{sfx}"
-            sfx += 1
-        seen_mv_slugs.add(hmv_name)
+
+    for spec in mv_specs:
+        mv_name = spec["view_name"]
+        logical_name = spec["logical_name"]
+        kind_desc = (
+            "Governed recursive rollup `MEASURE(...)` definitions (`metric_views.sql`)"
+            if spec["is_hierarchy"]
+            else "Governed `MEASURE(...)` definitions (`metric_views.sql`)"
+        )
         lines.append(
-            f"| Gold Metric View | `{_escape_md(f'{cat}.{gold_schema}.{hmv_name}')}` | "
-            f"`{_escape_md(logical_h)}` BOM KPIs | `metric_view` | "
-            f"Governed recursive rollup `MEASURE(...)` definitions (`metric_views.sql`) |"
+            f"| Gold Metric View | {_md_code(f'{cat}.{gold_schema}.{mv_name}')} | "
+            f"{_md_code(logical_name)} KPIs | `metric_view` | {kind_desc} |"
         )
 
     if omitted_empty:
         lines.append("")
         lines.append(
             f"> **Excluded Empty Tables ({len(omitted_empty)}):** "
-            + ", ".join(f"`{t.full_name}`" for t in omitted_empty[:15])
+            + ", ".join(_md_code(t.full_name) for t in omitted_empty[:15])
             + (" ..." if len(omitted_empty) > 15 else "")
         )
 
     # 2. Copy-Paste Genie General Instructions
-    lines.extend(
-        [
-            "",
-            "---",
-            "",
-            "## 2. Copy-Paste Genie General Instructions",
-            "",
-            "Paste the block below into **Genie Space → Configure → Instructions → Text**:",
-            "",
-            "```text",
-            f"You are an analytics assistant for {result.overview.database_name} data stored in Unity Catalog `{cat}`.",
-            f"1. ALWAYS query cleaned Silver tables in `{cat}.{silver_schema}` or Gold Metric Views in `{cat}.{gold_schema}` — NEVER query raw Bronze tables in `{cat}.{bsch}`.",
-            f"2. When answering KPI or aggregation questions, prefer Unity Catalog Metric Views (`{cat}.{gold_schema}.mv_*`) using MEASURE(<metric_name>) so calculations remain consistent across dashboards.",
-        ]
-    )
+    instr_lines: list[str] = [
+        f"You are an analytics assistant for {result.overview.database_name} data stored in Unity Catalog `{cat}`.",
+        f"1. ALWAYS query cleaned Silver tables in `{cat}.{silver_schema}` or Gold Metric Views in `{cat}.{gold_schema}` — NEVER query raw Bronze tables in `{cat}.{bsch}`.",
+        f"2. When answering KPI or aggregation questions, prefer Unity Catalog Metric Views (`{cat}.{gold_schema}.mv_*`) using MEASURE(<metric_name>) so calculations remain consistent across dashboards.",
+    ]
 
     step_no = 3
     glossary_pairs = [
@@ -1718,16 +2063,17 @@ def render_databricks_genie_context_md(
                     col_glossary_pairs.append(pair)
     if glossary_pairs or col_glossary_pairs:
         terms = ", ".join((glossary_pairs[:8] + col_glossary_pairs[:10]))
-        lines.append(f"{step_no}. ERP/MES Business Glossary mappings: {terms}.")
+        instr_lines.append(f"{step_no}. ERP/MES Business Glossary mappings: {terms}.")
         step_no += 1
 
     legacy_notes = [
         f"silver_{dbx_tbl_map[t.full_name]}.{derived_col} (from {raw_col})"
         for t in active_tables
-        for raw_col, (derived_col, _) in legacy_dbx_maps[t.full_name].items()
+        for raw_col, (derived_col, _, is_tmp) in legacy_dbx_maps[t.full_name].items()
+        if is_tmp
     ]
     if legacy_notes:
-        lines.append(
+        instr_lines.append(
             f"{step_no}. Legacy date/time fields are pre-parsed in Silver — use {', '.join(legacy_notes[:8])} instead of raw integer/Julian codes."
         )
         step_no += 1
@@ -1735,42 +2081,63 @@ def render_databricks_genie_context_md(
     ot_tables = [t for t in active_tables if t.telemetry_profile is not None]
     if ot_tables:
         ot_list = ", ".join(f"silver_{dbx_tbl_map[t.full_name]}" for t in ot_tables)
-        lines.append(
+        instr_lines.append(
             f"{step_no}. OT Telemetry ({ot_list}): Silver Lakeflow expectations flag/filter bad OPC sensor quality. Bucket time-series queries with DATE_TRUNC('hour', ...) or DATE_TRUNC('day', ...)."
         )
         step_no += 1
 
     if hier_tables:
         h_list = ", ".join(f"`{cat}.{gold_schema}.gold_{dbx_tbl_map[h.full_name]}_exploded`" for h in hier_tables)
-        lines.append(
-            f"{step_no}. Multi-level BOM / hierarchy queries: ALWAYS use {h_list} (`root_node_id`, `child_node_id`, `depth`, `extended_qty`) rather than writing recursive CTEs ad hoc."
+        has_any_qty = any(_find_quantity_column(h) is not None for h in hier_tables)
+        h_cols_hint = (
+            "`root_node_id`, `child_node_id`, `depth`, `extended_qty`"
+            if has_any_qty
+            else "`root_node_id`, `child_node_id`, `depth`, `hierarchy_path`"
+        )
+        instr_lines.append(
+            f"{step_no}. Multi-level BOM / hierarchy queries: ALWAYS use {h_list} ({h_cols_hint}) rather than writing recursive CTEs ad hoc."
         )
         step_no += 1
 
     pii_cols_list = [
-        f"{dbx_tbl_map[t.full_name]}.{dbx_col_maps[t.full_name][c.name]}"
+        f"silver_{dbx_tbl_map[t.full_name]}.{dbx_col_maps[t.full_name][c.name]}"
         for t in active_tables
         for c in t.columns
         if _is_direct_pii(c) or _is_itar_or_ip(c)
     ]
     if pii_cols_list:
-        lines.append(
+        instr_lines.append(
             f"{step_no}. Governance & Privacy: NEVER display raw PII or export-controlled IP columns ({', '.join(pii_cols_list[:10])}); rely on Unity Catalog column masks and aggregate results."
         )
         step_no += 1
 
     plant_cols_list = [
-        f"{dbx_tbl_map[t.full_name]}.{dbx_col_maps[t.full_name][c.name]}"
+        f"silver_{dbx_tbl_map[t.full_name]}.{dbx_col_maps[t.full_name][c.name]}"
         for t in active_tables
         for c in t.columns
-        if c.profile and any(g.category == "plant_isolation_key" for g in c.profile.governance_findings)
+        if _is_plant_key(c)
     ]
     if plant_cols_list:
-        lines.append(
+        instr_lines.append(
             f"{step_no}. Multi-Plant Scoping: Include or filter by plant isolation keys ({', '.join(plant_cols_list[:6])}) when comparing facilities."
         )
 
-    lines.append("```")
+    instr_body = "\n".join(instr_lines)
+    instr_fence = _md_fence(instr_body)
+    lines.extend(
+        [
+            "",
+            "---",
+            "",
+            "## 2. Copy-Paste Genie General Instructions",
+            "",
+            "Paste the block below into **Genie Space → Configure → Instructions → Text**:",
+            "",
+            f"{instr_fence}text",
+            instr_body,
+            instr_fence,
+        ]
+    )
 
     # 3. Verified Join Definitions for Genie Space
     lines.extend(["", "---", "", "## 3. Verified Join Paths (for Genie Space Joins)", ""])
@@ -1780,11 +2147,11 @@ def render_databricks_genie_context_md(
         for rel in verified_rels:
             l_safe = dbx_tbl_map[rel.source_table]
             r_safe = dbx_tbl_map[rel.target_table]
-            l_col = dbx_col_maps[rel.source_table].get(rel.source_column, sanitize_delta_column_name(rel.source_column))
-            r_col = dbx_col_maps[rel.target_table].get(rel.target_column, sanitize_delta_column_name(rel.target_column))
+            l_col = _resolve_col_name_ci(dbx_col_maps[rel.source_table], rel.source_column) or sanitize_delta_column_name(rel.source_column)
+            r_col = _resolve_col_name_ci(dbx_col_maps[rel.target_table], rel.target_column) or sanitize_delta_column_name(rel.target_column)
             on_expr = f"silver_{l_safe}.{_spark_ident(l_col)} = silver_{r_safe}.{_spark_ident(r_col)}"
             lines.append(
-                f"| `silver_{_escape_md(l_safe)}` | `silver_{_escape_md(r_safe)}` | `{_escape_md(on_expr)}` | "
+                f"| {_md_code(f'silver_{l_safe}')} | {_md_code(f'silver_{r_safe}')} | {_md_code(on_expr)} | "
                 f"`{rel.kind}` | {rel.confidence:.0%} |"
             )
     else:
@@ -1798,10 +2165,10 @@ def render_databricks_genie_context_md(
             vals, is_enum = _safe_sample_values(col, limit=8)
             if vals:
                 dbx_c = dbx_col_maps[tbl.full_name][col.name]
-                val_str = ", ".join(f"`{_escape_md(v)}`" for v in vals)
+                val_str = ", ".join(_md_code(v) for v in vals)
                 enum_tag = "Exact enum" if is_enum else "Top values"
                 filter_rows.append(
-                    f"| `silver_{_escape_md(safe_tbl)}` | `{_escape_md(dbx_c)}` | "
+                    f"| {_md_code(f'silver_{safe_tbl}')} | {_md_code(dbx_c)} | "
                     f"{_escape_md(col.semantic_name or col.name)} | {enum_tag} | {val_str} |"
                 )
 
@@ -1820,22 +2187,21 @@ def render_databricks_genie_context_md(
         silver_schema=silver_schema,
         gold_schema=gold_schema,
         active_tables=active_tables,
-        anchors=anchors,
+        mv_specs=mv_specs,
         hier_tables=hier_tables,
         dbx_tbl_map=dbx_tbl_map,
         dbx_col_maps=dbx_col_maps,
-        legacy_dbx_maps=legacy_dbx_maps,
-        logical_tbl_map=logical_tbl_map,
         verified_rels=verified_rels,
     )
     for idx, (question, sql_text) in enumerate(benchmarks, start=1):
+        sql_fence = _md_fence(sql_text)
         lines.extend(
             [
                 f"### Q{idx}: {question}",
                 "",
-                "```sql",
+                f"{sql_fence}sql",
                 sql_text,
-                "```",
+                sql_fence,
                 "",
             ]
         )
@@ -1848,91 +2214,27 @@ def _build_genie_benchmark_queries(
     silver_schema: str,
     gold_schema: str,
     active_tables: list[TableInfo],
-    anchors: list[TableInfo],
+    mv_specs: list[dict[str, Any]],
     hier_tables: list[TableInfo],
     dbx_tbl_map: dict[str, str],
     dbx_col_maps: dict[str, dict[str, str]],
-    legacy_dbx_maps: dict[str, dict[str, tuple[str, str]]],
-    logical_tbl_map: dict[str, str],
     verified_rels: list[RelationshipInfo],
 ) -> list[tuple[str, str]]:
     queries: list[tuple[str, str]] = []
 
-    if anchors:
-        top_tbl = anchors[0]
-        mv_name = f"mv_{_slug(logical_tbl_map[top_tbl.full_name])}"
-        mv_fqn = _spark_table_ref(cat, gold_schema, mv_name)
-        # Recompute exact emitted dimension/measure names for top_tbl so benchmark SQL matches metric_views.sql
-        top_dims: list[str] = []
-        seen_top_dims: set[str] = set()
-        top_measures: list[tuple[ColumnInfo, str]] = []
-        stitched_top = {
-            c.profile.legacy_date.paired_column
-            for c in top_tbl.columns
-            if c.profile and c.profile.legacy_date and c.profile.legacy_date.paired_column
-        }
-        for col in top_tbl.columns:
-            if col.canonical_type == "binary":
-                continue
-            if (_is_direct_pii(col) or _is_itar_or_ip(col)) and not col.is_primary_key:
-                continue
-            if (
-                col.profile
-                and col.profile.legacy_date
-                and col.profile.legacy_date.encoding == "hhmmss"
-                and col.name in stitched_top
-            ):
-                continue
-            if _is_numeric_measure_column(col, top_tbl):
-                top_measures.append((col, _slug(col.semantic_name or col.name)))
-                continue
-            if len(top_dims) < 20:
-                base_d = _semantic_slug(col.semantic_name or col.name, suffix="col")
-                cand_d = base_d
-                sfx = 2
-                while cand_d in seen_top_dims:
-                    cand_d = f"{base_d}_{sfx}"
-                    sfx += 1
-                seen_top_dims.add(cand_d)
-                top_dims.append(cand_d)
-
-        count_m = "reading_count" if top_tbl.telemetry_profile else "record_count"
-        if count_m in seen_top_dims:
-            sfx = 2
-            while f"{count_m}_{sfx}" in seen_top_dims:
-                sfx += 1
-            count_m = f"{count_m}_{sfx}"
-
-        if top_measures:
-            m_col, m_slug = top_measures[0]
-            base_m = f"{'avg' if _pick_metric_aggregation(m_col) == 'avg' else 'total'}_{m_slug}"
-            cand_m = _semantic_slug(base_m, suffix="metric")
-            sfx = 2
-            while cand_m in seen_top_dims or cand_m == count_m:
-                cand_m = f"{base_m}_{sfx}"
-                sfx += 1
-            m_expr = f"MEASURE({_spark_ident(cand_m)})"
-        else:
-            m_expr = f"MEASURE({_spark_ident(count_m)})"
-
-        if top_dims:
-            # Prefer a non-PK string/boolean dimension if present, else first dimension
-            pref_dim = next(
-                (
-                    _semantic_slug(c.semantic_name or c.name, suffix="col")
-                    for c in top_tbl.columns
-                    if c.canonical_type in {"string", "boolean"}
-                    and not _is_direct_pii(c)
-                    and not _is_itar_or_ip(c)
-                    and not c.is_primary_key
-                    and _semantic_slug(c.semantic_name or c.name, suffix="col") in seen_top_dims
-                ),
-                top_dims[0],
-            )
+    # Q1: Grounded directly in the exact emitted first non-hierarchy Metric View spec (zero drift!)
+    first_mv = next((s for s in mv_specs if not s["is_hierarchy"]), mv_specs[0] if mv_specs else None)
+    if first_mv:
+        mv_fqn = first_mv["view_fqn"]
+        logical_name = first_mv["logical_name"]
+        b_dim = first_mv["benchmark_dim"]
+        b_meas = first_mv["benchmark_measure"]
+        m_expr = f"MEASURE({_spark_ident(b_meas)})"
+        if b_dim:
             queries.append(
                 (
-                    f"What is the breakdown of {_human_label(logical_tbl_map[top_tbl.full_name]).lower()} by {_human_label(pref_dim).lower()}?",
-                    f"SELECT {_spark_ident(pref_dim)}, {m_expr} AS metric_value\n"
+                    f"What is the breakdown of {_human_label(logical_name).lower()} by {_human_label(b_dim).lower()}?",
+                    f"SELECT {_spark_ident(b_dim)}, {m_expr} AS metric_value\n"
                     f"FROM {mv_fqn}\n"
                     f"GROUP BY 1\n"
                     f"ORDER BY 2 DESC\n"
@@ -1942,20 +2244,20 @@ def _build_genie_benchmark_queries(
         else:
             queries.append(
                 (
-                    f"What is the overall {_human_label(logical_tbl_map[top_tbl.full_name]).lower()} summary?",
+                    f"What is the overall {_human_label(logical_name).lower()} summary?",
                     f"SELECT {m_expr} AS metric_value\nFROM {mv_fqn};",
                 )
             )
 
-    # Joined Silver query if a verified relationship exists
+    # Q2: Joined Silver query if a verified relationship exists (case-insensitive safe column lookup)
     if verified_rels:
         rel = verified_rels[0]
         l_safe = dbx_tbl_map[rel.source_table]
         r_safe = dbx_tbl_map[rel.target_table]
         l_fqn = _spark_table_ref(cat, silver_schema, f"silver_{l_safe}")
         r_fqn = _spark_table_ref(cat, silver_schema, f"silver_{r_safe}")
-        l_col = dbx_col_maps[rel.source_table][rel.source_column]
-        r_col = dbx_col_maps[rel.target_table][rel.target_column]
+        l_col = _resolve_col_name_ci(dbx_col_maps[rel.source_table], rel.source_column) or sanitize_delta_column_name(rel.source_column)
+        r_col = _resolve_col_name_ci(dbx_col_maps[rel.target_table], rel.target_column) or sanitize_delta_column_name(rel.target_column)
         queries.append(
             (
                 f"How many {_human_label(l_safe).lower()} records match each {_human_label(r_safe).lower()}?",
@@ -1969,22 +2271,25 @@ def _build_genie_benchmark_queries(
             )
         )
 
-    # OT Telemetry benchmark query
+    # Q3: OT Telemetry benchmark query
     ot_tbl = next((t for t in active_tables if t.telemetry_profile is not None), None)
     if ot_tbl and ot_tbl.telemetry_profile:
         safe_ot = dbx_tbl_map[ot_tbl.full_name]
         ot_fqn = _spark_table_ref(cat, silver_schema, f"silver_{safe_ot}")
-        ts_c = dbx_col_maps[ot_tbl.full_name].get(
-            ot_tbl.telemetry_profile.timestamp_column,
-            sanitize_delta_column_name(ot_tbl.telemetry_profile.timestamp_column),
-        )
+        ts_raw = ot_tbl.telemetry_profile.timestamp_column
+        ts_obj = next((c for c in ot_tbl.columns if c.name == ts_raw), None)
+        ts_c = _resolve_col_name_ci(dbx_col_maps[ot_tbl.full_name], ts_raw) or sanitize_delta_column_name(ts_raw)
+        is_ts = ts_obj is None or ts_obj.canonical_type == "timestamp"
+        trunc_unit = "HOUR" if is_ts else "DAY"
+        bucket_lbl = "hourly" if is_ts else "daily"
+        bucket_col = "reading_hour" if is_ts else "reading_day"
         val_raw = ot_tbl.telemetry_profile.value_columns[0] if ot_tbl.telemetry_profile.value_columns else None
-        val_c = dbx_col_maps[ot_tbl.full_name].get(val_raw) if val_raw else None
+        val_c = _resolve_col_name_ci(dbx_col_maps[ot_tbl.full_name], val_raw) if val_raw else None
         avg_part = f", AVG({_spark_ident(val_c)}) AS avg_{val_c}" if val_c else ""
         queries.append(
             (
-                f"Show hourly sensor reading volume for {_human_label(safe_ot).lower()}.",
-                f"SELECT DATE_TRUNC('HOUR', {_spark_ident(ts_c)}) AS reading_hour,\n"
+                f"Show {bucket_lbl} sensor reading volume for {_human_label(safe_ot).lower()}.",
+                f"SELECT DATE_TRUNC('{trunc_unit}', {_spark_ident(ts_c)}) AS {bucket_col},\n"
                 f"       COUNT(*) AS reading_count{avg_part}\n"
                 f"FROM {ot_fqn}\n"
                 f"GROUP BY 1\n"
@@ -1993,16 +2298,17 @@ def _build_genie_benchmark_queries(
             )
         )
 
-    # Gold BOM benchmark query
+    # Q4: Gold Hierarchy / BOM benchmark query
     if hier_tables:
         ht = hier_tables[0]
         safe_h = dbx_tbl_map[ht.full_name]
         gold_fqn = _spark_table_ref(cat, gold_schema, f"gold_{safe_h}_exploded")
         has_qty = _find_quantity_column(ht) is not None
         qty_part = ", SUM(extended_qty) AS total_extended_qty" if has_qty else ""
+        h_word = "BOM" if (ht.hierarchy and ht.hierarchy.pattern == "bom") else "hierarchy"
         queries.append(
             (
-                f"Which root assemblies have the deepest and largest exploded BOM in {_human_label(safe_h).lower()}?",
+                f"Which root nodes have the deepest and largest exploded {h_word} in {_human_label(safe_h).lower()}?",
                 f"SELECT root_node_id, COUNT(*) AS component_links, MAX(depth) AS max_depth{qty_part}\n"
                 f"FROM {gold_fqn}\n"
                 f"GROUP BY 1\n"
@@ -2011,7 +2317,6 @@ def _build_genie_benchmark_queries(
             )
         )
 
-    # Fallback if no queries generated (e.g. empty schema)
     if not queries and active_tables:
         t0 = active_tables[0]
         safe_0 = dbx_tbl_map[t0.full_name]
